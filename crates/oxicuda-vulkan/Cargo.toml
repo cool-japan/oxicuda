@@ -1,0 +1,21 @@
+[package]
+name = "oxicuda-vulkan"
+description = "OxiCUDA Vulkan — GPU compute via Vulkan/SPIR-V (ash runtime loader, pure Rust)"
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["vulkan", "gpu", "compute", "spirv", "pure-rust"]
+categories = ["hardware-support", "science", "mathematics"]
+
+[dependencies]
+oxicuda-backend.workspace = true
+ash.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,34 @@
+[package]
+name = "oxicuda-signal"
+description = "OxiCUDA Signal - GPU-accelerated signal, audio, and image processing (DCT, DWT, STFT, Mel, MFCC, NMS, morphology)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "dsp", "signal-processing", "gpu", "audio"]
+categories = ["algorithms", "multimedia", "science", "hardware-support"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+oxicuda-memory.workspace = true
+oxicuda-launch.workspace = true
+oxicuda-ptx.workspace = true
+oxicuda-fft.workspace = true
+thiserror.workspace = true
+num-complex.workspace = true
+num-traits.workspace = true
+half = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+full = ["f16", "serde"]
+f16 = ["dep:half"]
+serde = ["dep:serde"]
+gpu-tests = []
+
+[lints]
+workspace = true

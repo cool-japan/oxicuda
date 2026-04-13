@@ -1,0 +1,32 @@
+[package]
+name = "oxicuda-graph"
+description = "OxiCUDA Graph — CUDA Graph execution engine with operator fusion, buffer lifetime analysis, stream partitioning, and optimized execution planning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "graph", "fusion", "scheduling"]
+categories = ["algorithms", "concurrency", "hardware-support", "science"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+oxicuda-ptx.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "graph_build"
+harness = false
+
+[lints]
+workspace = true

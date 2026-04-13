@@ -1,0 +1,34 @@
+[package]
+name = "oxicuda-train"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GPU-accelerated training engine: fused optimizer update kernels, gradient checkpointing, LR schedulers, and ZeRO optimizer state sharding"
+readme = "README.md"
+
+[dependencies]
+oxicuda-driver  = { workspace = true }
+oxicuda-memory  = { workspace = true }
+oxicuda-launch  = { workspace = true }
+oxicuda-ptx     = { workspace = true }
+thiserror       = { workspace = true }
+num-traits      = { workspace = true }
+serde           = { workspace = true, features = ["derive"], optional = true }
+
+[features]
+default = []
+serialize = ["serde"]
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "train_ops"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name         = "oxicuda-infer"
+description  = "High-performance GPU inference engine for OxiCUDA: PagedAttention KV cache, continuous batching, speculative decoding, structured sampling, and quantized inference."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+readme                 = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "infer_engine"
+harness = false

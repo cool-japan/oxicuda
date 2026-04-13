@@ -1,0 +1,30 @@
+[package]
+name = "oxicuda-runtime"
+description = "OxiCUDA Runtime - CUDA Runtime API wrapper (cudaMalloc/cudaMemcpy/cudaLaunchKernel) built on the driver API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "runtime", "nvidia", "compute"]
+categories = ["hardware-support", "api-bindings"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+gpu-tests = []
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "runtime_ops"
+harness = false
+
+[lints]
+workspace = true

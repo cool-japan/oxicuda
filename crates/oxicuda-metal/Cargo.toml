@@ -1,0 +1,23 @@
+[package]
+name = "oxicuda-metal"
+description = "OxiCUDA Metal - GPU compute via Apple Metal API (macOS only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["metal", "gpu", "compute", "macos", "apple"]
+categories = ["hardware-support", "science", "mathematics"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal.workspace = true
+
+[dependencies]
+oxicuda-backend.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

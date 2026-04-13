@@ -1,0 +1,29 @@
+[package]
+name = "oxicuda-autotune"
+description = "OxiCUDA Autotune - Automatic GPU kernel parameter optimization engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "autotune", "gpu", "optimization", "benchmark"]
+categories = ["hardware-support", "development-tools::profiling"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+oxicuda-ptx = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[features]
+default = []
+full = ["ptx"]
+ptx = ["dep:oxicuda-ptx"]
+gpu-tests = ["oxicuda-driver/gpu-tests"]
+
+[lints]
+workspace = true

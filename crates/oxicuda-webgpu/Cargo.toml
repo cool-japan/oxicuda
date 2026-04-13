@@ -1,0 +1,22 @@
+[package]
+name = "oxicuda-webgpu"
+description = "OxiCUDA WebGPU - Cross-platform GPU compute via wgpu and WGSL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["webgpu", "wgpu", "gpu", "compute", "wgsl"]
+categories = ["hardware-support", "science", "mathematics"]
+
+[dependencies]
+oxicuda-backend.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

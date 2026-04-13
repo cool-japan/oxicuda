@@ -1,0 +1,19 @@
+[package]
+name = "oxicuda-ptx"
+description = "OxiCUDA PTX - PTX code generation DSL and IR for GPU kernel development"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "ptx", "codegen", "gpu", "kernel"]
+categories = ["compilers", "hardware-support"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

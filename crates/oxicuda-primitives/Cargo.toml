@@ -1,0 +1,26 @@
+[package]
+name = "oxicuda-primitives"
+description = "OxiCUDA Primitives - CUB-equivalent parallel GPU primitives (radix sort, scan, reduce, select, histogram)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "parallel", "sort", "primitives"]
+categories = ["hardware-support", "science", "mathematics", "algorithms"]
+
+[dependencies]
+oxicuda-driver = { workspace = true }
+oxicuda-memory = { workspace = true }
+oxicuda-launch = { workspace = true }
+oxicuda-ptx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+
+[lints]
+workspace = true

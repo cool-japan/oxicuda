@@ -1,0 +1,106 @@
+[package]
+name = "oxicuda"
+description = "OxiCUDA - Pure Rust CUDA replacement for the COOLJAPAN ecosystem (95% performance target)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "compute", "nvidia", "pure-rust"]
+categories = ["hardware-support", "science", "mathematics"]
+
+[dependencies]
+oxicuda-backend.workspace = true
+oxicuda-driver.workspace = true
+oxicuda-memory.workspace = true
+oxicuda-launch.workspace = true
+oxicuda-ptx = { workspace = true, optional = true }
+oxicuda-autotune = { workspace = true, optional = true }
+oxicuda-blas = { workspace = true, optional = true }
+oxicuda-dnn = { workspace = true, optional = true }
+oxicuda-fft = { workspace = true, optional = true }
+oxicuda-sparse = { workspace = true, optional = true }
+oxicuda-solver = { workspace = true, optional = true }
+oxicuda-rand = { workspace = true, optional = true }
+oxicuda-primitives = { workspace = true, optional = true }
+oxicuda-vulkan = { workspace = true, optional = true }
+oxicuda-metal = { workspace = true, optional = true }
+oxicuda-webgpu = { workspace = true, optional = true }
+oxicuda-rocm = { workspace = true, optional = true }
+oxicuda-levelzero = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+serde_json.workspace = true
+
+[features]
+default = ["driver", "memory", "launch"]
+driver = []
+memory = []
+launch = []
+backend = []
+ptx = ["dep:oxicuda-ptx"]
+autotune = ["dep:oxicuda-autotune", "ptx"]
+blas = ["dep:oxicuda-blas"]
+dnn = ["dep:oxicuda-dnn", "blas"]
+fft = ["dep:oxicuda-fft"]
+sparse = ["dep:oxicuda-sparse"]
+solver = ["dep:oxicuda-solver"]
+rand = ["dep:oxicuda-rand"]
+primitives = ["dep:oxicuda-primitives"]
+vulkan = ["dep:oxicuda-vulkan"]
+metal = ["dep:oxicuda-metal"]
+webgpu = ["dep:oxicuda-webgpu"]
+rocm = ["dep:oxicuda-rocm"]
+level-zero = ["dep:oxicuda-levelzero"]
+onnx-backend = []
+tensor-backend = []
+transformer-backend = []
+wasm-backend = ["dep:oxicuda-webgpu", "dep:wasm-bindgen", "dep:js-sys"]
+pool = ["oxicuda-memory/pool"]
+gpu-tests = ["oxicuda-driver/gpu-tests"]
+full = ["backend", "ptx", "autotune", "blas", "dnn", "fft", "sparse", "solver", "rand", "primitives", "pool", "onnx-backend", "tensor-backend", "transformer-backend", "vulkan", "metal", "webgpu", "rocm", "level-zero", "wasm-backend"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "ptx_generation"
+harness = false
+required-features = ["ptx"]
+
+[[bench]]
+name = "autotune_search"
+harness = false
+required-features = ["autotune"]
+
+[[bench]]
+name = "fft_planning"
+harness = false
+required-features = ["fft"]
+
+[[bench]]
+name = "blas_dispatch"
+harness = false
+required-features = ["blas", "ptx"]
+
+[[bench]]
+name = "backend_operations"
+harness = false
+required-features = ["backend"]
+
+[[example]]
+name = "matrix_multiply"
+required-features = ["ptx"]
+
+[[example]]
+name = "ptx_generation"
+required-features = ["ptx"]
+
+[[example]]
+name = "autotune_demo"
+required-features = ["autotune"]
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "oxicuda-memory"
+description = "OxiCUDA Memory - Type-safe GPU memory management with Rust ownership semantics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "memory", "device", "buffer"]
+categories = ["hardware-support", "memory-management"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+gpu-tests = ["oxicuda-driver/gpu-tests"]
+pool = []
+
+[lints]
+workspace = true

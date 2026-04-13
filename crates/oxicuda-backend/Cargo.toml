@@ -1,0 +1,18 @@
+[package]
+name = "oxicuda-backend"
+description = "OxiCUDA Backend - Abstract compute backend trait for GPU dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "compute", "backend", "pure-rust"]
+categories = ["hardware-support", "science", "mathematics"]
+
+[dependencies]
+# Zero external dependencies - trait uses only std types
+
+[lints]
+workspace = true

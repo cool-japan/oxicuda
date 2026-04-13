@@ -1,0 +1,118 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxicuda"
+authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
+
+[workspace.dependencies]
+# Internal crates
+oxicuda-backend = { path = "crates/oxicuda-backend", version = "0.1.0" }
+oxicuda-driver = { path = "crates/oxicuda-driver", version = "0.1.0" }
+oxicuda-memory = { path = "crates/oxicuda-memory", version = "0.1.0" }
+oxicuda-launch = { path = "crates/oxicuda-launch", version = "0.1.0" }
+oxicuda-ptx = { path = "crates/oxicuda-ptx", version = "0.1.0" }
+oxicuda-autotune = { path = "crates/oxicuda-autotune", version = "0.1.0" }
+oxicuda-blas = { path = "crates/oxicuda-blas", version = "0.1.0" }
+oxicuda-dnn = { path = "crates/oxicuda-dnn", version = "0.1.0" }
+oxicuda-fft = { path = "crates/oxicuda-fft", version = "0.1.0" }
+oxicuda-sparse = { path = "crates/oxicuda-sparse", version = "0.1.0" }
+oxicuda-solver = { path = "crates/oxicuda-solver", version = "0.1.0" }
+oxicuda-rand = { path = "crates/oxicuda-rand", version = "0.1.0" }
+oxicuda-webgpu = { path = "crates/oxicuda-webgpu", version = "0.1.0" }
+oxicuda-vulkan = { path = "crates/oxicuda-vulkan", version = "0.1.0" }
+oxicuda-metal = { path = "crates/oxicuda-metal", version = "0.1.0" }
+oxicuda-rocm = { path = "crates/oxicuda-rocm", version = "0.1.0" }
+oxicuda-levelzero = { path = "crates/oxicuda-levelzero", version = "0.1.0" }
+oxicuda-primitives = { path = "crates/oxicuda-primitives", version = "0.1.0" }
+oxicuda-signal = { path = "crates/oxicuda-signal", version = "0.1.0" }
+oxicuda-graph = { path = "crates/oxicuda-graph", version = "0.1.0" }
+oxicuda-train = { path = "crates/oxicuda-train", version = "0.1.0" }
+oxicuda-rl    = { path = "crates/oxicuda-rl",    version = "0.1.0" }
+oxicuda-quant = { path = "crates/oxicuda-quant", version = "0.1.0" }
+oxicuda-infer      = { path = "crates/oxicuda-infer",      version = "0.1.0" }
+oxicuda-dist-infer = { path = "crates/oxicuda-dist-infer", version = "0.1.0" }
+oxicuda-lm         = { path = "crates/oxicuda-lm",         version = "0.1.0" }
+oxicuda-runtime    = { path = "crates/oxicuda-runtime",    version = "0.1.0" }
+
+# Vulkan bindings (runtime loader — no compile-time libvulkan dependency)
+ash = "0.38"
+
+# Metal GPU compute (macOS only)
+metal = "0.33"
+
+# WebGPU / cross-platform GPU compute
+wgpu = "29.0.1"
+pollster = "0.4.0"
+
+# WASM + WebGPU browser bindings
+wasm-bindgen = "0.2.118"
+js-sys = "0.3.95"
+
+# Dynamic loading
+libloading = "0.9"
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+
+# Numeric types
+num-complex = { version = "0.4", features = ["bytemuck"] }
+num-traits = "0.2"
+bytemuck = { version = "1.25", features = ["derive"] }
+half = { version = "2.7", features = ["num-traits", "bytemuck"] }
+
+# Serialization (autotune DB, PTX cache)
+serde = { version = "1.0", features = ["std", "derive"] }
+serde_json = "1.0"
+
+# Dev dependencies
+criterion = "0.8"
+proptest = "1.11"
+approx = "0.5"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_imports = "warn"
+unused_variables = "warn"
+dead_code = "warn"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+all = { level = "warn", priority = -1 }
+too_many_lines = "allow"
+module_name_repetitions = "allow"
+similar_names = "allow"
+too_many_arguments = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+wildcard_imports = "allow"
+missing_transmute_annotations = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.dev]
+opt-level = 0
+incremental = true
+debug = 1
+
+[profile.dev.package."*"]
+debug = 0

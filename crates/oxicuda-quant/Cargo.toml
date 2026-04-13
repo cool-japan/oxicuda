@@ -1,0 +1,27 @@
+[package]
+name = "oxicuda-quant"
+description = "GPU-accelerated quantization and model compression engine for OxiCUDA"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[dependencies]
+oxicuda-driver = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+num-traits     = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "quant_ops"
+harness = false
+
+[lints]
+workspace = true

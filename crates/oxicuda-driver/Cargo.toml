@@ -1,0 +1,40 @@
+[package]
+name = "oxicuda-driver"
+description = "OxiCUDA Driver - Dynamic CUDA driver API wrapper via libloading (zero SDK dependency)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "gpu", "driver", "nvidia", "compute"]
+categories = ["hardware-support", "api-bindings"]
+
+[dependencies]
+libloading.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+gpu-tests = []
+
+[[example]]
+name = "device_info"
+
+[[example]]
+name = "vector_add"
+
+[[example]]
+name = "jit_logging"
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "occupancy"
+harness = false
+
+[lints]
+workspace = true

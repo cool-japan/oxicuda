@@ -1,0 +1,21 @@
+[package]
+name = "oxicuda-levelzero"
+description = "OxiCUDA Level Zero — GPU compute via Intel oneAPI/Level Zero (pure Rust, libloading)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["level-zero", "intel", "oneapi", "gpu", "compute"]
+categories = ["hardware-support", "science", "mathematics"]
+
+[dependencies]
+oxicuda-backend.workspace = true
+libloading.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

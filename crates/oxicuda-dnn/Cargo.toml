@@ -1,0 +1,28 @@
+[package]
+name = "oxicuda-dnn"
+description = "OxiCUDA DNN - GPU-accelerated deep learning primitives (cuDNN equivalent)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "dnn", "gpu", "deep-learning", "convolution"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+oxicuda-memory.workspace = true
+oxicuda-launch.workspace = true
+oxicuda-blas.workspace = true
+oxicuda-ptx.workspace = true
+thiserror.workspace = true
+half = { workspace = true, optional = true }
+
+[features]
+default = []
+f16 = ["dep:half", "oxicuda-blas/f16"]
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "oxicuda-rocm"
+description = "OxiCUDA ROCm — GPU compute via AMD HIP runtime (pure Rust, libloading)"
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["rocm", "hip", "amd", "gpu", "compute"]
+categories = ["hardware-support", "science", "mathematics"]
+
+[dependencies]
+oxicuda-backend.workspace = true
+libloading.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

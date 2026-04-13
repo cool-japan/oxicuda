@@ -1,0 +1,30 @@
+[package]
+name = "oxicuda-blas"
+description = "OxiCUDA BLAS - GPU-accelerated BLAS operations (cuBLAS equivalent)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["cuda", "blas", "gpu", "linear-algebra", "gemm"]
+categories = ["mathematics", "science", "hardware-support"]
+
+[dependencies]
+oxicuda-driver.workspace = true
+oxicuda-memory.workspace = true
+oxicuda-launch.workspace = true
+oxicuda-ptx.workspace = true
+oxicuda-autotune = { workspace = true, optional = true }
+thiserror.workspace = true
+half = { workspace = true, optional = true }
+
+[features]
+default = []
+f16 = ["dep:half"]
+tensor-core = []
+all-precisions = ["f16"]
+
+[lints]
+workspace = true
