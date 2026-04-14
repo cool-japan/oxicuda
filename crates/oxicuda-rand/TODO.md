@@ -53,6 +53,7 @@ Current implementation covers three PRNG engines (Philox-4x32-10, XORWOW, MRG32k
 
 ## Quality Status
 
+- Tests: 264 passing
 - All production code uses Result/Option (no unwrap)
 - clippy::all and missing_docs warnings enabled
 - GPU tests behind `#[cfg(feature = "gpu-tests")]`

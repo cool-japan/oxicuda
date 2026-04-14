@@ -536,7 +536,8 @@ impl GemmDispatcher {
 
     /// Computes the grid dimensions for a GEMM launch.
     ///
-    /// Grid X covers the N dimension (columns), Grid Y covers M (rows).
+    /// Grid X covers the N dimension (columns) in units of `tile_n`.
+    /// Grid Y covers the M dimension (rows) in units of `tile_m`.
     /// If split-K > 1, Grid Z holds the K-partitions.
     fn compute_grid(problem: &GemmProblem, tc: &TileConfig) -> Dim3 {
         let grid_x = problem.n.div_ceil(tc.tile_n);
@@ -547,15 +548,17 @@ impl GemmDispatcher {
 
     /// Computes the block dimensions from the tile configuration.
     ///
-    /// The number of threads per block is derived from the warp tiles:
-    /// `(tile_m / warp_m) * (tile_n / warp_n) * 32` (one warp = 32 threads).
+    /// Each CTA (block) handles one `tile_m × tile_n` output tile using a
+    /// flat 1-D thread layout.  The number of warps is:
+    ///   `warps_m = tile_m / warp_m`
+    ///   `warps_n = tile_n / warp_n`
+    /// Total threads = `warps_m * warps_n * WARP_SIZE` (≤ 1 024).
     fn compute_block(tc: &TileConfig) -> Dim3 {
+        const WARP_SIZE: u32 = 32;
         let warps_m = tc.tile_m / tc.warp_m.max(1);
         let warps_n = tc.tile_n / tc.warp_n.max(1);
-        let total_threads = warps_m * warps_n * 32;
-        // Flatten into 1D block for simplicity; the kernel can decompose
-        // `threadIdx.x` into warp coordinates.
-        Dim3::x(total_threads)
+        let threads = (warps_m * warps_n * WARP_SIZE).min(1024);
+        Dim3::new(threads, 1, 1)
     }
 }
 

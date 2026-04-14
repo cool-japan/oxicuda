@@ -94,6 +94,136 @@ impl WebGpuBackend {
     }
 }
 
+impl WebGpuBackend {
+    /// FP16 GEMM: `C = alpha * A * B + beta * C` with half-precision storage.
+    ///
+    /// This is an inherent method (not on `ComputeBackend`) because FP16
+    /// support is WebGPU-specific and requires the `f16` WGSL extension.
+    ///
+    /// Buffers pointed to by `a_ptr`, `b_ptr`, `c_ptr` must contain `f16`
+    /// elements (2 bytes each).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        b_ptr: u64,
+        beta: f64,
+        c_ptr: u64,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+
+        let dev = self.device()?;
+        let mem = self.memory()?;
+
+        let tile_size: u32 = 8;
+        let wgsl = shader::gemm_wgsl_f16(tile_size);
+
+        let shader_mod = dev
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("oxicuda-gemm-f16"),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
+
+        let pipeline = dev
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("oxicuda-gemm-f16"),
+                layout: None,
+                module: &shader_mod,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let bgl = pipeline.get_bind_group_layout(0);
+
+        // Build uniform buffer for GemmParams { m, n, k, alpha, beta }.
+        let mut params_bytes = [0u8; 20];
+        params_bytes[0..4].copy_from_slice(&(m as u32).to_le_bytes());
+        params_bytes[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        params_bytes[8..12].copy_from_slice(&(k as u32).to_le_bytes());
+        params_bytes[12..16].copy_from_slice(&(alpha as f32).to_le_bytes());
+        params_bytes[16..20].copy_from_slice(&(beta as f32).to_le_bytes());
+
+        let uniform_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oxicuda-gemm-f16-params"),
+            size: 20,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        dev.queue.write_buffer(&uniform_buf, 0, &params_bytes);
+
+        let bind_group = {
+            let buffers = mem
+                .lock_buffers()
+                .map_err(|e| BackendError::DeviceError(e.to_string()))?;
+            let a_info = buffers
+                .get(&a_ptr)
+                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {a_ptr}")))?;
+            let b_info = buffers
+                .get(&b_ptr)
+                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {b_ptr}")))?;
+            let c_info = buffers
+                .get(&c_ptr)
+                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {c_ptr}")))?;
+
+            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("oxicuda-gemm-f16"),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a_info.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_info.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: c_info.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: uniform_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+
+        let mut encoder = dev
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("oxicuda-gemm-f16"),
+            });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("oxicuda-gemm-f16"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (n as u32).div_ceil(tile_size);
+            let wg_y = (m as u32).div_ceil(tile_size);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        dev.queue.submit(std::iter::once(encoder.finish()));
+        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+
+        Ok(())
+    }
+}
+
 impl Default for WebGpuBackend {
     fn default() -> Self {
         Self::new()
@@ -258,6 +388,152 @@ impl ComputeBackend for WebGpuBackend {
             let wg_x = (n as u32).div_ceil(tile_size);
             let wg_y = (m as u32).div_ceil(tile_size);
             pass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        dev.queue.submit(std::iter::once(encoder.finish()));
+        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batched_gemm(
+        &self,
+        trans_a: BackendTranspose,
+        trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        _lda: usize,
+        stride_a: usize,
+        b_ptr: u64,
+        _ldb: usize,
+        stride_b: usize,
+        beta: f64,
+        c_ptr: u64,
+        _ldc: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+
+        if batch_count == 0 || m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+
+        if trans_a != BackendTranspose::NoTrans || trans_b != BackendTranspose::NoTrans {
+            return Err(BackendError::Unsupported(
+                "WebGPU batched GEMM does not yet support transposed inputs".into(),
+            ));
+        }
+
+        let dev = self.device()?;
+        let mem = self.memory()?;
+
+        let tile_size: u32 = 8;
+        let wgsl = shader::batched_gemm_wgsl(tile_size);
+
+        let shader_mod = dev
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("oxicuda-batched-gemm"),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
+
+        let pipeline = dev
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("oxicuda-batched-gemm"),
+                layout: None,
+                module: &shader_mod,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let bgl = pipeline.get_bind_group_layout(0);
+
+        // BatchedGemmParams: m, n, k, alpha, beta, batch_count, stride_a, stride_b, stride_c
+        // 9 fields: 5 x u32/f32 + 4 x u32 = 36 bytes total
+        // But we need 16-byte alignment for uniform buffers. 36 rounds up to 48.
+        // Actually: 3 u32 + 2 f32 + 1 u32 + 3 u32 = 9 x 4 = 36 bytes.
+        // Pad to 48 for safety (16-byte aligned).
+        let mut params_bytes = [0u8; 48];
+        params_bytes[0..4].copy_from_slice(&(m as u32).to_le_bytes());
+        params_bytes[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        params_bytes[8..12].copy_from_slice(&(k as u32).to_le_bytes());
+        params_bytes[12..16].copy_from_slice(&(alpha as f32).to_le_bytes());
+        params_bytes[16..20].copy_from_slice(&(beta as f32).to_le_bytes());
+        params_bytes[20..24].copy_from_slice(&(batch_count as u32).to_le_bytes());
+        params_bytes[24..28].copy_from_slice(&(stride_a as u32).to_le_bytes());
+        params_bytes[28..32].copy_from_slice(&(stride_b as u32).to_le_bytes());
+        params_bytes[32..36].copy_from_slice(&(stride_c as u32).to_le_bytes());
+        // bytes 36..48 are padding zeros
+
+        let uniform_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("oxicuda-batched-gemm-params"),
+            size: 48,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        dev.queue.write_buffer(&uniform_buf, 0, &params_bytes);
+
+        let bind_group = {
+            let buffers = mem
+                .lock_buffers()
+                .map_err(|e| BackendError::DeviceError(e.to_string()))?;
+            let a_info = buffers
+                .get(&a_ptr)
+                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {a_ptr}")))?;
+            let b_info = buffers
+                .get(&b_ptr)
+                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {b_ptr}")))?;
+            let c_info = buffers
+                .get(&c_ptr)
+                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {c_ptr}")))?;
+
+            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("oxicuda-batched-gemm"),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a_info.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_info.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: c_info.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: uniform_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+
+        let mut encoder = dev
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("oxicuda-batched-gemm"),
+            });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("oxicuda-batched-gemm"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let wg_x = (n as u32).div_ceil(tile_size);
+            let wg_y = (m as u32).div_ceil(tile_size);
+            pass.dispatch_workgroups(wg_x, wg_y, batch_count as u32);
         }
 
         dev.queue.submit(std::iter::once(encoder.finish()));
@@ -1755,6 +2031,188 @@ mod tests {
         b.free(k_h).expect("free");
         b.free(v_h).expect("free");
         b.free(o_h).expect("free");
+    }
+
+    // ── Batched GEMM tests ─────────────────────────────────────────────
+
+    #[test]
+    fn batched_gemm_not_initialized() {
+        let b = WebGpuBackend::new();
+        let result = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            2,
+        );
+        assert_eq!(result, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn batched_gemm_zero_batch_noop() {
+        let Some(b) = try_init() else { return };
+        let result = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            0, // batch_count = 0
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn batched_gemm_zero_dims_noop() {
+        let Some(b) = try_init() else { return };
+        // m = 0
+        let result = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            0,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            2,
+        );
+        assert_eq!(result, Ok(()));
+        // n = 0
+        let result = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            0,
+            4,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            2,
+        );
+        assert_eq!(result, Ok(()));
+        // k = 0
+        let result = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            0,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            2,
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn batched_gemm_identity_2x2() {
+        let Some(b) = try_init() else { return };
+        // 2 batches of 2x2 identity multiply
+        // batch 0: A0=[[1,2],[3,4]] * I = [[1,2],[3,4]]
+        // batch 1: A1=[[5,6],[7,8]] * I = [[5,6],[7,8]]
+        let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let eye = [1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let c_init = [0.0f32; 8];
+
+        let a_h = upload_f32(&b, &a);
+        let b_h = upload_f32(&b, &eye);
+        let c_h = upload_f32(&b, &c_init);
+
+        b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            2,
+            2,
+            2,
+            1.0,
+            a_h,
+            2,
+            4, // stride_a = 2*2 = 4
+            b_h,
+            2,
+            4, // stride_b = 4
+            0.0,
+            c_h,
+            2,
+            4, // stride_c = 4
+            2, // batch_count
+        )
+        .expect("batched_gemm");
+
+        let result = download_f32(&b, c_h, 8);
+        for (r, e) in result.iter().zip(a.iter()) {
+            assert!((r - e).abs() < 1e-5, "got {r}, expected {e}");
+        }
+
+        b.free(a_h).expect("free");
+        b.free(b_h).expect("free");
+        b.free(c_h).expect("free");
+    }
+
+    // ── FP16 GEMM tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn gemm_f16_not_initialized() {
+        let b = WebGpuBackend::new();
+        let result = b.gemm_f16(4, 4, 4, 1.0, 0, 0, 0.0, 0);
+        assert_eq!(result, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn gemm_f16_zero_dims_noop() {
+        let Some(b) = try_init() else { return };
+        assert_eq!(b.gemm_f16(0, 4, 4, 1.0, 0, 0, 0.0, 0), Ok(()));
+        assert_eq!(b.gemm_f16(4, 0, 4, 1.0, 0, 0, 0.0, 0), Ok(()));
+        assert_eq!(b.gemm_f16(4, 4, 0, 1.0, 0, 0, 0.0, 0), Ok(()));
     }
 
     #[test]

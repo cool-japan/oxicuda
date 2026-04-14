@@ -45,6 +45,99 @@ kernel void gemm_f32(
 "#
 }
 
+// ─── Batched GEMM ────────────────────────────────────────────────────────────
+
+/// MSL source for a single-precision batched GEMM kernel.
+///
+/// For each batch `b` in `0..batch_count`:
+///   `C_b = alpha * A_b * B_b + beta * C_b`
+///
+/// where `A_b` starts at offset `b * stride_a`, etc.
+/// The batch index is derived from `threadgroup_position_in_grid.z`.
+pub fn batched_gemm_msl() -> &'static str {
+    r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct BatchedGemmParams {
+    uint m;
+    uint n;
+    uint k;
+    float alpha;
+    float beta;
+    uint batch_count;
+    uint stride_a;
+    uint stride_b;
+    uint stride_c;
+};
+
+kernel void batched_gemm_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c       [[buffer(2)]],
+    constant BatchedGemmParams& params [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    uint batch = tgid.z;
+    if (row >= params.m || col >= params.n || batch >= params.batch_count) return;
+
+    uint a_off = batch * params.stride_a;
+    uint b_off = batch * params.stride_b;
+    uint c_off = batch * params.stride_c;
+
+    float acc = 0.0f;
+    for (uint i = 0; i < params.k; i++) {
+        acc += a[a_off + row * params.k + i] * b[b_off + i * params.n + col];
+    }
+    uint out_idx = c_off + row * params.n + col;
+    c[out_idx] = params.alpha * acc + params.beta * c[out_idx];
+}
+"#
+}
+
+// ─── FP16 GEMM ──────────────────────────────────────────────────────────────
+
+/// MSL source for a half-precision GEMM kernel (`C = alpha*A*B + beta*C`).
+///
+/// Uses Metal `half` type for storage buffers but keeps accumulation in `float`
+/// for numerical precision.
+pub fn gemm_msl_f16() -> &'static str {
+    r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct GemmParamsF16 {
+    uint m;
+    uint n;
+    uint k;
+    float alpha;
+    float beta;
+};
+
+kernel void gemm_f16(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* c       [[buffer(2)]],
+    constant GemmParamsF16& params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= params.m || col >= params.n) return;
+
+    float acc = 0.0f;
+    for (uint i = 0; i < params.k; i++) {
+        acc += float(a[row * params.k + i]) * float(b[i * params.n + col]);
+    }
+    uint out_idx = row * params.n + col;
+    c[out_idx] = half(params.alpha * acc + params.beta * float(c[out_idx]));
+}
+"#
+}
+
 // ─── Elementwise unary ────────────────────────────────────────────────────────
 
 /// MSL source for an element-wise unary kernel.
@@ -433,6 +526,72 @@ mod tests {
         assert!(src.contains("gemm_f32"));
         assert!(src.contains("GemmParams"));
         assert!(src.contains("metal_stdlib"));
+    }
+
+    #[test]
+    fn msl_batched_gemm_contains_kernel_name() {
+        let src = batched_gemm_msl();
+        assert!(src.contains("batched_gemm_f32"));
+        assert!(src.contains("BatchedGemmParams"));
+        assert!(src.contains("metal_stdlib"));
+        assert!(src.contains("batch_count"));
+        assert!(src.contains("stride_a"));
+        assert!(src.contains("stride_b"));
+        assert!(src.contains("stride_c"));
+    }
+
+    #[test]
+    fn msl_batched_gemm_uses_3d_grid() {
+        let src = batched_gemm_msl();
+        assert!(src.contains("uint3 gid"));
+        assert!(src.contains("uint3 tgid"));
+        assert!(src.contains("tgid.z"));
+    }
+
+    #[test]
+    fn msl_gemm_f16_contains_kernel_name() {
+        let src = gemm_msl_f16();
+        assert!(src.contains("gemm_f16"));
+        assert!(src.contains("GemmParamsF16"));
+        assert!(src.contains("metal_stdlib"));
+    }
+
+    #[test]
+    fn msl_gemm_f16_uses_half_type() {
+        let src = gemm_msl_f16();
+        assert!(src.contains("half"));
+        assert!(src.contains("device const half*"));
+        assert!(src.contains("device half*"));
+        // Accumulation should be in float for precision
+        assert!(src.contains("float acc"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn msl_batched_gemm_compiles_on_macos() {
+        use metal::{CompileOptions, Device};
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let opts = CompileOptions::new();
+        match device.new_library_with_source(batched_gemm_msl(), &opts) {
+            Ok(_) => {}
+            Err(e) => panic!("Batched GEMM MSL failed to compile: {e}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn msl_gemm_f16_compiles_on_macos() {
+        use metal::{CompileOptions, Device};
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let opts = CompileOptions::new();
+        match device.new_library_with_source(gemm_msl_f16(), &opts) {
+            Ok(_) => {}
+            Err(e) => panic!("FP16 GEMM MSL failed to compile: {e}"),
+        }
     }
 
     #[test]

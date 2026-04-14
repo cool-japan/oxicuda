@@ -53,7 +53,7 @@ Vol.1 Foundation covers driver + memory + launch. The driver crate is the lowest
 ## Quality Status
 
 - Warnings: 0
-- Tests: 118 passing
+- Tests: 333 passing
 - unwrap() calls: 0
 - Clippy: clean (pedantic + nursery)
 

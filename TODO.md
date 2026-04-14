@@ -3,12 +3,12 @@
 Pure Rust CUDA replacement for the COOLJAPAN ecosystem.
 (C) 2026 COOLJAPAN OU (Team KitaSan)
 
-## Project Status (v0.1.1 — 2026-04-14)
+## Project Status (v0.1.2 — 2026-04-14)
 
 - **Crates**: 28 workspace members (27 library crates + 1 umbrella)
-- **Files**: 751 Rust source files
-- **Code**: 247,812 SLoC (Rust, `tokei` verified)
-- **Tests**: 7,169 passing, 2 skipped (GPU-only on macOS)
+- **Files**: 755 Rust source files
+- **Code**: 253,125 SLoC (Rust, `tokei` verified)
+- **Tests**: 7,263 passing, 2 skipped (GPU-only on macOS)
 - **Warnings**: 0 (clippy + rustc, `-D warnings`)
 - **unwrap() calls**: 0 (no-unwrap policy in library code)
 - **Status**: All 10 volumes complete — Vol.1 Foundation, Vol.2 PTX/Autotune, Vol.3 BLAS, Vol.4 DNN, Vol.5 Scientific Computing, Vol.6 Signal Processing, Vol.7 Computation Graph, Vol.8 GPU Training, Vol.9 Inference Engine, Vol.10 Reinforcement Learning, plus 7 backend crates (Metal/Vulkan/WebGPU/ROCm/LevelZero/primitives/backend) with full compute operations wired
@@ -844,9 +844,9 @@ and GPU kernel PTX string generators.
 | Clippy warnings | 0 | 0 |
 | unwrap() in library code | 0 | 0 |
 | C/Fortran build deps | 0 | 0 |
-| Test count | >500 | 7,168 |
+| Test count | >500 | 7,263 |
 | Test pass rate | 100% | 100% |
-| Code lines (SLoC) | >30K | 247,822 |
+| Code lines (SLoC) | >30K | 253,125 |
 | Crate count | 12 | 28 |
 | GPU arch coverage | SM 7.5--10.0 | SM 7.5--10.0 |
 | Pure Rust | 100% default features | 100% |
@@ -891,7 +891,9 @@ All 5 alternative GPU backend crates now have compute operations (GEMM, Conv2D, 
 - [x] Reduction (sum, max, min, mean) with `reduction_wgsl` + `reduction_final_wgsl`
 - [x] Conv2D forward (WGSL NCHW compute shader + CPU fallback)
 - [x] Attention (WGSL scaled dot-product + stable softmax + causal masking)
-- 72 tests passing
+- [x] Batched GEMM (`batched_gemm_wgsl` shader + trait override with 3D dispatch)
+- [x] FP16 GEMM (`gemm_wgsl_f16` shader with `enable f16` + `gemm_f16()` method)
+- 86 tests passing
 
 ### oxicuda-metal — MSL Shader Dispatch via metal-rs
 - [x] GEMM compute shader (MSL tiled matrix multiply)
@@ -900,7 +902,9 @@ All 5 alternative GPU backend crates now have compute operations (GEMM, Conv2D, 
 - [x] Reduction (sum, max, min, mean) with dedicated MSL max/min/mean shaders
 - [x] Conv2D forward (MSL NCHW compute shader + CPU fallback)
 - [x] Attention (MSL scaled dot-product + stable softmax + causal masking)
-- 108 tests passing
+- [x] Batched GEMM (`batched_gemm_msl` shader + trait override with 3D threadgroup dispatch)
+- [x] FP16 GEMM (`gemm_msl_f16` shader with Metal `half` type + `gemm_f16()` method)
+- 121 tests passing
 
 ### oxicuda-vulkan — SPIR-V Compute Shader Dispatch via ash
 - [x] GEMM compute shader (SPIR-V tiled matrix multiply)
@@ -909,7 +913,8 @@ All 5 alternative GPU backend crates now have compute operations (GEMM, Conv2D, 
 - [x] Reduction (SPIR-V generator for sum, max, min, mean)
 - [x] Conv2D forward (SPIR-V NCHW compute shader + CPU fallback)
 - [x] Attention (SPIR-V scaled dot-product + stable softmax + causal masking)
-- 61 tests passing
+- [x] Batched GEMM (`batched_gemm_compute_shader` SPIR-V + trait override with 3D dispatch)
+- 66 tests passing
 
 ### oxicuda-rocm — HIP Kernel String Generators + Host-Side Dispatch
 - [x] GEMM kernel (HIP tiled matrix multiply)
@@ -918,7 +923,8 @@ All 5 alternative GPU backend crates now have compute operations (GEMM, Conv2D, 
 - [x] Reduction (HIP kernel generator for sum, max, min, mean)
 - [x] Attention kernel (HIP fused attention)
 - [x] Conv2D kernel (HIP convolution)
-- 50 tests passing
+- [x] Batched GEMM (`batched_gemm_hip` kernel + trait override with CPU fallback)
+- 56 tests passing
 
 ### oxicuda-levelzero — OpenCL SPIR-V Kernel Dispatch
 - [x] GEMM kernel (OpenCL SPIR-V generator)
@@ -927,7 +933,8 @@ All 5 alternative GPU backend crates now have compute operations (GEMM, Conv2D, 
 - [x] Reduction (OpenCL SPIR-V generator for sum, max, min, mean)
 - [x] Conv2D forward (OpenCL SPIR-V NCHW compute shader + CPU fallback)
 - [x] Attention (OpenCL SPIR-V scaled dot-product + stable softmax + causal masking)
-- 63 tests passing
+- [x] Batched GEMM (`batched_gemm_compute_shader` OpenCL SPIR-V + trait override with 3D dispatch)
+- 69 tests passing
 
 ---
 

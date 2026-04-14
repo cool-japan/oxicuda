@@ -70,7 +70,7 @@ The autotune crate provides the optimization loop that makes OxiCUDA kernels com
 ## Quality Status
 
 - Warnings: 0
-- Tests: 57 passing (47 unit + 10 doc-tests)
+- Tests: 408 passing
 - unwrap() calls: 0
 - ResultDb uses JSON for human-readable, debuggable persistence
 

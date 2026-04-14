@@ -7,7 +7,7 @@ SPIR-V compute shader dispatch. Part of [OxiCUDA](https://github.com/cool-japan/
 
 ## Implementation Status
 
-- **Tests**: 61 passing
+- **Tests**: 77 passing
 - **Status**: Memory + Compute operations via SPIR-V
 
 ### Completed
@@ -34,10 +34,10 @@ SPIR-V compute shader dispatch. Part of [OxiCUDA](https://github.com/cool-japan/
 
 ### Future Enhancements
 
-- [ ] Batched GEMM support
-- [ ] Subgroup (warp-level) optimizations
-- [ ] Vulkan descriptor set caching / pipeline caching
-- [ ] Multi-queue async compute
+- [x] Batched GEMM support (`batched_gemm_compute_shader` SPIR-V + `batched_gemm()` trait override)
+- [x] Subgroup (warp-level) optimizations (`reduction_subgroup_spirv`, `scan_subgroup_spirv` with GroupNonUniform)
+- [x] Vulkan descriptor set caching / pipeline caching (`ShaderKey` hash + `Mutex<HashMap>` cache in backend)
+- [x] Multi-queue async compute (`AsyncComputeManager` with round-robin, fences, timeline semaphores)
 
 ## Dependencies
 
@@ -50,6 +50,6 @@ SPIR-V compute shader dispatch. Part of [OxiCUDA](https://github.com/cool-japan/
 ## Quality Status
 
 - Warnings: 0
-- Tests: 61 passing
+- Tests: 77 passing
 - unwrap() calls: 0
 - Clippy: clean

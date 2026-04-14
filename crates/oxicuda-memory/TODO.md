@@ -46,7 +46,7 @@ The memory crate provides the core buffer types and copy operations that all hig
 ## Quality Status
 
 - Warnings: 0
-- Tests: 4 passing (4 doc-tests), 0 unit tests (GPU-dependent operations)
+- Tests: 204 passing
 - unwrap() calls: 0
 - Drop implementations log errors via tracing::warn, never panic
 

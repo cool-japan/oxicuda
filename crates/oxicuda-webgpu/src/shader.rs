@@ -45,6 +45,107 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     )
 }
 
+/// Generate WGSL source for a batched (strided) GEMM kernel.
+///
+/// For each batch `b` in `0..batch_count`:
+///   `C_b = alpha * A_b * B_b + beta * C_b`
+/// where `A_b` starts at `a[b * stride_a]`, etc.
+///
+/// Uses `tile_size × tile_size` workgroups with Z = batch_count.
+///
+/// # Arguments
+///
+/// * `tile_size` — workgroup tile dimension (e.g. 8, 16, 32).
+pub fn batched_gemm_wgsl(tile_size: u32) -> String {
+    format!(
+        r#"
+struct BatchedGemmParams {{
+    m:        u32,
+    n:        u32,
+    k:        u32,
+    alpha:    f32,
+    beta:     f32,
+    batch_count: u32,
+    stride_a: u32,
+    stride_b: u32,
+    stride_c: u32,
+}}
+
+@group(0) @binding(0) var<storage, read>       a:      array<f32>;
+@group(0) @binding(1) var<storage, read>       b:      array<f32>;
+@group(0) @binding(2) var<storage, read_write> c:      array<f32>;
+@group(0) @binding(3) var<uniform>             params: BatchedGemmParams;
+
+@compute @workgroup_size({ts}, {ts})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let row = gid.y;
+    let col = gid.x;
+    let batch_index = gid.z;
+    if (batch_index >= params.batch_count || row >= params.m || col >= params.n) {{ return; }}
+
+    let a_offset = batch_index * params.stride_a;
+    let b_offset = batch_index * params.stride_b;
+    let c_offset = batch_index * params.stride_c;
+
+    var acc: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.k; i = i + 1u) {{
+        acc += a[a_offset + row * params.k + i] * b[b_offset + i * params.n + col];
+    }}
+
+    let idx = c_offset + row * params.n + col;
+    c[idx] = params.alpha * acc + params.beta * c[idx];
+}}
+"#,
+        ts = tile_size
+    )
+}
+
+/// Generate WGSL source for a tiled GEMM kernel using FP16 storage.
+///
+/// Uses `enable f16;` WGSL extension. Storage buffers use `array<f16>`,
+/// but accumulation is done in f32 for precision.
+///
+/// # Arguments
+///
+/// * `tile_size` — workgroup tile dimension (e.g. 8, 16, 32).
+pub fn gemm_wgsl_f16(tile_size: u32) -> String {
+    format!(
+        r#"
+enable f16;
+
+struct GemmParams {{
+    m:     u32,
+    n:     u32,
+    k:     u32,
+    alpha: f32,
+    beta:  f32,
+}}
+
+@group(0) @binding(0) var<storage, read>       a:      array<f16>;
+@group(0) @binding(1) var<storage, read>       b:      array<f16>;
+@group(0) @binding(2) var<storage, read_write> c:      array<f16>;
+@group(0) @binding(3) var<uniform>             params: GemmParams;
+
+@compute @workgroup_size({ts}, {ts})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let row = gid.y;
+    let col = gid.x;
+    if (row >= params.m || col >= params.n) {{ return; }}
+
+    var acc: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.k; i = i + 1u) {{
+        acc += f32(a[row * params.k + i]) * f32(b[i * params.n + col]);
+    }}
+
+    let idx = row * params.n + col;
+    let prev = f32(c[idx]);
+    c[idx] = f16(params.alpha * acc + params.beta * prev);
+}}
+"#,
+        ts = tile_size
+    )
+}
+
 /// Generate WGSL source for an element-wise unary operation.
 ///
 /// The shader reads `n` elements from `input`, applies the operation, and
@@ -641,6 +742,68 @@ mod tests {
     fn wgsl_attention_embeds_scale() {
         let src = attention_wgsl(2, 16, 16, 64, 0.125, false);
         assert!(src.contains("0.125"));
+    }
+
+    // ── batched_gemm_wgsl tests ────────────────────────────────────────────
+
+    #[test]
+    fn wgsl_batched_gemm_contains_batch_params() {
+        let src = batched_gemm_wgsl(16);
+        assert!(src.contains("batch_count"));
+        assert!(src.contains("stride_a"));
+        assert!(src.contains("stride_b"));
+        assert!(src.contains("stride_c"));
+    }
+
+    #[test]
+    fn wgsl_batched_gemm_contains_workgroup() {
+        let src = batched_gemm_wgsl(16);
+        assert!(src.contains("@compute @workgroup_size(16, 16)"));
+        assert!(src.contains("BatchedGemmParams"));
+    }
+
+    #[test]
+    fn wgsl_batched_gemm_uses_batch_index() {
+        let src = batched_gemm_wgsl(8);
+        assert!(src.contains("batch_index"));
+        assert!(src.contains("gid.z"));
+    }
+
+    #[test]
+    fn wgsl_batched_gemm_tile_size_embedded() {
+        let src8 = batched_gemm_wgsl(8);
+        assert!(src8.contains("@workgroup_size(8, 8)"));
+        let src32 = batched_gemm_wgsl(32);
+        assert!(src32.contains("@workgroup_size(32, 32)"));
+    }
+
+    // ── gemm_wgsl_f16 tests ─────────────────────────────────────────────
+
+    #[test]
+    fn wgsl_gemm_f16_enables_extension() {
+        let src = gemm_wgsl_f16(16);
+        assert!(src.contains("enable f16;"));
+    }
+
+    #[test]
+    fn wgsl_gemm_f16_uses_f16_storage() {
+        let src = gemm_wgsl_f16(16);
+        assert!(src.contains("array<f16>"));
+    }
+
+    #[test]
+    fn wgsl_gemm_f16_accumulates_in_f32() {
+        let src = gemm_wgsl_f16(16);
+        assert!(src.contains("var acc: f32 = 0.0;"));
+        assert!(src.contains("f32(a["));
+        assert!(src.contains("f32(b["));
+    }
+
+    #[test]
+    fn wgsl_gemm_f16_contains_workgroup() {
+        let src = gemm_wgsl_f16(8);
+        assert!(src.contains("@compute @workgroup_size(8, 8)"));
+        assert!(src.contains("GemmParams"));
     }
 
     #[test]

@@ -27,7 +27,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-rocm = "0.1.1"
+oxicuda-rocm = "0.1.2"
 ```
 
 ```rust

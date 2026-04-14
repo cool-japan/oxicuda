@@ -7,7 +7,7 @@ on macOS through MSL shader dispatch. Part of [OxiCUDA](https://github.com/cool-
 
 ## Implementation Status
 
-- **Tests**: 108 passing
+- **Tests**: 121 passing
 - **Status**: Memory + Compute operations for macOS
 
 ### Completed
@@ -42,8 +42,8 @@ on macOS through MSL shader dispatch. Part of [OxiCUDA](https://github.com/cool-
 
 ### Future Enhancements
 
-- [ ] Batched GEMM support
-- [ ] FP16 support via Metal half-precision
+- [x] Batched GEMM support (`batched_gemm_msl` shader + `batched_gemm()` trait override)
+- [x] FP16 support via Metal half-precision (`gemm_msl_f16` shader + `gemm_f16()` method)
 - [ ] Apple Silicon neural engine integration
 - [ ] Metal Performance Shaders (MPS) interop
 
@@ -58,6 +58,6 @@ on macOS through MSL shader dispatch. Part of [OxiCUDA](https://github.com/cool-
 ## Quality Status
 
 - Warnings: 0
-- Tests: 108 passing
+- Tests: 121 passing
 - unwrap() calls: 0
 - Clippy: clean

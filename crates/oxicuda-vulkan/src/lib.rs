@@ -30,6 +30,7 @@
 //!
 //! [`ComputeBackend`]: oxicuda_backend::ComputeBackend
 
+pub mod async_compute;
 pub mod backend;
 pub mod command;
 pub mod device;
@@ -38,5 +39,6 @@ pub mod memory;
 pub mod pipeline;
 pub mod spirv;
 
+pub use async_compute::{AsyncComputeManager, VulkanFence, VulkanSemaphore};
 pub use backend::VulkanBackend;
 pub use error::{VulkanError, VulkanResult};

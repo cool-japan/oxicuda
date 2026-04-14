@@ -22,7 +22,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-runtime = "0.1.1"
+oxicuda-runtime = "0.1.2"
 ```
 
 ```rust

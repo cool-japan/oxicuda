@@ -7,7 +7,7 @@ through WGSL shader dispatch. Part of [OxiCUDA](https://github.com/cool-japan/ox
 
 ## Implementation Status
 
-- **Tests**: 72 passing
+- **Tests**: 91 passing
 - **Status**: Memory + Compute operations fully wired
 
 ### Completed
@@ -34,9 +34,9 @@ through WGSL shader dispatch. Part of [OxiCUDA](https://github.com/cool-japan/ox
 
 ### Future Enhancements
 
-- [ ] Batched GEMM support
-- [ ] FP16 support via wgpu f16 extension
-- [ ] WebAssembly target support for browser-based GPU compute
+- [x] Batched GEMM support (`batched_gemm_wgsl` shader + `batched_gemm()` trait override)
+- [x] FP16 support via wgpu f16 extension (`gemm_wgsl_f16` shader + `gemm_f16()` method)
+- [x] WebAssembly target support for browser-based GPU compute (`WasmBackend`, `WasmMemoryManager`, `wasm` feature flag)
 
 ## Dependencies
 
@@ -49,6 +49,6 @@ through WGSL shader dispatch. Part of [OxiCUDA](https://github.com/cool-japan/ox
 ## Quality Status
 
 - Warnings: 0
-- Tests: 72 passing
+- Tests: 91 passing
 - unwrap() calls: 0
 - Clippy: clean

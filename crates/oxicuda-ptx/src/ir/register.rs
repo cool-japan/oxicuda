@@ -48,6 +48,8 @@ pub struct RegisterAllocator {
     counters: HashMap<&'static str, u32>,
     /// Track which (prefix, `PtxType`) pairs have been used for declarations.
     used_types: Vec<(&'static str, PtxType)>,
+    /// Explicitly named registers (e.g., `%f_x`) declared via [`Self::declare_named`].
+    named_registers: Vec<(String, PtxType)>,
 }
 
 impl RegisterAllocator {
@@ -57,6 +59,7 @@ impl RegisterAllocator {
         Self {
             counters: HashMap::new(),
             used_types: Vec::new(),
+            named_registers: Vec::new(),
         }
     }
 
@@ -105,6 +108,17 @@ impl RegisterAllocator {
         (0..count).map(|_| self.alloc(ty)).collect()
     }
 
+    /// Declares a named register for use in raw PTX.
+    ///
+    /// Unlike [`alloc`](Self::alloc), this accepts an arbitrary register name
+    /// (e.g., `%f_x`, `%rd_off`) and ensures it appears in the `.reg`
+    /// declarations emitted by [`emit_declarations`](Self::emit_declarations).
+    pub fn declare_named(&mut self, name: &str, ty: PtxType) {
+        if !self.named_registers.iter().any(|(n, _)| n == name) {
+            self.named_registers.push((name.to_string(), ty));
+        }
+    }
+
     /// Emits `.reg` declaration lines for all allocated register types.
     ///
     /// Each declaration uses the PTX range syntax (e.g., `.reg .f32 %f<4>;`)
@@ -129,6 +143,11 @@ impl RegisterAllocator {
                 .map_or(".b32", |(_, ty)| ty.reg_type().as_ptx_str());
 
             declarations.push(format!(".reg {ptx_type_str} %{prefix}<{count}>;"));
+        }
+
+        // Emit named register declarations (e.g., `.reg .b64 %rd_off;`).
+        for (name, ty) in &self.named_registers {
+            declarations.push(format!(".reg {} {name};", ty.reg_type().as_ptx_str()));
         }
 
         declarations.sort();

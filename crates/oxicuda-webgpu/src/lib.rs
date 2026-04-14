@@ -46,5 +46,10 @@ pub mod error;
 pub mod memory;
 pub mod shader;
 
+// WASM target support — compiled on wasm32 or when the `wasm` feature is
+// enabled (so that native tests can exercise the module).
+#[cfg(any(target_arch = "wasm32", feature = "wasm"))]
+pub mod wasm;
+
 pub use backend::WebGpuBackend;
 pub use error::{WebGpuError, WebGpuResult};

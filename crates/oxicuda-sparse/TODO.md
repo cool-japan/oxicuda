@@ -61,6 +61,7 @@ Current implementation covers five sparse formats (CSR, CSC, COO, BSR, ELL), for
 
 ## Quality Status
 
+- Tests: 320 passing
 - All production code uses Result/Option (no unwrap)
 - clippy::all and missing_docs warnings enabled
 - GPU tests behind `#[cfg(feature = "gpu-tests")]`

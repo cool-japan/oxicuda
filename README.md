@@ -5,7 +5,7 @@
 [![CI](https://github.com/cool-japan/oxicuda/workflows/CI/badge.svg)](https://github.com/cool-japan/oxicuda/actions)
 [![License](https://img.shields.io/crates/l/oxicuda.svg)](LICENSE)
 
-**Pure Rust CUDA replacement -- cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSOLVER, cuRAND and beyond in ~248K lines of safe Rust across 28 crates.**
+**Pure Rust CUDA replacement -- cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSOLVER, cuRAND and beyond in ~253K lines of safe Rust across 28 crates.**
 
 OxiCUDA replaces the entire NVIDIA CUDA Toolkit software stack with type-safe,
 memory-safe Rust code. The only runtime dependency is the NVIDIA driver
@@ -242,16 +242,16 @@ fn main() -> Result<(), oxicuda::Error> {
 | **Vol.10 -- Reinforcement Learning** | | | | |
 | `oxicuda-rl` | -- | Replay buffers, policy dists, PPO/DQN/SAC/TD3 | 4,522 | 164 |
 | **Backends** | | | | |
-| `oxicuda-backend` | -- | Backend trait abstraction | 271 | 7 |
+| `oxicuda-backend` | -- | Backend trait abstraction | 271 | 10 |
 | `oxicuda-primitives` | CUB | GPU scan, reduce, sort, histogram | 4,446 | 142 |
-| `oxicuda-metal` | -- | Metal compute backend (macOS) | 3,328 | 108 |
-| `oxicuda-vulkan` | -- | Vulkan Compute backend | 3,377 | 61 |
-| `oxicuda-webgpu` | -- | WebGPU backend | 2,334 | 72 |
-| `oxicuda-rocm` | -- | AMD ROCm backend | 1,995 | 50 |
-| `oxicuda-levelzero` | -- | Intel oneAPI / LevelZero backend | 3,914 | 63 |
+| `oxicuda-metal` | -- | Metal compute backend (macOS) | 3,328 | 119 |
+| `oxicuda-vulkan` | -- | Vulkan Compute backend | 3,377 | 86 |
+| `oxicuda-webgpu` | -- | WebGPU backend | 2,334 | 91 |
+| `oxicuda-rocm` | -- | AMD ROCm backend | 1,995 | 68 |
+| `oxicuda-levelzero` | -- | Intel oneAPI / LevelZero backend | 3,914 | 82 |
 | **Umbrella** | | | | |
 | `oxicuda` | -- | Umbrella re-export crate | 19,614 | 494 |
-| | | **Total** | **247,717** | **7,168** |
+| | | **Total** | **253,125** | **7,263** |
 
 ## Feature Flags
 
@@ -342,7 +342,7 @@ cargo nextest run --all-features
 
 ## Roadmap
 
-**Released (v0.1.1) -- 2026-04-14**
+**Released (v0.1.2) -- 2026-04-14**
 - Vol.1: Driver, Memory, Launch, Runtime -- foundation layer (4 crates, 23,025 SLoC)
 - Vol.2: PTX codegen DSL, autotuner engine (2 crates, 43,354 SLoC)
 - Vol.3: Full BLAS L1/L2/L3 with Tensor Core GEMM (21,845 SLoC)

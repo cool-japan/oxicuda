@@ -43,7 +43,7 @@ The launch crate ties together driver (module/function) and memory (buffers) int
 ## Quality Status
 
 - Warnings: 0
-- Tests: 42 passing (31 unit + 11 doc-tests)
+- Tests: 207 passing
 - unwrap() calls: 0
 - Kernel owns Module via Arc -- safe shared ownership across threads
 

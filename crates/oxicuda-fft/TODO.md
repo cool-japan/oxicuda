@@ -66,6 +66,7 @@ Current implementation covers the core FFT pipeline: plan creation, Stockham ker
 
 ## Quality Status
 
+- Tests: 295 passing
 - All production code uses Result/Option (no unwrap)
 - clippy::all and missing_docs warnings enabled
 - GPU tests behind `#[cfg(feature = "gpu-tests")]`

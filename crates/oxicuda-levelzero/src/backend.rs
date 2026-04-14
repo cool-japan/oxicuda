@@ -120,6 +120,47 @@ impl ComputeBackend for LevelZeroBackend {
         self.dispatch_gemm(m, n, k, alpha as f32, a_ptr, b_ptr, beta as f32, c_ptr)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn batched_gemm(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        _lda: usize,
+        stride_a: usize,
+        b_ptr: u64,
+        _ldb: usize,
+        stride_b: usize,
+        beta: f64,
+        c_ptr: u64,
+        _ldc: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        if batch_count == 0 || m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        self.dispatch_batched_gemm(
+            m,
+            n,
+            k,
+            alpha as f32,
+            a_ptr,
+            b_ptr,
+            beta as f32,
+            c_ptr,
+            batch_count,
+            stride_a,
+            stride_b,
+            stride_c,
+        )
+    }
+
     fn conv2d_forward(
         &self,
         input_ptr: u64,
@@ -769,6 +810,282 @@ impl LevelZeroBackend {
         self.run_kernel(&spv, &args, total_output.div_ceil(WORKGROUP_SIZE))
     }
 
+    /// Dispatch a SPIR-V compute kernel with a 3D work group count.
+    ///
+    /// Like [`run_kernel`](Self::run_kernel) but supports 3D dispatch via
+    /// `(group_count_x, group_count_y, group_count_z)`.
+    fn run_kernel_3d(
+        &self,
+        spv_words: &[u32],
+        args: &[KernelArg],
+        workgroups_x: u32,
+        workgroups_y: u32,
+        workgroups_z: u32,
+    ) -> BackendResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            use std::ffi::c_void;
+
+            use crate::device::{
+                ZE_MODULE_FORMAT_IL_SPIRV, ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC,
+                ZE_STRUCTURE_TYPE_KERNEL_DESC, ZE_STRUCTURE_TYPE_MODULE_DESC, ZeCommandListDesc,
+                ZeGroupCount, ZeKernelDesc, ZeKernelHandle, ZeModuleDesc, ZeModuleHandle,
+            };
+
+            let device = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let memory = self.memory()?;
+            let api = &device.api;
+            let context = device.context;
+            let dev_handle = device.device;
+            let queue = device.queue;
+
+            // ── 1. SPIR-V words → bytes ──
+            let spv_bytes: Vec<u8> = spv_words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+
+            // ── 2. Create module ──
+            let module_desc = ZeModuleDesc {
+                stype: ZE_STRUCTURE_TYPE_MODULE_DESC,
+                p_next: std::ptr::null(),
+                format: ZE_MODULE_FORMAT_IL_SPIRV,
+                input_size: spv_bytes.len(),
+                p_input_module: spv_bytes.as_ptr(),
+                p_build_flags: std::ptr::null(),
+                p_constants: std::ptr::null(),
+            };
+            let mut module: ZeModuleHandle = std::ptr::null_mut();
+            let rc = unsafe {
+                (api.ze_module_create)(
+                    context,
+                    dev_handle,
+                    &module_desc,
+                    &mut module as *mut ZeModuleHandle,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 {
+                return Err(BackendError::DeviceError(format!(
+                    "zeModuleCreate failed: 0x{rc:08x}"
+                )));
+            }
+
+            // ── 3. Create kernel ──
+            let kernel_name = b"main\0";
+            let kernel_desc = ZeKernelDesc {
+                stype: ZE_STRUCTURE_TYPE_KERNEL_DESC,
+                p_next: std::ptr::null(),
+                flags: 0,
+                p_kernel_name: kernel_name.as_ptr(),
+            };
+            let mut kernel: ZeKernelHandle = std::ptr::null_mut();
+            let rc = unsafe {
+                (api.ze_kernel_create)(module, &kernel_desc, &mut kernel as *mut ZeKernelHandle)
+            };
+            if rc != 0 {
+                unsafe { (api.ze_module_destroy)(module) };
+                return Err(BackendError::DeviceError(format!(
+                    "zeKernelCreate failed: 0x{rc:08x}"
+                )));
+            }
+
+            // ── 4. Set group size ──
+            let rc = unsafe { (api.ze_kernel_set_group_size)(kernel, WORKGROUP_SIZE, 1, 1) };
+            if rc != 0 {
+                unsafe {
+                    (api.ze_kernel_destroy)(kernel);
+                    (api.ze_module_destroy)(module);
+                }
+                return Err(BackendError::DeviceError(format!(
+                    "zeKernelSetGroupSize failed: 0x{rc:08x}"
+                )));
+            }
+
+            // ── 5. Set kernel arguments ──
+            for (idx, arg) in args.iter().enumerate() {
+                let rc = match arg {
+                    KernelArg::Buffer(handle) => {
+                        let dev_ptr = memory.device_ptr(*handle).map_err(|e| {
+                            unsafe {
+                                (api.ze_kernel_destroy)(kernel);
+                                (api.ze_module_destroy)(module);
+                            }
+                            BackendError::from(e)
+                        })?;
+                        unsafe {
+                            (api.ze_kernel_set_argument_value)(
+                                kernel,
+                                idx as u32,
+                                std::mem::size_of::<*mut c_void>(),
+                                &dev_ptr as *const *mut c_void as *const c_void,
+                            )
+                        }
+                    }
+                    KernelArg::U32(val) => unsafe {
+                        (api.ze_kernel_set_argument_value)(
+                            kernel,
+                            idx as u32,
+                            std::mem::size_of::<u32>(),
+                            val as *const u32 as *const c_void,
+                        )
+                    },
+                    KernelArg::F32(val) => unsafe {
+                        (api.ze_kernel_set_argument_value)(
+                            kernel,
+                            idx as u32,
+                            std::mem::size_of::<f32>(),
+                            val as *const f32 as *const c_void,
+                        )
+                    },
+                };
+                if rc != 0 {
+                    unsafe {
+                        (api.ze_kernel_destroy)(kernel);
+                        (api.ze_module_destroy)(module);
+                    }
+                    return Err(BackendError::DeviceError(format!(
+                        "zeKernelSetArgumentValue(arg={idx}) failed: 0x{rc:08x}"
+                    )));
+                }
+            }
+
+            // ── 6. Create command list ──
+            let list_desc = ZeCommandListDesc {
+                stype: ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC,
+                p_next: std::ptr::null(),
+                command_queue_group_ordinal: 0,
+                flags: 0,
+            };
+            let mut list = std::ptr::null_mut();
+            let rc =
+                unsafe { (api.ze_command_list_create)(context, dev_handle, &list_desc, &mut list) };
+            if rc != 0 {
+                unsafe {
+                    (api.ze_kernel_destroy)(kernel);
+                    (api.ze_module_destroy)(module);
+                }
+                return Err(BackendError::DeviceError(format!(
+                    "zeCommandListCreate failed: 0x{rc:08x}"
+                )));
+            }
+
+            // ── 7. Append launch kernel (3D) ──
+            let group_count = ZeGroupCount {
+                group_count_x: workgroups_x,
+                group_count_y: workgroups_y,
+                group_count_z: workgroups_z,
+            };
+            let rc = unsafe {
+                (api.ze_command_list_append_launch_kernel)(
+                    list,
+                    kernel,
+                    &group_count,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if rc != 0 {
+                unsafe {
+                    (api.ze_command_list_destroy)(list);
+                    (api.ze_kernel_destroy)(kernel);
+                    (api.ze_module_destroy)(module);
+                }
+                return Err(BackendError::DeviceError(format!(
+                    "zeCommandListAppendLaunchKernel failed: 0x{rc:08x}"
+                )));
+            }
+
+            // ── 8. Close + execute + wait ──
+            let rc = unsafe { (api.ze_command_list_close)(list) };
+            if rc != 0 {
+                unsafe {
+                    (api.ze_command_list_destroy)(list);
+                    (api.ze_kernel_destroy)(kernel);
+                    (api.ze_module_destroy)(module);
+                }
+                return Err(BackendError::DeviceError(format!(
+                    "zeCommandListClose failed: 0x{rc:08x}"
+                )));
+            }
+
+            let rc = unsafe { (api.ze_command_queue_execute_command_lists)(queue, 1, &list, 0) };
+            if rc != 0 {
+                unsafe {
+                    (api.ze_command_list_destroy)(list);
+                    (api.ze_kernel_destroy)(kernel);
+                    (api.ze_module_destroy)(module);
+                }
+                return Err(BackendError::DeviceError(format!(
+                    "zeCommandQueueExecuteCommandLists failed: 0x{rc:08x}"
+                )));
+            }
+
+            let rc = unsafe { (api.ze_command_queue_synchronize)(queue, u64::MAX) };
+            if rc != 0 {
+                unsafe {
+                    (api.ze_command_list_destroy)(list);
+                    (api.ze_kernel_destroy)(kernel);
+                    (api.ze_module_destroy)(module);
+                }
+                return Err(BackendError::DeviceError(format!(
+                    "zeCommandQueueSynchronize failed: 0x{rc:08x}"
+                )));
+            }
+
+            // ── 9. Clean up ──
+            unsafe {
+                (api.ze_command_list_destroy)(list);
+                (api.ze_kernel_destroy)(kernel);
+                (api.ze_module_destroy)(module);
+            }
+
+            Ok(())
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = (spv_words, args, workgroups_x, workgroups_y, workgroups_z);
+            Err(BackendError::DeviceError(
+                "Level Zero requires Linux or Windows".into(),
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_batched_gemm(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a_ptr: u64,
+        b_ptr: u64,
+        beta: f32,
+        c_ptr: u64,
+        batch_count: usize,
+        stride_a: usize,
+        stride_b: usize,
+        stride_c: usize,
+    ) -> BackendResult<()> {
+        let spv = crate::spirv::batched_gemm_compute_shader();
+        let total_per_batch = (m * n) as u32;
+        let workgroups_x = total_per_batch.div_ceil(WORKGROUP_SIZE);
+        let args = [
+            KernelArg::Buffer(a_ptr),
+            KernelArg::Buffer(b_ptr),
+            KernelArg::Buffer(c_ptr),
+            KernelArg::U32(m as u32),
+            KernelArg::U32(n as u32),
+            KernelArg::U32(k as u32),
+            KernelArg::F32(alpha),
+            KernelArg::F32(beta),
+            KernelArg::U32(batch_count as u32),
+            KernelArg::U32(stride_a as u32),
+            KernelArg::U32(stride_b as u32),
+            KernelArg::U32(stride_c as u32),
+        ];
+        self.run_kernel_3d(&spv, &args, workgroups_x, 1, batch_count as u32)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch_gemm(
         &self,
@@ -859,6 +1176,31 @@ mod tests {
             0.0,
             0,
             4,
+        );
+        assert_eq!(result, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn backend_not_initialized_batched_gemm() {
+        let b = LevelZeroBackend::new();
+        let result = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            2,
         );
         assert_eq!(result, Err(BackendError::NotInitialized));
     }
@@ -965,6 +1307,64 @@ mod tests {
                 0.0,
                 0,
                 1
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn batched_gemm_zero_batch_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        assert_eq!(
+            b.batched_gemm(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                4,
+                4,
+                4,
+                1.0,
+                0,
+                4,
+                16,
+                0,
+                4,
+                16,
+                0.0,
+                0,
+                4,
+                16,
+                0,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn batched_gemm_zero_dims_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        assert_eq!(
+            b.batched_gemm(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                0,
+                0,
+                0,
+                1.0,
+                0,
+                1,
+                0,
+                0,
+                1,
+                0,
+                0.0,
+                0,
+                1,
+                0,
+                3,
             ),
             Ok(())
         );

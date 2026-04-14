@@ -8,33 +8,65 @@
 //!
 //! # Compute operations
 //!
-//! All compute kernels (`gemm`, `conv2d_forward`, `attention`, `reduce`,
-//! `unary`, `binary`) currently return `BackendError::Unsupported`.  The
-//! memory management pipeline (alloc / free / copy_htod / copy_dtoh) and
-//! synchronisation are fully implemented via Vulkan buffer objects backed by
-//! host-visible, host-coherent memory.
+//! All compute kernels (`gemm`, `batched_gemm`, `conv2d_forward`, `attention`,
+//! `reduce`, `unary`, `binary`) are dispatched via SPIR-V compute shaders
+//! generated at runtime by the [`crate::spirv`] module.  The memory management
+//! pipeline (alloc / free / copy_htod / copy_dtoh) and synchronisation are
+//! fully implemented via Vulkan buffer objects backed by host-visible,
+//! host-coherent memory.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use oxicuda_backend::{
     BackendError, BackendResult, BackendTranspose, BinaryOp, ComputeBackend, ReduceOp, UnaryOp,
 };
 
+use crate::async_compute::AsyncComputeManager;
 use crate::command::VulkanCommandPool;
 use crate::device::VulkanDevice;
 use crate::memory::VulkanMemoryManager;
 use crate::pipeline::VulkanComputePipeline;
 
+// ─── Pipeline cache types ───────────────────────────────────
+
+/// Key combining a SPIR-V hash with the number of descriptor bindings
+/// so that identical shaders with different binding counts produce
+/// distinct pipeline objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShaderKey {
+    spirv_hash: u64,
+    bindings: u32,
+}
+
+impl ShaderKey {
+    /// Build a key by hashing the SPIR-V word slice together with the binding
+    /// count.
+    pub fn new(spirv: &[u32], bindings: u32) -> Self {
+        let mut hasher = DefaultHasher::new();
+        spirv.hash(&mut hasher);
+        bindings.hash(&mut hasher);
+        Self {
+            spirv_hash: hasher.finish(),
+            bindings,
+        }
+    }
+}
+
 /// Vulkan compute backend.
 ///
 /// Create with `VulkanBackend::new()`, then call `init()` to select a device.
-#[derive(Debug)]
 pub struct VulkanBackend {
     device: Option<Arc<VulkanDevice>>,
     memory: Option<Arc<VulkanMemoryManager>>,
     command_pool: Option<VulkanCommandPool>,
+    /// Multi-queue async compute manager (created during `init`).
+    async_manager: Option<AsyncComputeManager>,
     initialized: bool,
+    /// Cache of compiled compute pipelines keyed by SPIR-V content hash.
+    pipeline_cache: Mutex<HashMap<ShaderKey, Arc<VulkanComputePipeline>>>,
 }
 
 impl VulkanBackend {
@@ -44,7 +76,9 @@ impl VulkanBackend {
             device: None,
             memory: None,
             command_pool: None,
+            async_manager: None,
             initialized: false,
+            pipeline_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -76,6 +110,55 @@ impl VulkanBackend {
             .as_ref()
             .ok_or(BackendError::NotInitialized)
     }
+
+    /// Convenience: get the async compute manager or return NotInitialized.
+    fn async_mgr(&self) -> BackendResult<&AsyncComputeManager> {
+        self.check_init()?;
+        self.async_manager
+            .as_ref()
+            .ok_or(BackendError::NotInitialized)
+    }
+
+    // ── Multi-queue async compute API ────────────────────────────────────────
+
+    /// Number of compute queues available for async dispatch.
+    ///
+    /// Returns `Err(NotInitialized)` if `init()` has not been called.
+    pub fn queue_count(&self) -> BackendResult<usize> {
+        Ok(self.async_mgr()?.queue_count())
+    }
+
+    /// Submit a compute command to a specific async queue.
+    ///
+    /// The `record_fn` closure receives a `vk::CommandBuffer` to record into.
+    /// The submission is asynchronous; call [`wait_all_queues`](Self::wait_all_queues)
+    /// or [`synchronize`](ComputeBackend::synchronize) to wait for completion.
+    pub fn submit_compute_async<F>(&self, queue_index: usize, record_fn: F) -> BackendResult<()>
+    where
+        F: FnOnce(vk::CommandBuffer) -> BackendResult<()>,
+    {
+        let mgr = self.async_mgr()?;
+        mgr.submit_async(queue_index, |cb| {
+            record_fn(cb).map_err(|e| crate::error::VulkanError::CommandBufferError(e.to_string()))
+        })
+        .map_err(BackendError::from)
+    }
+
+    /// Wait for all async compute queues to complete their in-flight work.
+    pub fn wait_all_queues(&self) -> BackendResult<()> {
+        let mgr = self.async_mgr()?;
+        mgr.wait_all().map_err(BackendError::from)
+    }
+}
+
+impl std::fmt::Debug for VulkanBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cache_len = self.pipeline_cache.lock().map(|c| c.len()).unwrap_or(0);
+        f.debug_struct("VulkanBackend")
+            .field("initialized", &self.initialized)
+            .field("pipeline_cache_entries", &cache_len)
+            .finish()
+    }
 }
 
 impl Default for VulkanBackend {
@@ -101,10 +184,18 @@ impl ComputeBackend for VulkanBackend {
         let device = Arc::new(device);
         let memory = Arc::new(VulkanMemoryManager::new(Arc::clone(&device)));
         let cmd_pool = VulkanCommandPool::new(Arc::clone(&device)).map_err(BackendError::from)?;
+        let async_mgr =
+            AsyncComputeManager::new(Arc::clone(&device)).map_err(BackendError::from)?;
+
+        tracing::debug!(
+            async_queues = async_mgr.queue_count(),
+            "async compute manager created"
+        );
 
         self.device = Some(device);
         self.memory = Some(memory);
         self.command_pool = Some(cmd_pool);
+        self.async_manager = Some(async_mgr);
         self.initialized = true;
 
         Ok(())
@@ -138,6 +229,48 @@ impl ComputeBackend for VulkanBackend {
             return Ok(());
         }
         self.dispatch_gemm(m, n, k, alpha as f32, a_ptr, b_ptr, beta as f32, c_ptr)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn batched_gemm(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        _lda: usize,
+        stride_a: usize,
+        b_ptr: u64,
+        _ldb: usize,
+        stride_b: usize,
+        beta: f64,
+        c_ptr: u64,
+        _ldc: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        // Zero batch count or zero dimensions → nothing to do.
+        if batch_count == 0 || m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        self.dispatch_batched_gemm(
+            m,
+            n,
+            k,
+            alpha as f32,
+            a_ptr,
+            stride_a,
+            b_ptr,
+            stride_b,
+            beta as f32,
+            c_ptr,
+            stride_c,
+            batch_count,
+        )
     }
 
     fn conv2d_forward(
@@ -414,6 +547,10 @@ impl ComputeBackend for VulkanBackend {
             // No device — nothing to synchronise.
             return Ok(());
         }
+        // Wait for async compute queues first.
+        if let Some(mgr) = &self.async_manager {
+            mgr.wait_all().map_err(BackendError::from)?;
+        }
         if let Some(dev) = &self.device {
             dev.wait_idle().map_err(BackendError::from)?;
         }
@@ -457,6 +594,44 @@ impl ComputeBackend for VulkanBackend {
 const WORKGROUP_SIZE: u32 = 256;
 
 impl VulkanBackend {
+    /// Look up or compile a pipeline for the given SPIR-V and binding count.
+    ///
+    /// On cache hit the existing `Arc<VulkanComputePipeline>` is returned.
+    /// On miss a new pipeline is created, inserted into the cache, and returned.
+    pub fn get_or_create_pipeline(
+        &self,
+        spirv: &[u32],
+        bindings: u32,
+    ) -> BackendResult<Arc<VulkanComputePipeline>> {
+        let key = ShaderKey::new(spirv, bindings);
+
+        // Fast path: check cache under the lock.
+        {
+            let cache = self
+                .pipeline_cache
+                .lock()
+                .map_err(|_| BackendError::DeviceError("pipeline cache lock poisoned".into()))?;
+            if let Some(pipeline) = cache.get(&key) {
+                return Ok(Arc::clone(pipeline));
+            }
+        }
+
+        // Slow path: create a new pipeline (outside the lock), then insert.
+        let device = self.device_arc()?;
+        let pipeline = VulkanComputePipeline::new(Arc::clone(device), spirv, bindings, 1)
+            .map_err(BackendError::from)?;
+        let pipeline = Arc::new(pipeline);
+
+        let mut cache = self
+            .pipeline_cache
+            .lock()
+            .map_err(|_| BackendError::DeviceError("pipeline cache lock poisoned".into()))?;
+        // Another thread may have inserted while we were compiling; prefer
+        // the existing entry to avoid duplicate Vulkan objects.
+        let entry = cache.entry(key).or_insert_with(|| Arc::clone(&pipeline));
+        Ok(Arc::clone(entry))
+    }
+
     /// Run a compute dispatch: create pipeline, bind buffers, dispatch, wait.
     ///
     /// `spv` — SPIR-V words for the shader.
@@ -474,8 +649,7 @@ impl VulkanBackend {
         let memory = self.memory_manager()?;
         let cmd_pool = self.cmd_pool()?;
 
-        let pipeline = VulkanComputePipeline::new(Arc::clone(device), spv, bindings, 1)
-            .map_err(BackendError::from)?;
+        let pipeline = self.get_or_create_pipeline(spv, bindings)?;
 
         let vk_dev = device.device();
 
@@ -533,6 +707,81 @@ impl VulkanBackend {
                         &[],
                     );
                     vk_dev.cmd_dispatch(cmd, workgroups, 1, 1);
+                }
+                Ok(())
+            })
+            .map_err(BackendError::from)
+    }
+
+    /// Run a 3-D compute dispatch: create pipeline, bind buffers, dispatch, wait.
+    ///
+    /// Like [`run_compute`] but dispatches `(wg_x, wg_y, wg_z)` workgroups.
+    fn run_compute_3d(
+        &self,
+        spv: &[u32],
+        bindings: u32,
+        buffer_handles: &[(u64, u32)],
+        wg_x: u32,
+        wg_y: u32,
+        wg_z: u32,
+    ) -> BackendResult<()> {
+        let device = self.device_arc()?;
+        let memory = self.memory_manager()?;
+        let cmd_pool = self.cmd_pool()?;
+
+        let pipeline = self.get_or_create_pipeline(spv, bindings)?;
+
+        let vk_dev = device.device();
+
+        let ds_layout = pipeline.descriptor_set_layout();
+        let ds_alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pipeline.descriptor_pool())
+            .set_layouts(std::slice::from_ref(&ds_layout));
+        let descriptor_sets = unsafe { vk_dev.allocate_descriptor_sets(&ds_alloc_info) }
+            .map_err(|e| BackendError::DeviceError(format!("allocate_descriptor_sets: {e}")))?;
+        let ds = descriptor_sets[0];
+
+        let mut buf_infos = Vec::with_capacity(buffer_handles.len());
+        for &(handle, _) in buffer_handles {
+            let vk_buf = memory.vk_buffer(handle).map_err(BackendError::from)?;
+            let size = memory.buffer_size(handle).map_err(BackendError::from)?;
+            buf_infos.push(
+                vk::DescriptorBufferInfo::default()
+                    .buffer(vk_buf)
+                    .offset(0)
+                    .range(size),
+            );
+        }
+
+        let writes: Vec<vk::WriteDescriptorSet> = buffer_handles
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, binding))| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(ds)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&buf_infos[i]))
+            })
+            .collect();
+
+        unsafe { vk_dev.update_descriptor_sets(&writes, &[]) };
+
+        let pl = pipeline.pipeline();
+        let pl_layout = pipeline.pipeline_layout();
+        cmd_pool
+            .record_and_submit(|cmd| {
+                unsafe {
+                    vk_dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pl);
+                    vk_dev.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pl_layout,
+                        0,
+                        &[ds],
+                        &[],
+                    );
+                    vk_dev.cmd_dispatch(cmd, wg_x, wg_y, wg_z);
                 }
                 Ok(())
             })
@@ -659,6 +908,52 @@ impl VulkanBackend {
             4,
             &[(a_ptr, 0), (b_ptr, 1), (c_ptr, 2), (params, 3)],
             total.div_ceil(WORKGROUP_SIZE),
+        );
+
+        self.free_params_buffer(params);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_batched_gemm(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a_ptr: u64,
+        stride_a: usize,
+        b_ptr: u64,
+        stride_b: usize,
+        beta: f32,
+        c_ptr: u64,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        let spv = crate::spirv::batched_gemm_compute_shader();
+
+        // params: [m, n, k, alpha(bitcast), beta(bitcast), stride_a, stride_b, stride_c]
+        let mut param_data = Vec::with_capacity(32);
+        param_data.extend_from_slice(&(m as u32).to_ne_bytes());
+        param_data.extend_from_slice(&(n as u32).to_ne_bytes());
+        param_data.extend_from_slice(&(k as u32).to_ne_bytes());
+        param_data.extend_from_slice(&alpha.to_bits().to_ne_bytes());
+        param_data.extend_from_slice(&beta.to_bits().to_ne_bytes());
+        param_data.extend_from_slice(&(stride_a as u32).to_ne_bytes());
+        param_data.extend_from_slice(&(stride_b as u32).to_ne_bytes());
+        param_data.extend_from_slice(&(stride_c as u32).to_ne_bytes());
+        let params = self.alloc_params_buffer(&param_data)?;
+
+        // Dispatch: X covers (m*n) elements per batch, Z covers batches.
+        let elements_per_batch = (m * n) as u32;
+        let wg_x = elements_per_batch.div_ceil(WORKGROUP_SIZE);
+        let result = self.run_compute_3d(
+            &spv,
+            4,
+            &[(a_ptr, 0), (b_ptr, 1), (c_ptr, 2), (params, 3)],
+            wg_x,
+            1,
+            batch_count as u32,
         );
 
         self.free_params_buffer(params);
@@ -1387,5 +1682,132 @@ mod tests {
         b.free(k).expect("free");
         b.free(v).expect("free");
         b.free(o).expect("free");
+    }
+
+    // ── Batched GEMM tests ──────────────────────────────────────
+
+    #[test]
+    fn batched_gemm_not_initialized() {
+        let b = VulkanBackend::new();
+        let r = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            2,
+            2,
+            2,
+            1.0,
+            0,
+            2,
+            4,
+            0,
+            2,
+            4,
+            0.0,
+            0,
+            2,
+            4,
+            3,
+        );
+        assert_eq!(r, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn batched_gemm_zero_batch_not_initialized() {
+        // batch_count == 0 is an early return before the init check.
+        let b = VulkanBackend::new();
+        let r = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            2,
+            2,
+            2,
+            1.0,
+            0,
+            2,
+            4,
+            0,
+            2,
+            4,
+            0.0,
+            0,
+            2,
+            4,
+            0,
+        );
+        // Zero batch triggers check_init first, then early return would be Ok
+        // but since not initialized, we get NotInitialized.
+        assert_eq!(r, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn batched_gemm_zero_dims_not_initialized() {
+        let b = VulkanBackend::new();
+        // m=0 but batch_count>0
+        let r = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            0,
+            2,
+            2,
+            1.0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            4,
+            0.0,
+            0,
+            0,
+            0,
+            2,
+        );
+        assert_eq!(r, Err(BackendError::NotInitialized));
+    }
+
+    // ── Pipeline cache tests (no Vulkan device required) ─────
+
+    #[test]
+    fn shader_key_same_spirv_same_bindings() {
+        use crate::backend::ShaderKey;
+        let spv = vec![0x07230203u32, 0, 0, 1, 0];
+        let k1 = ShaderKey::new(&spv, 3);
+        let k2 = ShaderKey::new(&spv, 3);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn shader_key_different_spirv() {
+        use crate::backend::ShaderKey;
+        let spv_a = vec![0x07230203u32, 1, 2, 3, 4];
+        let spv_b = vec![0x07230203u32, 5, 6, 7, 8];
+        let k1 = ShaderKey::new(&spv_a, 3);
+        let k2 = ShaderKey::new(&spv_b, 3);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn shader_key_different_bindings() {
+        use crate::backend::ShaderKey;
+        let spv = vec![0x07230203u32, 0, 0, 1, 0];
+        let k1 = ShaderKey::new(&spv, 3);
+        let k2 = ShaderKey::new(&spv, 4);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn pipeline_cache_miss_without_device_returns_error() {
+        let b = VulkanBackend::new();
+        let spv = crate::spirv::trivial_compute_shader();
+        let result = b.get_or_create_pipeline(&spv, 0);
+        // Not initialised — should fail.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pipeline_cache_debug_shows_entries() {
+        let b = VulkanBackend::new();
+        let s = format!("{b:?}");
+        assert!(s.contains("pipeline_cache_entries"));
     }
 }

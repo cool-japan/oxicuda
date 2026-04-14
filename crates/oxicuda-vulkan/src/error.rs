@@ -45,6 +45,10 @@ pub enum VulkanError {
     #[error("command buffer error: {0}")]
     CommandBufferError(String),
 
+    /// Queue index out of bounds.
+    #[error("queue index {0} out of bounds (max {1})")]
+    QueueIndexOutOfBounds(usize, usize),
+
     /// Memory mapping failed.
     #[error("memory mapping failed: {0}")]
     MemoryMapError(String),
@@ -72,6 +76,9 @@ impl From<VulkanError> for BackendError {
             VulkanError::CommandBufferError(s) => {
                 BackendError::DeviceError(format!("cmd_buf: {s}"))
             }
+            VulkanError::QueueIndexOutOfBounds(idx, max) => BackendError::InvalidArgument(format!(
+                "queue index {idx} out of bounds (max {max})"
+            )),
             VulkanError::MemoryMapError(s) => BackendError::DeviceError(format!("mmap: {s}")),
         }
     }
@@ -123,6 +130,10 @@ mod tests {
             VulkanError::MemoryMapError("host-visible".into()).to_string(),
             "memory mapping failed: host-visible"
         );
+        assert_eq!(
+            VulkanError::QueueIndexOutOfBounds(3, 2).to_string(),
+            "queue index 3 out of bounds (max 2)"
+        );
     }
 
     #[test]
@@ -149,6 +160,10 @@ mod tests {
         ));
         assert!(matches!(
             BackendError::from(VulkanError::InvalidArgument("x".into())),
+            BackendError::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            BackendError::from(VulkanError::QueueIndexOutOfBounds(3, 2)),
             BackendError::InvalidArgument(_)
         ));
     }

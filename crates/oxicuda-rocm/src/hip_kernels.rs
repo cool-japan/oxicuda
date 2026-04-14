@@ -46,6 +46,56 @@ extern "C" __global__ void gemm_f32(
     )
 }
 
+// ─── Batched GEMM ───────────────────────────────────────────────────────────
+
+/// HIP C++ source for a batched single-precision GEMM kernel:
+/// `C_b = alpha * A_b * B_b + beta * C_b` for each batch `b` in `0..batch_count`.
+///
+/// Uses `hipBlockIdx_z` as the batch index.  Each batch's matrices are located
+/// at `a + batch_index * stride_a`, etc.
+///
+/// Grid: `dim3((n+ts-1)/ts, (m+ts-1)/ts, batch_count)`, Block: `dim3(ts, ts)`.
+pub fn batched_gemm_hip(tile_size: u32) -> String {
+    format!(
+        r#"
+extern "C" __global__ void batched_gemm_f32(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float*       __restrict__ c,
+    unsigned int m,
+    unsigned int n,
+    unsigned int k,
+    float alpha,
+    float beta,
+    unsigned int batch_count,
+    unsigned int stride_a,
+    unsigned int stride_b,
+    unsigned int stride_c
+) {{
+    unsigned int batch_index = hipBlockIdx_z;
+    if (batch_index >= batch_count) return;
+
+    unsigned int row = hipBlockIdx_y * {ts} + hipThreadIdx_y;
+    unsigned int col = hipBlockIdx_x * {ts} + hipThreadIdx_x;
+    if (row >= m || col >= n) return;
+
+    const float* a_batch = a + batch_index * stride_a;
+    const float* b_batch = b + batch_index * stride_b;
+    float*       c_batch = c + batch_index * stride_c;
+
+    float acc = 0.0f;
+    for (unsigned int i = 0; i < k; ++i) {{
+        acc += a_batch[row * k + i] * b_batch[i * n + col];
+    }}
+
+    unsigned int idx = row * n + col;
+    c_batch[idx] = alpha * acc + beta * c_batch[idx];
+}}
+"#,
+        ts = tile_size
+    )
+}
+
 // ─── Elementwise unary ────────────────────────────────────────────────────────
 
 /// HIP C++ source for an element-wise unary kernel.
@@ -364,6 +414,127 @@ extern "C" __global__ void conv2d_forward_f32(
 "#
 }
 
+// ─── FP16 GEMM ──────────────────────────────────────────────────────────────
+
+/// HIP C++ source for a half-precision GEMM kernel: `C = alpha * A * B + beta * C`.
+///
+/// Uses `__half` (HIP FP16) for input/output buffers and `float` for
+/// accumulation (mixed precision).  Conversions use `__half2float()` /
+/// `__float2half()`.
+///
+/// Grid: `dim3((n+ts-1)/ts, (m+ts-1)/ts)`, Block: `dim3(ts, ts)`.
+pub fn gemm_hip_f16(tile_size: u32) -> String {
+    format!(
+        r#"
+#include <hip/hip_fp16.h>
+
+extern "C" __global__ void gemm_f16(
+    const __half* __restrict__ a,
+    const __half* __restrict__ b,
+    __half*       __restrict__ c,
+    unsigned int m,
+    unsigned int n,
+    unsigned int k,
+    float alpha,
+    float beta
+) {{
+    unsigned int row = hipBlockIdx_y * {ts} + hipThreadIdx_y;
+    unsigned int col = hipBlockIdx_x * {ts} + hipThreadIdx_x;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    for (unsigned int i = 0; i < k; ++i) {{
+        acc += __half2float(a[row * k + i]) * __half2float(b[i * n + col]);
+    }}
+
+    unsigned int idx = row * n + col;
+    float c_val = __half2float(c[idx]);
+    c[idx] = __float2half(alpha * acc + beta * c_val);
+}}
+"#,
+        ts = tile_size
+    )
+}
+
+// ─── BF16 GEMM ──────────────────────────────────────────────────────────────
+
+/// HIP C++ source for a BFloat16 GEMM kernel: `C = alpha * A * B + beta * C`.
+///
+/// Uses `hip_bfloat16` for input/output buffers and `float` for accumulation.
+///
+/// Grid: `dim3((n+ts-1)/ts, (m+ts-1)/ts)`, Block: `dim3(ts, ts)`.
+pub fn gemm_hip_bf16(tile_size: u32) -> String {
+    format!(
+        r#"
+#include <hip/hip_bfloat16.h>
+
+extern "C" __global__ void gemm_bf16(
+    const hip_bfloat16* __restrict__ a,
+    const hip_bfloat16* __restrict__ b,
+    hip_bfloat16*       __restrict__ c,
+    unsigned int m,
+    unsigned int n,
+    unsigned int k,
+    float alpha,
+    float beta
+) {{
+    unsigned int row = hipBlockIdx_y * {ts} + hipThreadIdx_y;
+    unsigned int col = hipBlockIdx_x * {ts} + hipThreadIdx_x;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    for (unsigned int i = 0; i < k; ++i) {{
+        acc += float(a[row * k + i]) * float(b[i * n + col]);
+    }}
+
+    unsigned int idx = row * n + col;
+    float c_val = float(c[idx]);
+    c[idx] = hip_bfloat16(alpha * acc + beta * c_val);
+}}
+"#,
+        ts = tile_size
+    )
+}
+
+// ─── FP16 Elementwise unary ─────────────────────────────────────────────────
+
+/// HIP C++ source for an element-wise unary kernel operating on `__half` data.
+///
+/// Grid: `((n + 255) / 256)`, Block: `256`.
+///
+/// Supported `op` values: `"relu"`, `"sigmoid"`, `"tanh"`, `"exp"`, `"log"`,
+/// `"sqrt"`, `"abs"`, `"neg"`.  Unknown ops become identity.
+pub fn elementwise_hip_f16(op: &str) -> String {
+    let op_expr = match op {
+        "relu" => "fmaxf(x, 0.0f)",
+        "sigmoid" => "1.0f / (1.0f + expf(-x))",
+        "tanh" => "tanhf(x)",
+        "exp" => "expf(x)",
+        "log" => "logf(x)",
+        "sqrt" => "sqrtf(x)",
+        "abs" => "fabsf(x)",
+        "neg" => "-x",
+        _ => "x", // identity fallback
+    };
+    format!(
+        r#"
+#include <hip/hip_fp16.h>
+
+extern "C" __global__ void elementwise_f16(
+    const __half* __restrict__ input,
+    __half*       __restrict__ output,
+    unsigned int n
+) {{
+    unsigned int gid = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+    if (gid >= n) return;
+    float x = __half2float(input[gid]);
+    output[gid] = __float2half({op});
+}}
+"#,
+        op = op_expr
+    )
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -386,6 +557,36 @@ mod tests {
         let src8 = gemm_hip(8);
         assert!(src8.contains("hipBlockIdx_y * 8"));
         let src32 = gemm_hip(32);
+        assert!(src32.contains("hipBlockIdx_y * 32"));
+    }
+
+    // ── Batched GEMM ─────────────────────────────────────────────────────
+
+    #[test]
+    fn hip_batched_gemm_contains_global() {
+        let src = batched_gemm_hip(16);
+        assert!(src.contains("__global__"));
+        assert!(src.contains("batched_gemm_f32"));
+        assert!(src.contains("alpha"));
+        assert!(src.contains("beta"));
+    }
+
+    #[test]
+    fn hip_batched_gemm_batch_params() {
+        let src = batched_gemm_hip(16);
+        assert!(src.contains("hipBlockIdx_z"));
+        assert!(src.contains("batch_count"));
+        assert!(src.contains("batch_index"));
+        assert!(src.contains("stride_a"));
+        assert!(src.contains("stride_b"));
+        assert!(src.contains("stride_c"));
+    }
+
+    #[test]
+    fn hip_batched_gemm_tile_size_embedded() {
+        let src8 = batched_gemm_hip(8);
+        assert!(src8.contains("hipBlockIdx_y * 8"));
+        let src32 = batched_gemm_hip(32);
         assert!(src32.contains("hipBlockIdx_y * 32"));
     }
 
@@ -503,5 +704,86 @@ mod tests {
         assert!(src.contains("__global__"));
         assert!(src.contains("stride_h"));
         assert!(src.contains("pad_h"));
+    }
+
+    // ── FP16 GEMM ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hip_gemm_f16_contains_half() {
+        let src = gemm_hip_f16(16);
+        assert!(src.contains("__half"));
+        assert!(src.contains("__half2float"));
+        assert!(src.contains("__float2half"));
+        assert!(src.contains("__global__"));
+        assert!(src.contains("gemm_f16"));
+    }
+
+    #[test]
+    fn hip_gemm_f16_tile_size_embedded() {
+        let src8 = gemm_hip_f16(8);
+        assert!(src8.contains("hipBlockIdx_y * 8"));
+        let src32 = gemm_hip_f16(32);
+        assert!(src32.contains("hipBlockIdx_y * 32"));
+    }
+
+    #[test]
+    fn hip_gemm_f16_float_accumulation() {
+        let src = gemm_hip_f16(16);
+        assert!(src.contains("float acc = 0.0f"));
+        assert!(src.contains("float alpha"));
+        assert!(src.contains("float beta"));
+    }
+
+    // ── BF16 GEMM ────────────────────────────────────────────────────────
+
+    #[test]
+    fn hip_gemm_bf16_contains_bfloat16() {
+        let src = gemm_hip_bf16(16);
+        assert!(src.contains("hip_bfloat16"));
+        assert!(src.contains("__global__"));
+        assert!(src.contains("gemm_bf16"));
+    }
+
+    #[test]
+    fn hip_gemm_bf16_tile_size_embedded() {
+        let src8 = gemm_hip_bf16(8);
+        assert!(src8.contains("hipBlockIdx_y * 8"));
+        let src32 = gemm_hip_bf16(32);
+        assert!(src32.contains("hipBlockIdx_y * 32"));
+    }
+
+    #[test]
+    fn hip_gemm_bf16_float_accumulation() {
+        let src = gemm_hip_bf16(16);
+        assert!(src.contains("float acc = 0.0f"));
+        assert!(src.contains("float alpha"));
+        assert!(src.contains("float beta"));
+    }
+
+    // ── FP16 Elementwise ─────────────────────────────────────────────────
+
+    #[test]
+    fn hip_elementwise_f16_relu() {
+        let src = elementwise_hip_f16("relu");
+        assert!(src.contains("fmaxf(x, 0.0f)"));
+        assert!(src.contains("__global__"));
+        assert!(src.contains("elementwise_f16"));
+        assert!(src.contains("__half"));
+        assert!(src.contains("__half2float"));
+        assert!(src.contains("__float2half"));
+    }
+
+    #[test]
+    fn hip_elementwise_f16_all_ops() {
+        assert!(elementwise_hip_f16("sigmoid").contains("expf(-x)"));
+        assert!(elementwise_hip_f16("tanh").contains("tanhf(x)"));
+        assert!(elementwise_hip_f16("exp").contains("expf(x)"));
+        assert!(elementwise_hip_f16("log").contains("logf(x)"));
+        assert!(elementwise_hip_f16("sqrt").contains("sqrtf(x)"));
+        assert!(elementwise_hip_f16("abs").contains("fabsf(x)"));
+        assert!(elementwise_hip_f16("neg").contains("-x"));
+        // Unknown op is identity.
+        let unknown = elementwise_hip_f16("unknown_op");
+        assert!(unknown.contains("__float2half(x)"));
     }
 }

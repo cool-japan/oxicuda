@@ -37,6 +37,7 @@ pub(crate) const OP_TYPE_BOOL: u32 = 20;
 pub(crate) const OP_TYPE_INT: u32 = 21;
 pub(crate) const OP_TYPE_FLOAT: u32 = 22;
 pub(crate) const OP_TYPE_VECTOR: u32 = 23;
+pub(crate) const OP_TYPE_ARRAY: u32 = 28;
 pub(crate) const OP_TYPE_POINTER: u32 = 32;
 pub(crate) const OP_TYPE_FUNCTION: u32 = 33;
 pub(crate) const OP_CONSTANT: u32 = 43;
@@ -65,7 +66,13 @@ pub(crate) const OP_SELECTION_MERGE: u32 = 247;
 pub(crate) const OP_LABEL: u32 = 248;
 pub(crate) const OP_BRANCH: u32 = 249;
 pub(crate) const OP_BRANCH_CONDITIONAL: u32 = 250;
+pub(crate) const OP_CONTROL_BARRIER: u32 = 224;
+pub(crate) const OP_PHI: u32 = 245;
 pub(crate) const OP_RETURN: u32 = 253;
+
+// GroupNonUniform opcodes (SPIR-V 1.3+)
+pub(crate) const OP_GROUP_NON_UNIFORM_FADD: u32 = 350;
+pub(crate) const OP_GROUP_NON_UNIFORM_SHUFFLE: u32 = 345;
 
 // Capabilities
 const CAPABILITY_SHADER: u32 = 1;
@@ -1015,6 +1022,234 @@ pub fn gemm_compute_shader() -> Vec<u32> {
     m.finalize()
 }
 
+// ─── Batched GEMM compute kernel ─────────────────────────────
+
+/// Load `GlobalInvocationId.z` into a uint result.
+fn load_gid_z(m: &mut SpvModule, b: &BaseIds) -> u32 {
+    let gid_val = m.alloc_id();
+    m.emit_load(b.ty_v3uint, gid_val, b.var_gid);
+    let gid_z = m.alloc_id();
+    m.emit(OP_COMPOSITE_EXTRACT, &[b.ty_uint, gid_z, gid_val, 2]);
+    gid_z
+}
+
+/// Generate an OpenCL SPIR-V compute kernel for batched GEMM.
+///
+/// For each batch `b` in `0..batch_count`:
+///   `C_b = alpha * A_b * B_b + beta * C_b`
+/// where `A_b` starts at offset `b * stride_a`, etc.
+///
+/// Uses 3D global work size `(ceil(m*n / WG), 1, batch_count)`:
+/// - `get_global_id(0)` = element index within a single m×n output
+/// - `get_global_id(2)` = batch index
+///
+/// Kernel parameters:
+/// `(CrossWorkgroup float* A, CrossWorkgroup float* B, CrossWorkgroup float* C,
+///   uint m, uint n, uint k, float alpha, float beta,
+///   uint batch_count, uint stride_a, uint stride_b, uint stride_c)`.
+pub fn batched_gemm_compute_shader() -> Vec<u32> {
+    let mut m = SpvModule::new();
+    let b = emit_preamble(&mut m);
+
+    let main_fn = m.alloc_id();
+    let fn_ty = m.alloc_id();
+    let p_a = m.alloc_id();
+    let p_b = m.alloc_id();
+    let p_c = m.alloc_id();
+    let p_m = m.alloc_id();
+    let p_n = m.alloc_id();
+    let p_k = m.alloc_id();
+    let p_alpha = m.alloc_id();
+    let p_beta = m.alloc_id();
+    let p_batch_count = m.alloc_id();
+    let p_stride_a = m.alloc_id();
+    let p_stride_b = m.alloc_id();
+    let p_stride_c = m.alloc_id();
+
+    // Function type: void(float*, float*, float*, uint, uint, uint, float, float,
+    //                      uint, uint, uint, uint)
+    m.emit_type_function(
+        fn_ty,
+        b.ty_void,
+        &[
+            b.ty_ptr_cross_float,
+            b.ty_ptr_cross_float,
+            b.ty_ptr_cross_float,
+            b.ty_uint,
+            b.ty_uint,
+            b.ty_uint,
+            b.ty_float,
+            b.ty_float,
+            b.ty_uint,
+            b.ty_uint,
+            b.ty_uint,
+            b.ty_uint,
+        ],
+    );
+
+    m.emit_entry_point(EXECUTION_MODEL_KERNEL, main_fn, "main", &[b.var_gid]);
+    m.emit_execution_mode_local_size(main_fn, WORKGROUP_SIZE, 1, 1);
+
+    let label_entry = m.alloc_id();
+    let label_bounds_body = m.alloc_id();
+    let label_bounds_merge = m.alloc_id();
+    let label_loop_header = m.alloc_id();
+    let label_loop_body = m.alloc_id();
+    let label_loop_continue = m.alloc_id();
+    let label_loop_merge = m.alloc_id();
+
+    m.emit_function(b.ty_void, main_fn, FUNCTION_CONTROL_NONE, fn_ty);
+    m.emit_function_parameter(b.ty_ptr_cross_float, p_a);
+    m.emit_function_parameter(b.ty_ptr_cross_float, p_b);
+    m.emit_function_parameter(b.ty_ptr_cross_float, p_c);
+    m.emit_function_parameter(b.ty_uint, p_m);
+    m.emit_function_parameter(b.ty_uint, p_n);
+    m.emit_function_parameter(b.ty_uint, p_k);
+    m.emit_function_parameter(b.ty_float, p_alpha);
+    m.emit_function_parameter(b.ty_float, p_beta);
+    m.emit_function_parameter(b.ty_uint, p_batch_count);
+    m.emit_function_parameter(b.ty_uint, p_stride_a);
+    m.emit_function_parameter(b.ty_uint, p_stride_b);
+    m.emit_function_parameter(b.ty_uint, p_stride_c);
+    m.emit_label(label_entry);
+
+    // gid_x = element index within single GEMM output
+    let gid = load_gid_x(&mut m, &b);
+    // gid_z = batch index
+    let batch_idx = load_gid_z(&mut m, &b);
+
+    // total = m * n
+    let total = m.alloc_id();
+    m.emit(OP_I_MUL, &[b.ty_uint, total, p_m, p_n]);
+
+    // Bounds check: gid < total && batch_idx < batch_count
+    let cond1 = m.alloc_id();
+    m.emit(OP_U_LESS_THAN, &[b.ty_bool, cond1, gid, total]);
+    let cond2 = m.alloc_id();
+    m.emit(
+        OP_U_LESS_THAN,
+        &[b.ty_bool, cond2, batch_idx, p_batch_count],
+    );
+    // Combined condition via OpLogicalAnd
+    let cond = m.alloc_id();
+    // OpLogicalAnd = 166
+    m.emit(166, &[b.ty_bool, cond, cond1, cond2]);
+    m.emit_selection_merge(label_bounds_merge);
+    m.emit_branch_conditional(cond, label_bounds_body, label_bounds_merge);
+
+    m.emit_label(label_bounds_body);
+
+    // Compute batch offsets: a_base = batch_idx * stride_a, etc.
+    let a_offset = m.alloc_id();
+    m.emit(OP_I_MUL, &[b.ty_uint, a_offset, batch_idx, p_stride_a]);
+    let b_offset = m.alloc_id();
+    m.emit(OP_I_MUL, &[b.ty_uint, b_offset, batch_idx, p_stride_b]);
+    let c_offset = m.alloc_id();
+    m.emit(OP_I_MUL, &[b.ty_uint, c_offset, batch_idx, p_stride_c]);
+
+    // Offset the base pointers
+    let a_batch = m.alloc_id();
+    m.emit_in_bounds_ptr_access_chain(b.ty_ptr_cross_float, a_batch, p_a, a_offset);
+    let b_batch = m.alloc_id();
+    m.emit_in_bounds_ptr_access_chain(b.ty_ptr_cross_float, b_batch, p_b, b_offset);
+    let c_batch = m.alloc_id();
+    m.emit_in_bounds_ptr_access_chain(b.ty_ptr_cross_float, c_batch, p_c, c_offset);
+
+    // row = gid / n, col = gid % n
+    let row = m.alloc_id();
+    m.emit(OP_U_DIV, &[b.ty_uint, row, gid, p_n]);
+    let col = m.alloc_id();
+    m.emit(OP_U_MOD, &[b.ty_uint, col, gid, p_n]);
+
+    // Loop counter + accumulator
+    let var_i = m.alloc_id();
+    m.emit_variable(b.ty_ptr_func_uint, var_i, STORAGE_CLASS_FUNCTION);
+    m.emit_store(var_i, b.c_uint_0);
+    let var_acc = m.alloc_id();
+    m.emit_variable(b.ty_ptr_func_float, var_acc, STORAGE_CLASS_FUNCTION);
+    m.emit_store(var_acc, b.c_float_0);
+
+    m.emit_branch(label_loop_header);
+
+    // ── Loop header ──
+    m.emit_label(label_loop_header);
+    let i_val = m.alloc_id();
+    m.emit_load(b.ty_uint, i_val, var_i);
+    let loop_cond = m.alloc_id();
+    m.emit(OP_U_LESS_THAN, &[b.ty_bool, loop_cond, i_val, p_k]);
+    m.emit_loop_merge(label_loop_merge, label_loop_continue);
+    m.emit_branch_conditional(loop_cond, label_loop_body, label_loop_merge);
+
+    // ── Loop body ──
+    m.emit_label(label_loop_body);
+
+    // a_idx = row * k + i
+    let row_k = m.alloc_id();
+    m.emit(OP_I_MUL, &[b.ty_uint, row_k, row, p_k]);
+    let a_idx = m.alloc_id();
+    m.emit(OP_I_ADD, &[b.ty_uint, a_idx, row_k, i_val]);
+
+    // b_idx = i * n + col
+    let i_n = m.alloc_id();
+    m.emit(OP_I_MUL, &[b.ty_uint, i_n, i_val, p_n]);
+    let b_idx = m.alloc_id();
+    m.emit(OP_I_ADD, &[b.ty_uint, b_idx, i_n, col]);
+
+    let a_ptr = m.alloc_id();
+    m.emit_in_bounds_ptr_access_chain(b.ty_ptr_cross_float, a_ptr, a_batch, a_idx);
+    let a_val = m.alloc_id();
+    m.emit_load(b.ty_float, a_val, a_ptr);
+
+    let b_ptr = m.alloc_id();
+    m.emit_in_bounds_ptr_access_chain(b.ty_ptr_cross_float, b_ptr, b_batch, b_idx);
+    let b_val = m.alloc_id();
+    m.emit_load(b.ty_float, b_val, b_ptr);
+
+    let prod = m.alloc_id();
+    m.emit(OP_F_MUL, &[b.ty_float, prod, a_val, b_val]);
+    let old_acc = m.alloc_id();
+    m.emit_load(b.ty_float, old_acc, var_acc);
+    let new_acc = m.alloc_id();
+    m.emit(OP_F_ADD, &[b.ty_float, new_acc, old_acc, prod]);
+    m.emit_store(var_acc, new_acc);
+
+    m.emit_branch(label_loop_continue);
+
+    // ── Loop continue ──
+    m.emit_label(label_loop_continue);
+    let i_inc = m.alloc_id();
+    m.emit(OP_I_ADD, &[b.ty_uint, i_inc, i_val, b.c_uint_1]);
+    m.emit_store(var_i, i_inc);
+    m.emit_branch(label_loop_header);
+
+    // ── Loop merge ──
+    m.emit_label(label_loop_merge);
+
+    // result = alpha * acc + beta * C_batch[gid]
+    let final_acc = m.alloc_id();
+    m.emit_load(b.ty_float, final_acc, var_acc);
+    let alpha_acc = m.alloc_id();
+    m.emit(OP_F_MUL, &[b.ty_float, alpha_acc, p_alpha, final_acc]);
+
+    let c_ptr = m.alloc_id();
+    m.emit_in_bounds_ptr_access_chain(b.ty_ptr_cross_float, c_ptr, c_batch, gid);
+    let c_old = m.alloc_id();
+    m.emit_load(b.ty_float, c_old, c_ptr);
+    let beta_c = m.alloc_id();
+    m.emit(OP_F_MUL, &[b.ty_float, beta_c, p_beta, c_old]);
+    let c_new = m.alloc_id();
+    m.emit(OP_F_ADD, &[b.ty_float, c_new, alpha_acc, beta_c]);
+    m.emit_store(c_ptr, c_new);
+
+    m.emit_branch(label_bounds_merge);
+
+    m.emit_label(label_bounds_merge);
+    m.emit_return();
+    m.emit_function_end();
+
+    m.finalize()
+}
+
 // ─── Trivial placeholder ────────────────────────────────────
 
 /// Build a minimal valid Shader-style compute shader: `void main() {}`.
@@ -1180,6 +1415,27 @@ mod tests {
     }
 
     #[test]
+    fn batched_gemm_shader_valid() {
+        let words = batched_gemm_compute_shader();
+        check_valid_spirv(&words);
+    }
+
+    #[test]
+    fn batched_gemm_shader_word_aligned() {
+        let words = batched_gemm_compute_shader();
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        assert_eq!(bytes.len() % 4, 0);
+    }
+
+    #[test]
+    fn batched_gemm_shader_uses_kernel_capability() {
+        let words = batched_gemm_compute_shader();
+        let cap_header = (2u32 << 16) | OP_CAPABILITY;
+        assert_eq!(words[5], cap_header);
+        assert_eq!(words[6], 6); // CAPABILITY_KERNEL
+    }
+
+    #[test]
     fn all_kernel_shaders_word_aligned() {
         fn to_bytes(words: &[u32]) -> Vec<u8> {
             words.iter().flat_map(|w| w.to_ne_bytes()).collect()
@@ -1188,6 +1444,7 @@ mod tests {
         assert_eq!(to_bytes(&binary_compute_shader(BinaryOp::Add)).len() % 4, 0);
         assert_eq!(to_bytes(&reduce_compute_shader(ReduceOp::Sum)).len() % 4, 0);
         assert_eq!(to_bytes(&gemm_compute_shader()).len() % 4, 0);
+        assert_eq!(to_bytes(&batched_gemm_compute_shader()).len() % 4, 0);
     }
 
     #[test]

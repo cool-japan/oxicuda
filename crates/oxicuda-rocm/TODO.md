@@ -7,7 +7,7 @@ providing GPU-accelerated operations on AMD GPUs. Part of [OxiCUDA](https://gith
 
 ## Implementation Status
 
-- **Tests**: 50 passing
+- **Tests**: 68 passing
 - **Status**: HIP kernel generators + host-side dispatch
 
 ### Completed
@@ -30,8 +30,8 @@ providing GPU-accelerated operations on AMD GPUs. Part of [OxiCUDA](https://gith
 
 - [ ] Actual GPU dispatch via hiprtc when HIP runtime available
 - [ ] ROCm-specific optimizations (wave64 vs wave32)
-- [ ] Batched GEMM support
-- [ ] FP16/BF16 support via AMD matrix cores (MFMA)
+- [x] Batched GEMM support (`batched_gemm_hip` kernel + `batched_gemm()` trait override)
+- [x] FP16/BF16 support via AMD matrix cores (MFMA) (`gemm_hip_f16`, `gemm_hip_bf16`, `elementwise_hip_f16` kernels)
 - [ ] hipBLAS interop for performance-critical paths
 - [ ] Multi-GPU HIP support
 
@@ -45,6 +45,6 @@ providing GPU-accelerated operations on AMD GPUs. Part of [OxiCUDA](https://gith
 ## Quality Status
 
 - Warnings: 0
-- Tests: 50 passing
+- Tests: 68 passing
 - unwrap() calls: 0
 - Clippy: clean

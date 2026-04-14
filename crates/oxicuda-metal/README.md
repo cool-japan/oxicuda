@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-metal = "0.1.1"
+oxicuda-metal = "0.1.2"
 ```
 
 ```rust

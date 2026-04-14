@@ -1582,8 +1582,44 @@ impl<'a> BodyBuilder<'a> {
     /// Emits raw PTX text verbatim. Use as an escape hatch for instructions
     /// not yet modeled in the IR.
     ///
-    /// The text should be a single instruction without trailing newline.
+    /// Named registers (e.g., `%f_x`, `%rd_off`, `%p_ge`) found in the text
+    /// are automatically declared based on their prefix:
+    /// - `%f_*`  → `.reg .f32`
+    /// - `%rd_*` → `.reg .b64`
+    /// - `%r_*`  → `.reg .b32`
+    /// - `%p_*`  → `.reg .pred`
     pub fn raw_ptx(&mut self, text: &str) {
+        // Auto-declare named registers found in the raw text.
+        let mut i = 0;
+        let bytes = text.as_bytes();
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let start = i;
+                i += 1;
+                // Consume alphanumeric + underscore
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let name = &text[start..i];
+                // Only declare names containing an underscore (custom names)
+                if name.contains('_') {
+                    let ty = if name.starts_with("%rd_") {
+                        PtxType::B64
+                    } else if name.starts_with("%f_") {
+                        PtxType::F32
+                    } else if name.starts_with("%p_") {
+                        PtxType::Pred
+                    } else if name.starts_with("%r_") {
+                        PtxType::B32
+                    } else {
+                        continue;
+                    };
+                    self.regs.declare_named(name, ty);
+                }
+            } else {
+                i += 1;
+            }
+        }
         self.emit(Instruction::Raw(text.to_string()));
     }
 
@@ -1643,6 +1679,14 @@ impl<'a> BodyBuilder<'a> {
     /// instruction methods which allocate destination registers automatically.
     pub fn alloc_reg(&mut self, ty: PtxType) -> Register {
         self.regs.alloc(ty)
+    }
+
+    /// Declares a named register for use in [`raw_ptx`](Self::raw_ptx) blocks.
+    ///
+    /// Named registers (e.g., `%f_x`, `%rd_off`) are not created by the
+    /// automatic allocator, so they must be declared explicitly before use.
+    pub fn declare_named_reg(&mut self, name: &str, ty: PtxType) {
+        self.regs.declare_named(name, ty);
     }
 
     // ════════════════════════════════════════════════════════════════════

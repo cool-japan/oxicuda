@@ -16,6 +16,7 @@ oxicuda-backend.workspace = true
 libloading.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+half.workspace = true
 
 [lints]
 workspace = true

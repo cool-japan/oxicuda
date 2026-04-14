@@ -11,12 +11,18 @@ readme = "README.md"
 keywords = ["webgpu", "wgpu", "gpu", "compute", "wgsl"]
 categories = ["hardware-support", "science", "mathematics"]
 
+[features]
+default = []
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+
 [dependencies]
 oxicuda-backend.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
 
 [lints]
 workspace = true

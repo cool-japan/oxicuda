@@ -159,7 +159,7 @@ to cuDNN. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda) (Vol.4).
 ## Quality Status
 
 - Warnings: 0 (clippy clean)
-- Tests: 627 passing
+- Tests: 960 passing
 - unwrap() calls: 0 (production code)
 
 ## Performance Targets

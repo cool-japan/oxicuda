@@ -20,6 +20,8 @@ pub struct VulkanDevice {
     device: Device,
     compute_queue_family: u32,
     compute_queue: vk::Queue,
+    /// All compute queues discovered in the selected queue family.
+    compute_queues: Vec<vk::Queue>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     device_name: String,
 }
@@ -51,7 +53,7 @@ impl VulkanDevice {
             return Err(VulkanError::NoSuitableDevice);
         }
 
-        let (physical_device, compute_queue_family) =
+        let (physical_device, compute_queue_family, queue_count) =
             Self::select_device(&instance, &physical_devices)?;
 
         let device_name = Self::get_device_name(&instance, physical_device);
@@ -59,17 +61,27 @@ impl VulkanDevice {
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-        let device = Self::create_logical_device(&instance, physical_device, compute_queue_family)
-            .inspect_err(|_| {
-                // On failure we must clean up the instance.
-                unsafe { instance.destroy_instance(None) };
-            })?;
+        let device = Self::create_logical_device(
+            &instance,
+            physical_device,
+            compute_queue_family,
+            queue_count,
+        )
+        .inspect_err(|_| {
+            // On failure we must clean up the instance.
+            unsafe { instance.destroy_instance(None) };
+        })?;
 
         let compute_queue = unsafe { device.get_device_queue(compute_queue_family, 0) };
+
+        let compute_queues: Vec<vk::Queue> = (0..queue_count)
+            .map(|i| unsafe { device.get_device_queue(compute_queue_family, i) })
+            .collect();
 
         tracing::debug!(
             device = %device_name,
             compute_queue_family,
+            queue_count,
             "Vulkan device initialised"
         );
 
@@ -80,6 +92,7 @@ impl VulkanDevice {
             device,
             compute_queue_family,
             compute_queue,
+            compute_queues,
             memory_properties,
             device_name,
         })
@@ -107,9 +120,10 @@ impl VulkanDevice {
     fn select_device(
         instance: &Instance,
         devices: &[vk::PhysicalDevice],
-    ) -> VulkanResult<(vk::PhysicalDevice, u32)> {
+    ) -> VulkanResult<(vk::PhysicalDevice, u32, u32)> {
         // Prefer discrete GPU, then any device with a compute queue.
-        let mut fallback: Option<(vk::PhysicalDevice, u32)> = None;
+        // Returns (physical_device, queue_family_index, queue_count).
+        let mut fallback: Option<(vk::PhysicalDevice, u32, u32)> = None;
 
         for &dev in devices {
             let props = unsafe { instance.get_physical_device_properties(dev) };
@@ -119,11 +133,12 @@ impl VulkanDevice {
             for (i, qf) in queue_families.iter().enumerate() {
                 if qf.queue_flags.contains(vk::QueueFlags::COMPUTE) {
                     let qf_idx = i as u32;
+                    let qcount = qf.queue_count;
                     if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
-                        return Ok((dev, qf_idx));
+                        return Ok((dev, qf_idx, qcount));
                     }
                     if fallback.is_none() {
-                        fallback = Some((dev, qf_idx));
+                        fallback = Some((dev, qf_idx, qcount));
                     }
                 }
             }
@@ -148,8 +163,9 @@ impl VulkanDevice {
         instance: &Instance,
         physical_device: vk::PhysicalDevice,
         compute_queue_family: u32,
+        queue_count: u32,
     ) -> VulkanResult<Device> {
-        let queue_priorities = [1.0_f32];
+        let queue_priorities: Vec<f32> = vec![1.0_f32; queue_count as usize];
         let queue_create_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(compute_queue_family)
             .queue_priorities(&queue_priorities);
@@ -176,6 +192,16 @@ impl VulkanDevice {
     /// The raw `vk::Queue` used for compute command submissions.
     pub fn compute_queue(&self) -> vk::Queue {
         self.compute_queue
+    }
+
+    /// All compute queues in the selected queue family.
+    pub fn compute_queues(&self) -> &[vk::Queue] {
+        &self.compute_queues
+    }
+
+    /// Number of compute queues available in the selected queue family.
+    pub fn compute_queue_count(&self) -> usize {
+        self.compute_queues.len()
     }
 
     /// Reference to the logical device (used by memory manager, pipeline, etc.).

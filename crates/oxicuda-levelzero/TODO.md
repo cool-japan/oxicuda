@@ -7,7 +7,7 @@ and dispatch framework. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda)
 
 ## Implementation Status
 
-- **Tests**: 63 passing
+- **Tests**: 82 passing
 - **Status**: OpenCL SPIR-V kernel generators + dispatch framework
 
 ### Completed
@@ -28,9 +28,9 @@ and dispatch framework. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda)
 
 ### Future Enhancements
 
-- [ ] Batched GEMM support
+- [x] Batched GEMM support (`batched_gemm_compute_shader` SPIR-V + `batched_gemm()` trait override)
 - [ ] Intel Xe matrix extensions (XMX) for Tensor Core equivalent
-- [ ] Intel GPU sub-group optimizations
+- [x] Intel GPU sub-group optimizations (`reduction_subgroup_spirv`, `scan_subgroup_spirv`, `gemm_subgroup_spirv`)
 - [ ] Multi-tile/multi-device support
 
 ## Dependencies
@@ -43,6 +43,6 @@ and dispatch framework. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda)
 ## Quality Status
 
 - Warnings: 0
-- Tests: 63 passing
+- Tests: 82 passing
 - unwrap() calls: 0
 - Clippy: clean

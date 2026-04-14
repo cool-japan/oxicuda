@@ -257,6 +257,52 @@ impl ComputeBackend for RocmBackend {
         self.dispatch_binary(op, a_ptr, b_ptr, output_ptr, n)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn batched_gemm(
+        &self,
+        trans_a: BackendTranspose,
+        trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        lda: usize,
+        stride_a: usize,
+        b_ptr: u64,
+        ldb: usize,
+        stride_b: usize,
+        beta: f64,
+        c_ptr: u64,
+        ldc: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        if batch_count == 0 || m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        self.dispatch_batched_gemm(
+            trans_a,
+            trans_b,
+            m,
+            n,
+            k,
+            alpha,
+            a_ptr,
+            lda,
+            stride_a,
+            b_ptr,
+            ldb,
+            stride_b,
+            beta,
+            c_ptr,
+            ldc,
+            stride_c,
+            batch_count,
+        )
+    }
+
     // ── Synchronisation ───────────────────────────────────────────────────────
 
     fn synchronize(&self) -> BackendResult<()> {
@@ -406,6 +452,109 @@ impl RocmBackend {
                 .map_err(BackendError::from)?;
 
             // Synchronize
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_batched_gemm(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _alpha: f64,
+        _a_ptr: u64,
+        _lda: usize,
+        _stride_a: usize,
+        _b_ptr: u64,
+        _ldb: usize,
+        _stride_b: usize,
+        _beta: f64,
+        _c_ptr: u64,
+        _ldc: usize,
+        _stride_c: usize,
+        _batch_count: usize,
+    ) -> BackendResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let _src = crate::hip_kernels::batched_gemm_hip(16);
+
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let m = _m;
+            let n = _n;
+            let k = _k;
+            let alpha = _alpha as f32;
+            let beta = _beta as f32;
+            let batch_count = _batch_count;
+
+            // For each batch, read A_b, B_b, C_b, compute, write C_b back.
+            let a_elems = m * k;
+            let b_elems = k * n;
+            let c_elems = m * n;
+
+            let mut a_host = vec![0u8; a_elems * 4];
+            let mut b_host = vec![0u8; b_elems * 4];
+            let mut c_host = vec![0u8; c_elems * 4];
+
+            for batch in 0..batch_count {
+                let a_offset = _a_ptr + (batch * _stride_a * 4) as u64;
+                let b_offset = _b_ptr + (batch * _stride_b * 4) as u64;
+                let c_offset = _c_ptr + (batch * _stride_c * 4) as u64;
+
+                mm.copy_from_device(&mut a_host, a_offset)
+                    .map_err(BackendError::from)?;
+                mm.copy_from_device(&mut b_host, b_offset)
+                    .map_err(BackendError::from)?;
+                mm.copy_from_device(&mut c_host, c_offset)
+                    .map_err(BackendError::from)?;
+
+                let a_f32 = bytemuck_cast_f32(&a_host);
+                let b_f32 = bytemuck_cast_f32(&b_host);
+                let c_f32 = bytemuck_cast_f32_mut(&mut c_host);
+
+                for row in 0..m {
+                    for col in 0..n {
+                        let mut acc = 0.0f32;
+                        for i in 0..k {
+                            let a_val = match _trans_a {
+                                BackendTranspose::NoTrans => a_f32[row * _lda + i],
+                                BackendTranspose::Trans | BackendTranspose::ConjTrans => {
+                                    a_f32[i * _lda + row]
+                                }
+                            };
+                            let b_val = match _trans_b {
+                                BackendTranspose::NoTrans => b_f32[i * _ldb + col],
+                                BackendTranspose::Trans | BackendTranspose::ConjTrans => {
+                                    b_f32[col * _ldb + i]
+                                }
+                            };
+                            acc += a_val * b_val;
+                        }
+                        let idx = row * _ldc + col;
+                        c_f32[idx] = alpha * acc + beta * c_f32[idx];
+                    }
+                }
+
+                mm.copy_to_device(c_offset, &c_host)
+                    .map_err(BackendError::from)?;
+            }
+
             let rc = unsafe { (dev.api.hip_device_synchronize)() };
             if rc != crate::device::HIP_SUCCESS {
                 return Err(BackendError::DeviceError(format!(
@@ -875,6 +1024,210 @@ impl RocmBackend {
     }
 }
 
+// ─── FP16 / BF16 inherent methods ───────────────────────────────────────────
+
+impl RocmBackend {
+    /// Half-precision (FP16) GEMM: `C = alpha * A * B + beta * C`.
+    ///
+    /// All buffers use 2-byte `f16` elements.  Accumulation is performed in
+    /// `f32` on the CPU fallback path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _alpha: f64,
+        _a_ptr: u64,
+        _lda: usize,
+        _b_ptr: u64,
+        _ldb: usize,
+        _beta: f64,
+        _c_ptr: u64,
+        _ldc: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        if _m == 0 || _n == 0 || _k == 0 {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _src = crate::hip_kernels::gemm_hip_f16(16);
+
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let m = _m;
+            let n = _n;
+            let k = _k;
+            let alpha = _alpha as f32;
+            let beta = _beta as f32;
+
+            let a_bytes = m * k * 2;
+            let b_bytes = k * n * 2;
+            let c_bytes = m * n * 2;
+
+            let mut a_host = vec![0u8; a_bytes];
+            let mut b_host = vec![0u8; b_bytes];
+            let mut c_host = vec![0u8; c_bytes];
+
+            mm.copy_from_device(&mut a_host, _a_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut b_host, _b_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut c_host, _c_ptr)
+                .map_err(BackendError::from)?;
+
+            let a_f16 = bytemuck_cast_f16(&a_host);
+            let b_f16 = bytemuck_cast_f16(&b_host);
+            let c_f16 = bytemuck_cast_f16_mut(&mut c_host);
+
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0.0f32;
+                    for i in 0..k {
+                        let a_val = match _trans_a {
+                            BackendTranspose::NoTrans => a_f16[row * _lda + i],
+                            BackendTranspose::Trans | BackendTranspose::ConjTrans => {
+                                a_f16[i * _lda + row]
+                            }
+                        };
+                        let b_val = match _trans_b {
+                            BackendTranspose::NoTrans => b_f16[i * _ldb + col],
+                            BackendTranspose::Trans | BackendTranspose::ConjTrans => {
+                                b_f16[col * _ldb + i]
+                            }
+                        };
+                        acc += a_val.to_f32() * b_val.to_f32();
+                    }
+                    let idx = row * _ldc + col;
+                    let c_val = c_f16[idx].to_f32();
+                    c_f16[idx] = half::f16::from_f32(alpha * acc + beta * c_val);
+                }
+            }
+
+            mm.copy_to_device(_c_ptr, &c_host)
+                .map_err(BackendError::from)?;
+
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+
+    /// BFloat16 GEMM: `C = alpha * A * B + beta * C`.
+    ///
+    /// All buffers use 2-byte `bf16` elements.  Accumulation is performed in
+    /// `f32` on the CPU fallback path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _alpha: f64,
+        _a_ptr: u64,
+        _lda: usize,
+        _b_ptr: u64,
+        _ldb: usize,
+        _beta: f64,
+        _c_ptr: u64,
+        _ldc: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        if _m == 0 || _n == 0 || _k == 0 {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _src = crate::hip_kernels::gemm_hip_bf16(16);
+
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let m = _m;
+            let n = _n;
+            let k = _k;
+            let alpha = _alpha as f32;
+            let beta = _beta as f32;
+
+            let a_bytes = m * k * 2;
+            let b_bytes = k * n * 2;
+            let c_bytes = m * n * 2;
+
+            let mut a_host = vec![0u8; a_bytes];
+            let mut b_host = vec![0u8; b_bytes];
+            let mut c_host = vec![0u8; c_bytes];
+
+            mm.copy_from_device(&mut a_host, _a_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut b_host, _b_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut c_host, _c_ptr)
+                .map_err(BackendError::from)?;
+
+            let a_bf16 = bytemuck_cast_bf16(&a_host);
+            let b_bf16 = bytemuck_cast_bf16(&b_host);
+            let c_bf16 = bytemuck_cast_bf16_mut(&mut c_host);
+
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0.0f32;
+                    for i in 0..k {
+                        let a_val = match _trans_a {
+                            BackendTranspose::NoTrans => a_bf16[row * _lda + i],
+                            BackendTranspose::Trans | BackendTranspose::ConjTrans => {
+                                a_bf16[i * _lda + row]
+                            }
+                        };
+                        let b_val = match _trans_b {
+                            BackendTranspose::NoTrans => b_bf16[i * _ldb + col],
+                            BackendTranspose::Trans | BackendTranspose::ConjTrans => {
+                                b_bf16[col * _ldb + i]
+                            }
+                        };
+                        acc += a_val.to_f32() * b_val.to_f32();
+                    }
+                    let idx = row * _ldc + col;
+                    let c_val = c_bf16[idx].to_f32();
+                    c_bf16[idx] = half::bf16::from_f32(alpha * acc + beta * c_val);
+                }
+            }
+
+            mm.copy_to_device(_c_ptr, &c_host)
+                .map_err(BackendError::from)?;
+
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+}
+
 // ─── Byte reinterpretation helpers ──────────────────────────────────────────
 
 /// Reinterpret a `&[u8]` slice (whose length is a multiple of 4) as `&[f32]`.
@@ -900,6 +1253,42 @@ fn bytemuck_cast_f32_mut(bytes: &mut [u8]) -> &mut [f32] {
     debug_assert_eq!(bytes.len() % 4, 0);
     let len = bytes.len() / 4;
     let ptr = bytes.as_mut_ptr().cast::<f32>();
+    unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+}
+
+/// Reinterpret a `&[u8]` slice (whose length is a multiple of 2) as `&[half::f16]`.
+#[cfg(target_os = "linux")]
+fn bytemuck_cast_f16(bytes: &[u8]) -> &[half::f16] {
+    debug_assert_eq!(bytes.len() % 2, 0);
+    let len = bytes.len() / 2;
+    let ptr = bytes.as_ptr().cast::<half::f16>();
+    unsafe { std::slice::from_raw_parts(ptr, len) }
+}
+
+/// Reinterpret a `&mut [u8]` slice (whose length is a multiple of 2) as `&mut [half::f16]`.
+#[cfg(target_os = "linux")]
+fn bytemuck_cast_f16_mut(bytes: &mut [u8]) -> &mut [half::f16] {
+    debug_assert_eq!(bytes.len() % 2, 0);
+    let len = bytes.len() / 2;
+    let ptr = bytes.as_mut_ptr().cast::<half::f16>();
+    unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+}
+
+/// Reinterpret a `&[u8]` slice (whose length is a multiple of 2) as `&[half::bf16]`.
+#[cfg(target_os = "linux")]
+fn bytemuck_cast_bf16(bytes: &[u8]) -> &[half::bf16] {
+    debug_assert_eq!(bytes.len() % 2, 0);
+    let len = bytes.len() / 2;
+    let ptr = bytes.as_ptr().cast::<half::bf16>();
+    unsafe { std::slice::from_raw_parts(ptr, len) }
+}
+
+/// Reinterpret a `&mut [u8]` slice (whose length is a multiple of 2) as `&mut [half::bf16]`.
+#[cfg(target_os = "linux")]
+fn bytemuck_cast_bf16_mut(bytes: &mut [u8]) -> &mut [half::bf16] {
+    debug_assert_eq!(bytes.len() % 2, 0);
+    let len = bytes.len() / 2;
+    let ptr = bytes.as_mut_ptr().cast::<half::bf16>();
     unsafe { std::slice::from_raw_parts_mut(ptr, len) }
 }
 
@@ -996,6 +1385,136 @@ mod tests {
         let b = RocmBackend::new();
         let mut buf = [0u8; 4];
         assert_eq!(b.copy_dtoh(&mut buf, 1), Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn backend_not_initialized_batched_gemm() {
+        let b = RocmBackend::new();
+        let result = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            3,
+        );
+        assert_eq!(result, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn batched_gemm_zero_batch_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        assert_eq!(
+            b.batched_gemm(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                4,
+                4,
+                4,
+                1.0,
+                0,
+                4,
+                16,
+                0,
+                4,
+                16,
+                0.0,
+                0,
+                4,
+                16,
+                0, // batch_count = 0
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn batched_gemm_zero_dims_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        // m == 0
+        assert_eq!(
+            b.batched_gemm(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                0,
+                4,
+                4,
+                1.0,
+                0,
+                4,
+                0,
+                0,
+                4,
+                0,
+                0.0,
+                0,
+                4,
+                0,
+                2,
+            ),
+            Ok(())
+        );
+        // n == 0
+        assert_eq!(
+            b.batched_gemm(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                4,
+                0,
+                4,
+                1.0,
+                0,
+                4,
+                0,
+                0,
+                4,
+                0,
+                0.0,
+                0,
+                4,
+                0,
+                2,
+            ),
+            Ok(())
+        );
+        // k == 0
+        assert_eq!(
+            b.batched_gemm(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                4,
+                4,
+                0,
+                1.0,
+                0,
+                4,
+                0,
+                0,
+                4,
+                0,
+                0.0,
+                0,
+                4,
+                0,
+                2,
+            ),
+            Ok(())
+        );
     }
 
     // ── 3. Graceful init failure ──────────────────────────────────────────────
@@ -1249,5 +1768,99 @@ mod tests {
         };
         assert!(handle > 0);
         b.free(handle).expect("free should succeed");
+    }
+
+    // ── FP16 / BF16 backend methods ─────────────────────────────────────────
+
+    #[test]
+    fn backend_not_initialized_gemm_f16() {
+        let b = RocmBackend::new();
+        let result = b.gemm_f16(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            0,
+            4,
+            0.0,
+            0,
+            4,
+        );
+        assert_eq!(result, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn backend_not_initialized_gemm_bf16() {
+        let b = RocmBackend::new();
+        let result = b.gemm_bf16(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            0,
+            4,
+            0.0,
+            0,
+            4,
+        );
+        assert_eq!(result, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn gemm_f16_zero_dims_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        assert_eq!(
+            b.gemm_f16(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                0,
+                0,
+                0,
+                1.0,
+                0,
+                1,
+                0,
+                1,
+                0.0,
+                0,
+                1,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn gemm_bf16_zero_dims_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        assert_eq!(
+            b.gemm_bf16(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                0,
+                0,
+                0,
+                1.0,
+                0,
+                1,
+                0,
+                1,
+                0.0,
+                0,
+                1,
+            ),
+            Ok(())
+        );
     }
 }

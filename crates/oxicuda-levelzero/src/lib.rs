@@ -14,6 +14,7 @@ pub mod error;
 pub mod memory;
 pub mod spirv;
 pub mod spirv_nn;
+pub mod spirv_subgroup;
 
 pub use backend::LevelZeroBackend;
 pub use error::{LevelZeroError, LevelZeroResult};

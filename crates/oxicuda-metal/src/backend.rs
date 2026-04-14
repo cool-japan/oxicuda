@@ -374,6 +374,53 @@ impl ComputeBackend for MetalBackend {
         self.dispatch_binary(op, a_ptr, b_ptr, output_ptr, n)
     }
 
+    // ── Batched GEMM ──────────────────────────────────────────────────────────
+
+    fn batched_gemm(
+        &self,
+        trans_a: BackendTranspose,
+        trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        lda: usize,
+        stride_a: usize,
+        b_ptr: u64,
+        ldb: usize,
+        stride_b: usize,
+        beta: f64,
+        c_ptr: u64,
+        ldc: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        if batch_count == 0 || m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        self.dispatch_batched_gemm(
+            trans_a,
+            trans_b,
+            m,
+            n,
+            k,
+            alpha,
+            a_ptr,
+            lda,
+            stride_a,
+            b_ptr,
+            ldb,
+            stride_b,
+            beta,
+            c_ptr,
+            ldc,
+            stride_c,
+            batch_count,
+        )
+    }
+
     // ── Synchronisation ───────────────────────────────────────────────────────
 
     fn synchronize(&self) -> BackendResult<()> {
@@ -725,6 +772,188 @@ impl MetalBackend {
 
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_batched_gemm(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        _lda: usize,
+        stride_a: usize,
+        b_ptr: u64,
+        _ldb: usize,
+        stride_b: usize,
+        beta: f64,
+        c_ptr: u64,
+        _ldc: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        let device = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+        let memory = self.memory()?;
+
+        let msl = crate::msl::batched_gemm_msl();
+        let pipeline = crate::pipeline::MetalComputePipeline::new(device, msl, "batched_gemm_f32")
+            .map_err(BackendError::from)?;
+
+        let buffers = memory.lock_buffers().map_err(BackendError::from)?;
+        let a_info = buffers
+            .get(&a_ptr)
+            .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {a_ptr}")))?;
+        let b_info = buffers
+            .get(&b_ptr)
+            .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {b_ptr}")))?;
+        let c_info = buffers
+            .get(&c_ptr)
+            .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {c_ptr}")))?;
+
+        #[repr(C)]
+        struct BatchedGemmParams {
+            m: u32,
+            n: u32,
+            k: u32,
+            alpha: f32,
+            beta: f32,
+            batch_count: u32,
+            stride_a: u32,
+            stride_b: u32,
+            stride_c: u32,
+        }
+
+        let params = BatchedGemmParams {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            alpha: alpha as f32,
+            beta: beta as f32,
+            batch_count: batch_count as u32,
+            stride_a: stride_a as u32,
+            stride_b: stride_b as u32,
+            stride_c: stride_c as u32,
+        };
+
+        let command_buffer = pipeline.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline.pipeline_state);
+        encoder.set_buffer(0, Some(&a_info.buffer), 0);
+        encoder.set_buffer(1, Some(&b_info.buffer), 0);
+        encoder.set_buffer(2, Some(&c_info.buffer), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<BatchedGemmParams>() as u64,
+            &params as *const BatchedGemmParams as *const std::ffi::c_void,
+        );
+
+        let tg_w = 16u64;
+        let tg_h = 16u64;
+        let groups_x = (n as u64).div_ceil(tg_w);
+        let groups_y = (m as u64).div_ceil(tg_h);
+        let groups_z = batch_count as u64;
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(groups_x, groups_y, groups_z),
+            metal::MTLSize::new(tg_w, tg_h, 1),
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        Ok(())
+    }
+
+    /// Half-precision GEMM: `C = alpha * A * B + beta * C` using FP16 storage.
+    ///
+    /// This is an inherent method (not on the `ComputeBackend` trait) since
+    /// the trait operates on f32/f64 data. Element size is 2 bytes (half).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a_ptr: u64,
+        _lda: usize,
+        b_ptr: u64,
+        _ldb: usize,
+        beta: f32,
+        c_ptr: u64,
+        _ldc: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+
+        let device = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+        let memory = self.memory()?;
+
+        let msl = crate::msl::gemm_msl_f16();
+        let pipeline = crate::pipeline::MetalComputePipeline::new(device, msl, "gemm_f16")
+            .map_err(BackendError::from)?;
+
+        let buffers = memory.lock_buffers().map_err(BackendError::from)?;
+        let a_info = buffers
+            .get(&a_ptr)
+            .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {a_ptr}")))?;
+        let b_info = buffers
+            .get(&b_ptr)
+            .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {b_ptr}")))?;
+        let c_info = buffers
+            .get(&c_ptr)
+            .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {c_ptr}")))?;
+
+        #[repr(C)]
+        struct GemmParamsF16 {
+            m: u32,
+            n: u32,
+            k: u32,
+            alpha: f32,
+            beta: f32,
+        }
+
+        let params = GemmParamsF16 {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            alpha,
+            beta,
+        };
+
+        let command_buffer = pipeline.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline.pipeline_state);
+        encoder.set_buffer(0, Some(&a_info.buffer), 0);
+        encoder.set_buffer(1, Some(&b_info.buffer), 0);
+        encoder.set_buffer(2, Some(&c_info.buffer), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<GemmParamsF16>() as u64,
+            &params as *const GemmParamsF16 as *const std::ffi::c_void,
+        );
+
+        let tg_w = 16u64;
+        let tg_h = 16u64;
+        let groups_x = (n as u64).div_ceil(tg_w);
+        let groups_y = (m as u64).div_ceil(tg_h);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(groups_x, groups_y, 1),
+            metal::MTLSize::new(tg_w, tg_h, 1),
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -778,6 +1007,55 @@ impl MetalBackend {
         _c_ptr: u64,
         _ldc: usize,
     ) -> BackendResult<()> {
+        Err(BackendError::DeviceError("Metal requires macOS".into()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_batched_gemm(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _alpha: f64,
+        _a_ptr: u64,
+        _lda: usize,
+        _stride_a: usize,
+        _b_ptr: u64,
+        _ldb: usize,
+        _stride_b: usize,
+        _beta: f64,
+        _c_ptr: u64,
+        _ldc: usize,
+        _stride_c: usize,
+        _batch_count: usize,
+    ) -> BackendResult<()> {
+        Err(BackendError::DeviceError("Metal requires macOS".into()))
+    }
+
+    /// Half-precision GEMM: `C = alpha * A * B + beta * C` using FP16 storage.
+    ///
+    /// This is an inherent method (not on the `ComputeBackend` trait) since
+    /// the trait operates on f32/f64 data. Element size is 2 bytes (half).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _alpha: f32,
+        _a_ptr: u64,
+        _lda: usize,
+        _b_ptr: u64,
+        _ldb: usize,
+        _beta: f32,
+        _c_ptr: u64,
+        _ldc: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
         Err(BackendError::DeviceError("Metal requires macOS".into()))
     }
 }
@@ -877,6 +1155,135 @@ mod tests {
         let b = MetalBackend::new();
         let mut buf = [0u8; 4];
         assert_eq!(b.copy_dtoh(&mut buf, 1), Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn batched_gemm_not_initialized() {
+        let b = MetalBackend::new();
+        let result = b.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            2,
+        );
+        assert_eq!(result, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn batched_gemm_zero_batch_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        assert_eq!(
+            b.batched_gemm(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                4,
+                4,
+                4,
+                1.0,
+                0,
+                4,
+                16,
+                0,
+                4,
+                16,
+                0.0,
+                0,
+                4,
+                16,
+                0,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn batched_gemm_zero_dims_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        assert_eq!(
+            b.batched_gemm(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                0,
+                0,
+                0,
+                1.0,
+                0,
+                1,
+                0,
+                0,
+                1,
+                0,
+                0.0,
+                0,
+                1,
+                0,
+                3,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn gemm_f16_not_initialized() {
+        let b = MetalBackend::new();
+        let result = b.gemm_f16(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            0,
+            4,
+            0.0,
+            0,
+            4,
+        );
+        assert_eq!(result, Err(BackendError::NotInitialized));
+    }
+
+    #[test]
+    fn gemm_f16_zero_dims_noop() {
+        let Some(b) = try_init() else {
+            return;
+        };
+        assert_eq!(
+            b.gemm_f16(
+                BackendTranspose::NoTrans,
+                BackendTranspose::NoTrans,
+                0,
+                0,
+                0,
+                1.0,
+                0,
+                1,
+                0,
+                1,
+                0.0,
+                0,
+                1,
+            ),
+            Ok(())
+        );
     }
 
     // ── Helper: try to get an initialised backend (skip if no GPU) ────────────

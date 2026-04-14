@@ -62,6 +62,7 @@ Current implementation covers eight dense decompositions (LU, QR, Cholesky, SVD,
 
 ## Quality Status
 
+- Tests: 373 passing
 - All production code uses Result/Option (no unwrap)
 - clippy::all and missing_docs warnings enabled
 - GPU tests behind `#[cfg(feature = "gpu-tests")]`

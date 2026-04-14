@@ -318,6 +318,67 @@ pub trait ComputeBackend: Send + Sync + fmt::Debug {
         n: usize,
     ) -> BackendResult<()>;
 
+    /// Strided batched GEMM: for each batch `b` in `0..batch_count`,
+    /// compute `C_b = alpha * op(A_b) * op(B_b) + beta * C_b`
+    /// where `A_b` starts at `a_ptr + b * stride_a * 4` bytes (f32 elements), etc.
+    ///
+    /// # Arguments
+    ///
+    /// * `trans_a`, `trans_b` — transpose modes for A and B.
+    /// * `m`, `n`, `k` — matrix dimensions (C is m×n).
+    /// * `alpha`, `beta` — scaling factors.
+    /// * `a_ptr`, `b_ptr`, `c_ptr` — device pointers to the first matrix in each batch.
+    /// * `lda`, `ldb`, `ldc` — leading dimensions.
+    /// * `stride_a`, `stride_b`, `stride_c` — element strides between consecutive matrices.
+    /// * `batch_count` — number of GEMM operations in the batch.
+    ///
+    /// The default implementation dispatches `batch_count` individual
+    /// [`gemm`](Self::gemm) calls with pointer offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn batched_gemm(
+        &self,
+        trans_a: BackendTranspose,
+        trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        lda: usize,
+        stride_a: usize,
+        b_ptr: u64,
+        ldb: usize,
+        stride_b: usize,
+        beta: f64,
+        c_ptr: u64,
+        ldc: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        // Default: loop over individual gemm calls with byte-offset pointers.
+        // Backends should override with a single batched kernel for efficiency.
+        let elem_bytes: u64 = 4; // f32
+        for b in 0..batch_count {
+            let b64 = b as u64;
+            self.gemm(
+                trans_a,
+                trans_b,
+                m,
+                n,
+                k,
+                alpha,
+                a_ptr + b64 * stride_a as u64 * elem_bytes,
+                lda,
+                b_ptr + b64 * stride_b as u64 * elem_bytes,
+                ldb,
+                beta,
+                c_ptr + b64 * stride_c as u64 * elem_bytes,
+                ldc,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Synchronize all pending operations on this backend.
     ///
     /// Blocks the host until all previously submitted GPU work completes.
@@ -435,6 +496,186 @@ mod tests {
         for (op, name) in ops.iter().zip(names.iter()) {
             assert_eq!(op.to_string(), *name);
         }
+    }
+
+    // ── Mock backend for testing default batched_gemm ──
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct MockBackend {
+        gemm_call_count: AtomicUsize,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                gemm_call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ComputeBackend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn init(&mut self) -> BackendResult<()> {
+            Ok(())
+        }
+        fn is_initialized(&self) -> bool {
+            true
+        }
+        fn gemm(
+            &self,
+            _trans_a: BackendTranspose,
+            _trans_b: BackendTranspose,
+            _m: usize,
+            _n: usize,
+            _k: usize,
+            _alpha: f64,
+            _a_ptr: u64,
+            _lda: usize,
+            _b_ptr: u64,
+            _ldb: usize,
+            _beta: f64,
+            _c_ptr: u64,
+            _ldc: usize,
+        ) -> BackendResult<()> {
+            self.gemm_call_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn conv2d_forward(
+            &self,
+            _: u64,
+            _: &[usize],
+            _: u64,
+            _: &[usize],
+            _: u64,
+            _: &[usize],
+            _: &[usize],
+            _: &[usize],
+        ) -> BackendResult<()> {
+            Ok(())
+        }
+        fn attention(
+            &self,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: usize,
+            _: f64,
+            _: bool,
+        ) -> BackendResult<()> {
+            Ok(())
+        }
+        fn reduce(&self, _: ReduceOp, _: u64, _: u64, _: &[usize], _: usize) -> BackendResult<()> {
+            Ok(())
+        }
+        fn unary(&self, _: UnaryOp, _: u64, _: u64, _: usize) -> BackendResult<()> {
+            Ok(())
+        }
+        fn binary(&self, _: BinaryOp, _: u64, _: u64, _: u64, _: usize) -> BackendResult<()> {
+            Ok(())
+        }
+        fn synchronize(&self) -> BackendResult<()> {
+            Ok(())
+        }
+        fn alloc(&self, _: usize) -> BackendResult<u64> {
+            Ok(0)
+        }
+        fn free(&self, _: u64) -> BackendResult<()> {
+            Ok(())
+        }
+        fn copy_htod(&self, _: u64, _: &[u8]) -> BackendResult<()> {
+            Ok(())
+        }
+        fn copy_dtoh(&self, _: &mut [u8], _: u64) -> BackendResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn batched_gemm_zero_batch_is_noop() {
+        let backend = MockBackend::new();
+        let result = backend.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            4,
+            4,
+            4,
+            1.0,
+            0,
+            4,
+            16,
+            0,
+            4,
+            16,
+            0.0,
+            0,
+            4,
+            16,
+            0, // batch_count = 0
+        );
+        assert!(result.is_ok());
+        assert_eq!(backend.gemm_call_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn batched_gemm_default_calls_gemm_n_times() {
+        let backend = MockBackend::new();
+        let batch_count = 7;
+        let result = backend.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::Trans,
+            8,
+            8,
+            8,
+            1.0,
+            1000,
+            8,
+            64,
+            2000,
+            8,
+            64,
+            0.0,
+            3000,
+            8,
+            64,
+            batch_count,
+        );
+        assert!(result.is_ok());
+        assert_eq!(backend.gemm_call_count.load(Ordering::Relaxed), batch_count);
+    }
+
+    #[test]
+    fn batched_gemm_single_batch() {
+        let backend = MockBackend::new();
+        let result = backend.batched_gemm(
+            BackendTranspose::NoTrans,
+            BackendTranspose::NoTrans,
+            16,
+            16,
+            16,
+            1.0,
+            0,
+            16,
+            256,
+            0,
+            16,
+            256,
+            1.0,
+            0,
+            16,
+            256,
+            1,
+        );
+        assert!(result.is_ok());
+        assert_eq!(backend.gemm_call_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
