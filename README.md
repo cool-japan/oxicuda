@@ -5,7 +5,7 @@
 [![CI](https://github.com/cool-japan/oxicuda/workflows/CI/badge.svg)](https://github.com/cool-japan/oxicuda/actions)
 [![License](https://img.shields.io/crates/l/oxicuda.svg)](LICENSE)
 
-**Pure Rust CUDA replacement -- cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSOLVER, cuRAND and beyond in ~239K lines of safe Rust across 28 crates.**
+**Pure Rust CUDA replacement -- cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSOLVER, cuRAND and beyond in ~248K lines of safe Rust across 28 crates.**
 
 OxiCUDA replaces the entire NVIDIA CUDA Toolkit software stack with type-safe,
 memory-safe Rust code. The only runtime dependency is the NVIDIA driver
@@ -73,13 +73,13 @@ architecture to achieve near-peak throughput from Turing through Blackwell.
 
 ## Feature Highlights
 
-**Vol.1 -- Foundation** (4 crates, 22,972 SLoC)
+**Vol.1 -- Foundation** (4 crates, 23,025 SLoC)
 - Dynamic driver loading via `libloading` -- zero build-time SDK dependency
 - `DeviceBuffer<T>` with Rust ownership semantics -- `Send + Sync`, RAII
 - Type-safe `launch!` macro with compile-time grid/block validation
 - CUDA Runtime API layer for high-level device management
 
-**Vol.2 -- PTX Codegen & Autotuner** (2 crates, 43,122 SLoC)
+**Vol.2 -- PTX Codegen & Autotuner** (2 crates, 43,354 SLoC)
 - Rust DSL that generates PTX IR covering SM 7.5 through SM 10.0
 - Tensor Core support: WMMA, MMA, WGMMA instruction generation
 - Built-in autotuner with 3-tier dispatch (cached / tuned / default)
@@ -107,7 +107,7 @@ architecture to achieve near-peak throughput from Turing through Blackwell.
 - Solver: LU, QR, SVD, Cholesky, eigendecomp, CG, BiCGSTAB, GMRES
 - Rand: Philox, MRG32k3a, XORWOW, Sobol, uniform/normal/Poisson
 
-**Vol.6 -- Signal Processing** (1 crate, 6,037 SLoC)
+**Vol.6 -- Signal Processing** (1 crate, 6,061 SLoC)
 - Audio: MFCC, STFT, Mel filterbank, spectral features
 - Image: Gaussian blur, Sobel edge detection, morphological ops
 - DCT: Types I-IV with fast algorithms
@@ -115,13 +115,13 @@ architecture to achieve near-peak throughput from Turing through Blackwell.
 - Filtering: IIR/FIR filters, Butterworth, Chebyshev
 - Correlation: cross-correlation, autocorrelation
 
-**Vol.7 -- Computation Graph** (1 crate, 4,784 SLoC)
+**Vol.7 -- Computation Graph** (1 crate, 4,802 SLoC)
 - CUDA Graph capture API (StreamCapture, GraphCapture)
 - Execution plan with dependency-sorted node scheduling
 - Event-based inter-node synchronization
 - Sequential + parallel graph executors
 
-**Vol.8 -- GPU Training** (2 crates, 10,244 SLoC)
+**Vol.8 -- GPU Training** (2 crates, 10,247 SLoC)
 - Mixed precision training (AMP): FP16/BF16 + loss scaling
 - Gradient accumulation and clipping; EMA (exponential moving average)
 - LR schedulers: cosine, warmup, cyclic, polynomial
@@ -135,7 +135,7 @@ architecture to achieve near-peak throughput from Turing through Blackwell.
 - Distributed inference pipeline (tensor/pipeline parallelism)
 - LM inference: BPE tokenizer, vocabulary management, sampling strategies
 
-**Vol.10 -- Reinforcement Learning** (1 crate, 4,234 SLoC)
+**Vol.10 -- Reinforcement Learning** (1 crate, 4,522 SLoC)
 - Replay buffers: Uniform, Prioritized (PER), N-step
 - Policy distributions: Categorical, Gaussian (SAC reparameterization), Deterministic
 - Advantage estimators: GAE, TD(λ), V-trace, Retrace(λ)
@@ -143,7 +143,7 @@ architecture to achieve near-peak throughput from Turing through Blackwell.
 - Observation/reward normalization with Welford running stats
 - Environment abstractions: Env, VecEnv (auto-reset)
 
-**Backends** (7 crates, 11,234 SLoC)
+**Backends** (7 crates, 19,665 SLoC)
 - Backend trait abstraction for multi-GPU-runtime portability
 - CUB-equivalent GPU primitives (scan, reduce, sort, histogram)
 - Metal (macOS), Vulkan Compute, WebGPU, AMD ROCm, Intel oneAPI (LevelZero)
@@ -212,46 +212,46 @@ fn main() -> Result<(), oxicuda::Error> {
 | Crate | CUDA Equivalent | Description | SLoC | Tests |
 |-------|-----------------|-------------|------|-------|
 | **Vol.1 -- Foundation** | | | | |
-| `oxicuda-driver` | Driver API | FFI, device/context/stream/event/module | 11,548 | 333 |
+| `oxicuda-driver` | Driver API | FFI, device/context/stream/event/module | 11,601 | 333 |
 | `oxicuda-memory` | cuMemAlloc | DeviceBuffer, PinnedBuffer, unified, pool | 4,178 | 204 |
 | `oxicuda-launch` | cuLaunchKernel | Dim3, LaunchParams, `launch!` macro | 4,728 | 207 |
 | `oxicuda-runtime` | CUDA Runtime | High-level cudaRT API layer | 2,518 | 46 |
 | **Vol.2 -- PTX Codegen & Autotuner** | | | | |
-| `oxicuda-ptx` | nvcc / CUTLASS | PTX IR, codegen DSL, Tensor Core gen | 29,206 | 873 |
+| `oxicuda-ptx` | nvcc / CUTLASS | PTX IR, codegen DSL, Tensor Core gen | 29,438 | 873 |
 | `oxicuda-autotune` | -- | Search space, benchmark, tuning DB | 13,916 | 408 |
 | **Vol.3 -- Linear Algebra** | | | | |
 | `oxicuda-blas` | cuBLAS | BLAS L1/L2/L3, GEMM, batched, elementwise | 21,845 | 604 |
 | **Vol.4 -- Deep Learning** | | | | |
 | `oxicuda-dnn` | cuDNN | Conv, attention, MoE, norm, pool, quantize | 34,711 | 960 |
 | **Vol.5 -- Scientific Computing** | | | | |
-| `oxicuda-fft` | cuFFT | Stockham, radix-2/4/8, Bluestein, 1D/2D/3D | 9,749 | 295 |
+| `oxicuda-fft` | cuFFT | Stockham, radix-2/4/8, Bluestein, 1D/2D/3D | 9,745 | 295 |
 | `oxicuda-sparse` | cuSPARSE | CSR/CSC/COO/BSR/ELL, SpMV, SpMM, SpGEMM | 12,278 | 320 |
 | `oxicuda-solver` | cuSOLVER | LU, QR, SVD, Cholesky, eig, CG, GMRES | 15,804 | 373 |
 | `oxicuda-rand` | cuRAND | Philox, MRG32k3a, Sobol, distributions | 10,115 | 264 |
 | **Vol.6 -- Signal Processing** | | | | |
-| `oxicuda-signal` | -- | Audio/image DSP, DCT, DWT, IIR/FIR filters | 6,037 | 231 |
+| `oxicuda-signal` | -- | Audio/image DSP, DCT, DWT, IIR/FIR filters | 6,061 | 231 |
 | **Vol.7 -- Computation Graph** | | | | |
-| `oxicuda-graph` | CUDA Graphs | Graph capture, dep-sorted exec, events | 4,784 | 175 |
+| `oxicuda-graph` | CUDA Graphs | Graph capture, dep-sorted exec, events | 4,802 | 175 |
 | **Vol.8 -- GPU Training** | | | | |
-| `oxicuda-train` | -- | AMP, grad accum/clip, LR schedulers, optimizers | 5,927 | 165 |
-| `oxicuda-quant` | -- | INT8/INT4/FP8 quantization, block-scaled | 4,317 | 150 |
+| `oxicuda-train` | -- | AMP, grad accum/clip, LR schedulers, optimizers | 5,929 | 165 |
+| `oxicuda-quant` | -- | INT8/INT4/FP8 quantization, block-scaled | 4,318 | 150 |
 | **Vol.9 -- Inference Engine** | | | | |
 | `oxicuda-infer` | -- | KV-cache, paged attention, speculative decode | 4,256 | 137 |
 | `oxicuda-dist-infer` | -- | Tensor/pipeline parallelism, distributed infer | 3,279 | 80 |
 | `oxicuda-lm` | -- | BPE tokenizer, vocab, sampling strategies | 4,394 | 182 |
 | **Vol.10 -- Reinforcement Learning** | | | | |
-| `oxicuda-rl` | -- | Replay buffers, policy dists, PPO/DQN/SAC/TD3 | 4,234 | 164 |
+| `oxicuda-rl` | -- | Replay buffers, policy dists, PPO/DQN/SAC/TD3 | 4,522 | 164 |
 | **Backends** | | | | |
 | `oxicuda-backend` | -- | Backend trait abstraction | 271 | 7 |
-| `oxicuda-primitives` | CUB | GPU scan, reduce, sort, histogram | 4,372 | 142 |
-| `oxicuda-metal` | -- | Metal compute backend (macOS) | 1,186 | 52 |
-| `oxicuda-vulkan` | -- | Vulkan Compute backend | 1,445 | 38 |
-| `oxicuda-webgpu` | -- | WebGPU backend | 1,108 | 42 |
-| `oxicuda-rocm` | -- | AMD ROCm backend | 1,087 | 36 |
-| `oxicuda-levelzero` | -- | Intel oneAPI / LevelZero backend | 1,765 | 44 |
+| `oxicuda-primitives` | CUB | GPU scan, reduce, sort, histogram | 4,446 | 142 |
+| `oxicuda-metal` | -- | Metal compute backend (macOS) | 3,328 | 108 |
+| `oxicuda-vulkan` | -- | Vulkan Compute backend | 3,377 | 61 |
+| `oxicuda-webgpu` | -- | WebGPU backend | 2,334 | 72 |
+| `oxicuda-rocm` | -- | AMD ROCm backend | 1,995 | 50 |
+| `oxicuda-levelzero` | -- | Intel oneAPI / LevelZero backend | 3,914 | 63 |
 | **Umbrella** | | | | |
 | `oxicuda` | -- | Umbrella re-export crate | 19,614 | 494 |
-| | | **Total** | **238,672** | **7,026** |
+| | | **Total** | **247,717** | **7,168** |
 
 ## Feature Flags
 
@@ -342,23 +342,23 @@ cargo nextest run --all-features
 
 ## Roadmap
 
-**Released (v0.1.0) -- 2026-04-13**
-- Vol.1: Driver, Memory, Launch, Runtime -- foundation layer (4 crates, 22,972 SLoC)
-- Vol.2: PTX codegen DSL, autotuner engine (2 crates, 43,122 SLoC)
+**Released (v0.1.1) -- 2026-04-14**
+- Vol.1: Driver, Memory, Launch, Runtime -- foundation layer (4 crates, 23,025 SLoC)
+- Vol.2: PTX codegen DSL, autotuner engine (2 crates, 43,354 SLoC)
 - Vol.3: Full BLAS L1/L2/L3 with Tensor Core GEMM (21,845 SLoC)
 - Vol.4: Convolution, FlashAttention, MoE, normalization, pooling, quantization (34,711 SLoC)
 - Vol.5: FFT, sparse, solver, RNG (4 crates, 47,946 SLoC)
-- Vol.6: Signal processing -- audio/image DSP, DCT, DWT, IIR/FIR filters (6,037 SLoC)
-- Vol.7: Computation graph -- capture API, dep-sorted scheduling, parallel executor (4,784 SLoC)
-- Vol.8: GPU training -- AMP, optimizers, LR schedulers, checkpointing, quantization (2 crates, 10,244 SLoC)
+- Vol.6: Signal processing -- audio/image DSP, DCT, DWT, IIR/FIR filters (6,061 SLoC)
+- Vol.7: Computation graph -- capture API, dep-sorted scheduling, parallel executor (4,802 SLoC)
+- Vol.8: GPU training -- AMP, optimizers, LR schedulers, checkpointing, quantization (2 crates, 10,247 SLoC)
 - Vol.9: Inference engine -- KV-cache, speculative decode, distributed infer, LM (3 crates, 11,929 SLoC)
-- Vol.10: Reinforcement learning -- replay buffers, policy dists, PPO/DQN/SAC/TD3 (4,234 SLoC)
-- Backends: Metal, Vulkan, WebGPU, ROCm, LevelZero (7 crates, 11,234 SLoC)
+- Vol.10: Reinforcement learning -- replay buffers, policy dists, PPO/DQN/SAC/TD3 (4,522 SLoC)
+- Backends: Metal, Vulkan, WebGPU, ROCm, LevelZero (7 crates, 19,665 SLoC)
 
 **Next**
-- Ecosystem integration (SciRS2, OxiONNX, TrustformeRS, ToRSh backends)
-- Multi-GPU / NCCL-equivalent collective operations
-- Performance benchmarks and CI regression tracking
+- Published documentation on docs.rs
+- GPU hardware benchmark validation (CI regression tracking)
+- v1.0 completion criteria verification (see TODO.md)
 
 ## Quick Links
 

@@ -86,6 +86,22 @@ impl LevelZeroMemoryManager {
         }
     }
 
+    /// Get the raw device pointer for a buffer handle.
+    ///
+    /// Returns the `*mut c_void` device pointer that Level Zero allocated for
+    /// the given handle.  This is needed to pass as a kernel argument.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn device_ptr(&self, handle: u64) -> LevelZeroResult<*mut c_void> {
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| LevelZeroError::CommandListError("mutex poisoned".into()))?;
+        let rec = buffers
+            .get(&handle)
+            .ok_or_else(|| LevelZeroError::InvalidArgument(format!("unknown handle {handle}")))?;
+        Ok(rec.device_ptr)
+    }
+
     /// Allocate `bytes` bytes of device memory.
     ///
     /// Returns an opaque handle.  The caller must eventually call [`free`](Self::free).

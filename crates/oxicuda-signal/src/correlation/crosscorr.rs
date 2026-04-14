@@ -131,8 +131,12 @@ pub fn find_delay(x: &[f64], y: &[f64], max_lag: usize) -> SignalResult<(isize, 
     let (idx, &peak) = r
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap();
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .ok_or_else(|| {
+            SignalError::InvalidSize(
+                "cross-correlation output is empty (max_lag check failed)".to_owned(),
+            )
+        })?;
     let lag = idx as isize - max_lag as isize;
     Ok((lag, peak))
 }

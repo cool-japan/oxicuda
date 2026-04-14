@@ -31,6 +31,12 @@ pub(crate) type ZeCommandQueueHandle = *mut c_void;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) type ZeCommandListHandle = *mut c_void;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) type ZeModuleHandle = *mut c_void;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) type ZeKernelHandle = *mut c_void;
+
 // ─── Level Zero result / type constants ──────────────────────────────────────
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -56,6 +62,15 @@ pub(crate) const ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC: u32 = 0x2;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES: u32 = 0x3;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const ZE_STRUCTURE_TYPE_MODULE_DESC: u32 = 0x18;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const ZE_STRUCTURE_TYPE_KERNEL_DESC: u32 = 0x1a;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const ZE_MODULE_FORMAT_IL_SPIRV: u32 = 0;
 
 // ─── Level Zero descriptor and property structs (Linux + Windows only) ───────
 
@@ -126,6 +141,35 @@ pub(crate) struct ZeDeviceProperties {
     _num_slices: u32,
     _timer_resolution_ns: u64,
     _uuid: [u8; 16],
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[repr(C)]
+pub(crate) struct ZeModuleDesc {
+    pub stype: u32,
+    pub p_next: *const c_void,
+    pub format: u32,
+    pub input_size: usize,
+    pub p_input_module: *const u8,
+    pub p_build_flags: *const u8,
+    pub p_constants: *const c_void,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[repr(C)]
+pub(crate) struct ZeKernelDesc {
+    pub stype: u32,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub p_kernel_name: *const u8,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[repr(C)]
+pub(crate) struct ZeGroupCount {
+    pub group_count_x: u32,
+    pub group_count_y: u32,
+    pub group_count_z: u32,
 }
 
 // ─── Level Zero function pointer types (Linux + Windows only) ────────────────
@@ -230,6 +274,50 @@ type ZeMemAllocHostFn = unsafe extern "C" fn(
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 type ZeMemFreeFn = unsafe extern "C" fn(context: ZeContextHandle, ptr: *mut c_void) -> u32;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type ZeModuleCreateFn = unsafe extern "C" fn(
+    context: ZeContextHandle,
+    device: ZeDeviceHandle,
+    desc: *const ZeModuleDesc,
+    module: *mut ZeModuleHandle,
+    build_log: *mut *mut c_void,
+) -> u32;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type ZeModuleDestroyFn = unsafe extern "C" fn(module: ZeModuleHandle) -> u32;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type ZeKernelCreateFn = unsafe extern "C" fn(
+    module: ZeModuleHandle,
+    desc: *const ZeKernelDesc,
+    kernel: *mut ZeKernelHandle,
+) -> u32;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type ZeKernelDestroyFn = unsafe extern "C" fn(kernel: ZeKernelHandle) -> u32;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type ZeKernelSetGroupSizeFn =
+    unsafe extern "C" fn(kernel: ZeKernelHandle, x: u32, y: u32, z: u32) -> u32;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type ZeKernelSetArgumentValueFn = unsafe extern "C" fn(
+    kernel: ZeKernelHandle,
+    arg_index: u32,
+    arg_size: usize,
+    p_arg_value: *const c_void,
+) -> u32;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type ZeCommandListAppendLaunchKernelFn = unsafe extern "C" fn(
+    list: ZeCommandListHandle,
+    kernel: ZeKernelHandle,
+    launch_func_args: *const ZeGroupCount,
+    signal_event: usize,
+    wait_count: u32,
+    wait_events: *const usize,
+) -> u32;
+
 // ─── L0Api — dynamically-loaded function table (Linux + Windows only) ─────────
 
 /// Holds the loaded `libze_loader` library and all extracted function pointers.
@@ -258,6 +346,13 @@ pub(crate) struct L0Api {
     pub ze_mem_alloc_device: ZeMemAllocDeviceFn,
     pub ze_mem_alloc_host: ZeMemAllocHostFn,
     pub ze_mem_free: ZeMemFreeFn,
+    pub ze_module_create: ZeModuleCreateFn,
+    pub ze_module_destroy: ZeModuleDestroyFn,
+    pub ze_kernel_create: ZeKernelCreateFn,
+    pub ze_kernel_destroy: ZeKernelDestroyFn,
+    pub ze_kernel_set_group_size: ZeKernelSetGroupSizeFn,
+    pub ze_kernel_set_argument_value: ZeKernelSetArgumentValueFn,
+    pub ze_command_list_append_launch_kernel: ZeCommandListAppendLaunchKernelFn,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -323,6 +418,17 @@ impl L0Api {
         let ze_mem_alloc_device = sym!(b"zeMemAllocDevice\0", ZeMemAllocDeviceFn);
         let ze_mem_alloc_host = sym!(b"zeMemAllocHost\0", ZeMemAllocHostFn);
         let ze_mem_free = sym!(b"zeMemFree\0", ZeMemFreeFn);
+        let ze_module_create = sym!(b"zeModuleCreate\0", ZeModuleCreateFn);
+        let ze_module_destroy = sym!(b"zeModuleDestroy\0", ZeModuleDestroyFn);
+        let ze_kernel_create = sym!(b"zeKernelCreate\0", ZeKernelCreateFn);
+        let ze_kernel_destroy = sym!(b"zeKernelDestroy\0", ZeKernelDestroyFn);
+        let ze_kernel_set_group_size = sym!(b"zeKernelSetGroupSize\0", ZeKernelSetGroupSizeFn);
+        let ze_kernel_set_argument_value =
+            sym!(b"zeKernelSetArgumentValue\0", ZeKernelSetArgumentValueFn);
+        let ze_command_list_append_launch_kernel = sym!(
+            b"zeCommandListAppendLaunchKernel\0",
+            ZeCommandListAppendLaunchKernelFn
+        );
 
         Ok(Self {
             _lib: lib,
@@ -344,6 +450,13 @@ impl L0Api {
             ze_mem_alloc_device,
             ze_mem_alloc_host,
             ze_mem_free,
+            ze_module_create,
+            ze_module_destroy,
+            ze_kernel_create,
+            ze_kernel_destroy,
+            ze_kernel_set_group_size,
+            ze_kernel_set_argument_value,
+            ze_command_list_append_launch_kernel,
         })
     }
 }

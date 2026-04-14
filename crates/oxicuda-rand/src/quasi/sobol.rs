@@ -254,12 +254,12 @@ fn generate_sobol_ptx(sm: SmVersion) -> Result<String, PtxGenError> {
 /// # use oxicuda_memory::DeviceBuffer;
 /// # use oxicuda_rand::quasi::SobolGenerator;
 /// # fn main() -> oxicuda_rand::RandResult<()> {
-/// # oxicuda_driver::init().unwrap();
-/// # let dev = Device::get(0).unwrap();
-/// # let ctx = Arc::new(Context::new(&dev).unwrap());
+/// # oxicuda_driver::init()?;
+/// # let dev = Device::get(0)?;
+/// # let ctx = Arc::new(Context::new(&dev)?);
 /// let mut sobol = SobolGenerator::new(3, &ctx)?;
 /// // Generate 1024 quasi-random points for dimension 0
-/// let mut output = DeviceBuffer::<f32>::alloc(1024).unwrap();
+/// let mut output = DeviceBuffer::<f32>::alloc(1024)?;
 /// sobol.generate(&mut output, 1024)?;
 /// # Ok(())
 /// # }

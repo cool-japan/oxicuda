@@ -145,7 +145,8 @@ impl DeviceScanTemplate {
         let identity = self.identity_str();
 
         let mut out = ptx_header(sm);
-        writeln!(out, ".shared .align {eb} .{ty} blk_scan_smem[{bs}];").unwrap();
+        writeln!(out, ".shared .align {eb} .{ty} blk_scan_smem[{bs}];")
+            .map_err(|e| e.to_string())?;
         writeln!(
             out,
             ".visible .entry {name}(\n    \
@@ -154,138 +155,150 @@ impl DeviceScanTemplate {
              .param .u64 param_input,\n    \
              .param .u64 param_n\n)"
         )
-        .unwrap();
-        writeln!(out, "{{").unwrap();
-        writeln!(out, "    .reg .{ty}   %val, %left;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "{{").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .{ty}   %val, %left;").map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    .reg .u32    %tid, %bid, %left_idx, %right_idx, %stride;"
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    .reg .u64    %n, %gid, %ptr_in, %ptr_out, %ptr_sums;"
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    .reg .u64    %elem_addr, %smem_base, %left_addr, %right_addr;"
         )
-        .unwrap();
-        writeln!(out, "    .reg .pred   %p;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .pred   %p;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    ld.param.u64 %ptr_out,  [param_output];").unwrap();
-        writeln!(out, "    ld.param.u64 %ptr_sums, [param_block_sums];").unwrap();
-        writeln!(out, "    ld.param.u64 %ptr_in,   [param_input];").unwrap();
-        writeln!(out, "    ld.param.u64 %n,         [param_n];").unwrap();
-        writeln!(out, "    mov.u32      %tid, %tid.x;").unwrap();
-        writeln!(out, "    mov.u32      %bid, %ctaid.x;").unwrap();
-        writeln!(out, "    mad.lo.u64   %gid, %bid, {bs}, %tid;").unwrap();
-        writeln!(out, "    mov.u64      %smem_base, blk_scan_smem;").unwrap();
+        writeln!(out, "    ld.param.u64 %ptr_out,  [param_output];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u64 %ptr_sums, [param_block_sums];")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u64 %ptr_in,   [param_input];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u64 %n,         [param_n];").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u32      %tid, %tid.x;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u32      %bid, %ctaid.x;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64   %gid, %bid, {bs}, %tid;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u64      %smem_base, blk_scan_smem;").map_err(|e| e.to_string())?;
 
         // Load input
-        writeln!(out, "    setp.ge.u64 %p, %gid, %n;").unwrap();
-        writeln!(out, "    mad.lo.u64  %elem_addr, %gid, {eb}, %ptr_in;").unwrap();
-        writeln!(out, "    @!%p ld.global.{ty} %val, [%elem_addr];").unwrap();
-        writeln!(out, "    @%p  mov.{ty} %val, {identity};").unwrap();
-        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %smem_base;").unwrap();
-        writeln!(out, "    st.shared.{ty} [%elem_addr], %val;").unwrap();
-        writeln!(out, "    bar.sync 0;").unwrap();
+        writeln!(out, "    setp.ge.u64 %p, %gid, %n;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %elem_addr, %gid, {eb}, %ptr_in;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    @!%p ld.global.{ty} %val, [%elem_addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p  mov.{ty} %val, {identity};").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %smem_base;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    st.shared.{ty} [%elem_addr], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
 
         // Up-sweep
         let mut stride = 1u32;
         while stride < bs {
-            writeln!(out, "    add.u32  %right_idx, %tid, 1;").unwrap();
+            writeln!(out, "    add.u32  %right_idx, %tid, 1;").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mul.lo.u32 %right_idx, %right_idx, {};",
                 2 * stride
             )
-            .unwrap();
-            writeln!(out, "    sub.u32  %right_idx, %right_idx, 1;").unwrap();
-            writeln!(out, "    sub.u32  %left_idx, %right_idx, {stride};").unwrap();
-            writeln!(out, "    setp.ge.u32 %p, %right_idx, {bs};").unwrap();
-            writeln!(out, "    @%p bra UP_{name}_{stride};").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    sub.u32  %right_idx, %right_idx, 1;").map_err(|e| e.to_string())?;
+            writeln!(out, "    sub.u32  %left_idx, %right_idx, {stride};")
+                .map_err(|e| e.to_string())?;
+            writeln!(out, "    setp.ge.u32 %p, %right_idx, {bs};").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%p bra UP_{name}_{stride};").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mad.lo.u64 %left_addr,  %left_idx,  {eb}, %smem_base;"
             )
-            .unwrap();
+            .map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mad.lo.u64 %right_addr, %right_idx, {eb}, %smem_base;"
             )
-            .unwrap();
-            writeln!(out, "    ld.shared.{ty} %left, [%left_addr];").unwrap();
-            writeln!(out, "    ld.shared.{ty} %val,  [%right_addr];").unwrap();
-            writeln!(out, "    {op} %val, %val, %left;").unwrap();
-            writeln!(out, "    st.shared.{ty} [%right_addr], %val;").unwrap();
-            writeln!(out, "UP_{name}_{stride}:").unwrap();
-            writeln!(out, "    bar.sync 0;").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    ld.shared.{ty} %left, [%left_addr];").map_err(|e| e.to_string())?;
+            writeln!(out, "    ld.shared.{ty} %val,  [%right_addr];").map_err(|e| e.to_string())?;
+            writeln!(out, "    {op} %val, %val, %left;").map_err(|e| e.to_string())?;
+            writeln!(out, "    st.shared.{ty} [%right_addr], %val;").map_err(|e| e.to_string())?;
+            writeln!(out, "UP_{name}_{stride}:").map_err(|e| e.to_string())?;
+            writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
             stride *= 2;
         }
 
         // Save block aggregate from smem[bs-1] before clearing
-        writeln!(out, "    setp.ne.u32 %p, %tid, 0;").unwrap();
-        writeln!(out, "    @%p bra SAVE_AGG_{name};").unwrap();
+        writeln!(out, "    setp.ne.u32 %p, %tid, 0;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p bra SAVE_AGG_{name};").map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    mad.lo.u64 %elem_addr, {}, {eb}, %smem_base;",
             bs - 1
         )
-        .unwrap();
-        writeln!(out, "    ld.shared.{ty} %val, [%elem_addr];").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.shared.{ty} %val, [%elem_addr];").map_err(|e| e.to_string())?;
         // Store aggregate at block_sums[bid]
-        writeln!(out, "    mad.lo.u64 %elem_addr, %bid, {eb}, %ptr_sums;").unwrap();
-        writeln!(out, "    st.global.{ty} [%elem_addr], %val;").unwrap();
-        writeln!(out, "SAVE_AGG_{name}:").unwrap();
+        writeln!(out, "    mad.lo.u64 %elem_addr, %bid, {eb}, %ptr_sums;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    st.global.{ty} [%elem_addr], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "SAVE_AGG_{name}:").map_err(|e| e.to_string())?;
 
         // Clear last element for exclusive scan
         if is_exclusive {
-            writeln!(out, "    setp.ne.u32 %p, %tid, 0;").unwrap();
-            writeln!(out, "    @%p bra CLEAR_LAST_{name};").unwrap();
+            writeln!(out, "    setp.ne.u32 %p, %tid, 0;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%p bra CLEAR_LAST_{name};").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mad.lo.u64 %elem_addr, {}, {eb}, %smem_base;",
                 bs - 1
             )
-            .unwrap();
-            writeln!(out, "    mov.{ty} %val, {identity};").unwrap();
-            writeln!(out, "    st.shared.{ty} [%elem_addr], %val;").unwrap();
-            writeln!(out, "CLEAR_LAST_{name}:").unwrap();
-            writeln!(out, "    bar.sync 0;").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    mov.{ty} %val, {identity};").map_err(|e| e.to_string())?;
+            writeln!(out, "    st.shared.{ty} [%elem_addr], %val;").map_err(|e| e.to_string())?;
+            writeln!(out, "CLEAR_LAST_{name}:").map_err(|e| e.to_string())?;
+            writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
 
             // Down-sweep
             stride = bs / 2;
             loop {
-                writeln!(out, "    add.u32  %right_idx, %tid, 1;").unwrap();
+                writeln!(out, "    add.u32  %right_idx, %tid, 1;").map_err(|e| e.to_string())?;
                 writeln!(
                     out,
                     "    mul.lo.u32 %right_idx, %right_idx, {};",
                     2 * stride
                 )
-                .unwrap();
-                writeln!(out, "    sub.u32  %right_idx, %right_idx, 1;").unwrap();
-                writeln!(out, "    sub.u32  %left_idx, %right_idx, {stride};").unwrap();
-                writeln!(out, "    setp.ge.u32 %p, %right_idx, {bs};").unwrap();
-                writeln!(out, "    @%p bra DN_{name}_{stride};").unwrap();
+                .map_err(|e| e.to_string())?;
+                writeln!(out, "    sub.u32  %right_idx, %right_idx, 1;")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "    sub.u32  %left_idx, %right_idx, {stride};")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "    setp.ge.u32 %p, %right_idx, {bs};")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "    @%p bra DN_{name}_{stride};").map_err(|e| e.to_string())?;
                 writeln!(
                     out,
                     "    mad.lo.u64 %left_addr,  %left_idx,  {eb}, %smem_base;"
                 )
-                .unwrap();
+                .map_err(|e| e.to_string())?;
                 writeln!(
                     out,
                     "    mad.lo.u64 %right_addr, %right_idx, {eb}, %smem_base;"
                 )
-                .unwrap();
-                writeln!(out, "    ld.shared.{ty} %left, [%left_addr];").unwrap();
-                writeln!(out, "    ld.shared.{ty} %val,  [%right_addr];").unwrap();
-                writeln!(out, "    st.shared.{ty} [%left_addr],  %val;").unwrap();
-                writeln!(out, "    {op} %val, %val, %left;").unwrap();
-                writeln!(out, "    st.shared.{ty} [%right_addr], %val;").unwrap();
-                writeln!(out, "DN_{name}_{stride}:").unwrap();
-                writeln!(out, "    bar.sync 0;").unwrap();
+                .map_err(|e| e.to_string())?;
+                writeln!(out, "    ld.shared.{ty} %left, [%left_addr];")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "    ld.shared.{ty} %val,  [%right_addr];")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "    st.shared.{ty} [%left_addr],  %val;")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "    {op} %val, %val, %left;").map_err(|e| e.to_string())?;
+                writeln!(out, "    st.shared.{ty} [%right_addr], %val;")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "DN_{name}_{stride}:").map_err(|e| e.to_string())?;
+                writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
                 if stride == 1 {
                     break;
                 }
@@ -294,13 +307,15 @@ impl DeviceScanTemplate {
         }
 
         // Write output
-        writeln!(out, "    setp.lt.u64 %p, %gid, %n;").unwrap();
-        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %smem_base;").unwrap();
-        writeln!(out, "    @%p ld.shared.{ty} %val, [%elem_addr];").unwrap();
-        writeln!(out, "    mad.lo.u64  %elem_addr, %gid, {eb}, %ptr_out;").unwrap();
-        writeln!(out, "    @%p st.global.{ty} [%elem_addr], %val;").unwrap();
-        writeln!(out, "    ret;").unwrap();
-        writeln!(out, "}}").unwrap();
+        writeln!(out, "    setp.lt.u64 %p, %gid, %n;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %smem_base;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p ld.shared.{ty} %val, [%elem_addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %elem_addr, %gid, {eb}, %ptr_out;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p st.global.{ty} [%elem_addr], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "    ret;").map_err(|e| e.to_string())?;
+        writeln!(out, "}}").map_err(|e| e.to_string())?;
 
         Ok(out)
     }
@@ -317,120 +332,127 @@ impl DeviceScanTemplate {
         let bs: u32 = 1024; // use max block size for aggregate scan (≤1024 blocks)
 
         let mut out = ptx_header(sm);
-        writeln!(out, ".shared .align {eb} .{ty} agg_smem[{bs}];").unwrap();
+        writeln!(out, ".shared .align {eb} .{ty} agg_smem[{bs}];").map_err(|e| e.to_string())?;
         writeln!(
             out,
             ".visible .entry {name}(\n    \
              .param .u64 param_block_sums,\n    \
              .param .u32 param_nblocks\n)"
         )
-        .unwrap();
-        writeln!(out, "{{").unwrap();
-        writeln!(out, "    .reg .{ty}   %val, %left;").unwrap();
-        writeln!(out, "    .reg .u32    %tid, %nb, %left_idx, %right_idx;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "{{").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .{ty}   %val, %left;").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .u32    %tid, %nb, %left_idx, %right_idx;")
+            .map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    .reg .u64    %ptr_sums, %elem_addr, %smem_base, %left_addr, %right_addr;"
         )
-        .unwrap();
-        writeln!(out, "    .reg .pred   %p;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .pred   %p;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    ld.param.u64 %ptr_sums, [param_block_sums];").unwrap();
-        writeln!(out, "    ld.param.u32 %nb,        [param_nblocks];").unwrap();
-        writeln!(out, "    mov.u32      %tid, %tid.x;").unwrap();
-        writeln!(out, "    mov.u64      %smem_base, agg_smem;").unwrap();
+        writeln!(out, "    ld.param.u64 %ptr_sums, [param_block_sums];")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u32 %nb,        [param_nblocks];")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u32      %tid, %tid.x;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u64      %smem_base, agg_smem;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    setp.ge.u32 %p, %tid, %nb;").unwrap();
-        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %ptr_sums;").unwrap();
-        writeln!(out, "    @!%p ld.global.{ty} %val, [%elem_addr];").unwrap();
-        writeln!(out, "    @%p  mov.{ty} %val, {identity};").unwrap();
-        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %smem_base;").unwrap();
-        writeln!(out, "    st.shared.{ty} [%elem_addr], %val;").unwrap();
-        writeln!(out, "    bar.sync 0;").unwrap();
+        writeln!(out, "    setp.ge.u32 %p, %tid, %nb;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %ptr_sums;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    @!%p ld.global.{ty} %val, [%elem_addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p  mov.{ty} %val, {identity};").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %smem_base;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    st.shared.{ty} [%elem_addr], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
 
         // Up-sweep on block_sums (variable length, up to bs)
         let mut stride = 1u32;
         while stride < bs {
-            writeln!(out, "    add.u32  %right_idx, %tid, 1;").unwrap();
+            writeln!(out, "    add.u32  %right_idx, %tid, 1;").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mul.lo.u32 %right_idx, %right_idx, {};",
                 2 * stride
             )
-            .unwrap();
-            writeln!(out, "    sub.u32  %right_idx, %right_idx, 1;").unwrap();
-            writeln!(out, "    sub.u32  %left_idx, %right_idx, {stride};").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    sub.u32  %right_idx, %right_idx, 1;").map_err(|e| e.to_string())?;
+            writeln!(out, "    sub.u32  %left_idx, %right_idx, {stride};")
+                .map_err(|e| e.to_string())?;
             // Guard: right_idx < nb AND right_idx < bs
-            writeln!(out, "    setp.ge.u32 %p, %right_idx, %nb;").unwrap();
-            writeln!(out, "    @%p bra AGG_UP_{name}_{stride};").unwrap();
-            writeln!(out, "    setp.ge.u32 %p, %right_idx, {bs};").unwrap();
-            writeln!(out, "    @%p bra AGG_UP_{name}_{stride};").unwrap();
+            writeln!(out, "    setp.ge.u32 %p, %right_idx, %nb;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%p bra AGG_UP_{name}_{stride};").map_err(|e| e.to_string())?;
+            writeln!(out, "    setp.ge.u32 %p, %right_idx, {bs};").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%p bra AGG_UP_{name}_{stride};").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mad.lo.u64 %left_addr,  %left_idx,  {eb}, %smem_base;"
             )
-            .unwrap();
+            .map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mad.lo.u64 %right_addr, %right_idx, {eb}, %smem_base;"
             )
-            .unwrap();
-            writeln!(out, "    ld.shared.{ty} %left, [%left_addr];").unwrap();
-            writeln!(out, "    ld.shared.{ty} %val,  [%right_addr];").unwrap();
-            writeln!(out, "    {op} %val, %val, %left;").unwrap();
-            writeln!(out, "    st.shared.{ty} [%right_addr], %val;").unwrap();
-            writeln!(out, "AGG_UP_{name}_{stride}:").unwrap();
-            writeln!(out, "    bar.sync 0;").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    ld.shared.{ty} %left, [%left_addr];").map_err(|e| e.to_string())?;
+            writeln!(out, "    ld.shared.{ty} %val,  [%right_addr];").map_err(|e| e.to_string())?;
+            writeln!(out, "    {op} %val, %val, %left;").map_err(|e| e.to_string())?;
+            writeln!(out, "    st.shared.{ty} [%right_addr], %val;").map_err(|e| e.to_string())?;
+            writeln!(out, "AGG_UP_{name}_{stride}:").map_err(|e| e.to_string())?;
+            writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
             stride *= 2;
         }
 
         // Clear last and down-sweep (exclusive)
-        writeln!(out, "    setp.ne.u32 %p, %tid, 0;").unwrap();
-        writeln!(out, "    @%p bra AGG_CLR_{name};").unwrap();
-        writeln!(out, "    sub.u32 %right_idx, %nb, 1;").unwrap();
+        writeln!(out, "    setp.ne.u32 %p, %tid, 0;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p bra AGG_CLR_{name};").map_err(|e| e.to_string())?;
+        writeln!(out, "    sub.u32 %right_idx, %nb, 1;").map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    mad.lo.u64 %elem_addr, %right_idx, {eb}, %smem_base;"
         )
-        .unwrap();
-        writeln!(out, "    mov.{ty} %val, {identity};").unwrap();
-        writeln!(out, "    st.shared.{ty} [%elem_addr], %val;").unwrap();
-        writeln!(out, "AGG_CLR_{name}:").unwrap();
-        writeln!(out, "    bar.sync 0;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.{ty} %val, {identity};").map_err(|e| e.to_string())?;
+        writeln!(out, "    st.shared.{ty} [%elem_addr], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "AGG_CLR_{name}:").map_err(|e| e.to_string())?;
+        writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
 
         // Simple down-sweep using nb/2 … 1
         let mut stride = bs / 2;
         loop {
-            writeln!(out, "    add.u32  %right_idx, %tid, 1;").unwrap();
+            writeln!(out, "    add.u32  %right_idx, %tid, 1;").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mul.lo.u32 %right_idx, %right_idx, {};",
                 2 * stride
             )
-            .unwrap();
-            writeln!(out, "    sub.u32  %right_idx, %right_idx, 1;").unwrap();
-            writeln!(out, "    sub.u32  %left_idx, %right_idx, {stride};").unwrap();
-            writeln!(out, "    setp.ge.u32 %p, %right_idx, %nb;").unwrap();
-            writeln!(out, "    @%p bra AGG_DN_{name}_{stride};").unwrap();
-            writeln!(out, "    setp.ge.u32 %p, %right_idx, {bs};").unwrap();
-            writeln!(out, "    @%p bra AGG_DN_{name}_{stride};").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    sub.u32  %right_idx, %right_idx, 1;").map_err(|e| e.to_string())?;
+            writeln!(out, "    sub.u32  %left_idx, %right_idx, {stride};")
+                .map_err(|e| e.to_string())?;
+            writeln!(out, "    setp.ge.u32 %p, %right_idx, %nb;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%p bra AGG_DN_{name}_{stride};").map_err(|e| e.to_string())?;
+            writeln!(out, "    setp.ge.u32 %p, %right_idx, {bs};").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%p bra AGG_DN_{name}_{stride};").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mad.lo.u64 %left_addr,  %left_idx,  {eb}, %smem_base;"
             )
-            .unwrap();
+            .map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mad.lo.u64 %right_addr, %right_idx, {eb}, %smem_base;"
             )
-            .unwrap();
-            writeln!(out, "    ld.shared.{ty} %left, [%left_addr];").unwrap();
-            writeln!(out, "    ld.shared.{ty} %val,  [%right_addr];").unwrap();
-            writeln!(out, "    st.shared.{ty} [%left_addr],  %val;").unwrap();
-            writeln!(out, "    {op} %val, %val, %left;").unwrap();
-            writeln!(out, "    st.shared.{ty} [%right_addr], %val;").unwrap();
-            writeln!(out, "AGG_DN_{name}_{stride}:").unwrap();
-            writeln!(out, "    bar.sync 0;").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    ld.shared.{ty} %left, [%left_addr];").map_err(|e| e.to_string())?;
+            writeln!(out, "    ld.shared.{ty} %val,  [%right_addr];").map_err(|e| e.to_string())?;
+            writeln!(out, "    st.shared.{ty} [%left_addr],  %val;").map_err(|e| e.to_string())?;
+            writeln!(out, "    {op} %val, %val, %left;").map_err(|e| e.to_string())?;
+            writeln!(out, "    st.shared.{ty} [%right_addr], %val;").map_err(|e| e.to_string())?;
+            writeln!(out, "AGG_DN_{name}_{stride}:").map_err(|e| e.to_string())?;
+            writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
             if stride == 1 {
                 break;
             }
@@ -438,13 +460,15 @@ impl DeviceScanTemplate {
         }
 
         // Write back scanned aggregates
-        writeln!(out, "    setp.lt.u32 %p, %tid, %nb;").unwrap();
-        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %smem_base;").unwrap();
-        writeln!(out, "    @%p ld.shared.{ty} %val, [%elem_addr];").unwrap();
-        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %ptr_sums;").unwrap();
-        writeln!(out, "    @%p st.global.{ty} [%elem_addr], %val;").unwrap();
-        writeln!(out, "    ret;").unwrap();
-        writeln!(out, "}}").unwrap();
+        writeln!(out, "    setp.lt.u32 %p, %tid, %nb;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %smem_base;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p ld.shared.{ty} %val, [%elem_addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %elem_addr, %tid, {eb}, %ptr_sums;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p st.global.{ty} [%elem_addr], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "    ret;").map_err(|e| e.to_string())?;
+        writeln!(out, "}}").map_err(|e| e.to_string())?;
 
         Ok(out)
     }
@@ -467,36 +491,37 @@ impl DeviceScanTemplate {
              .param .u64 param_block_sums,\n    \
              .param .u64 param_n\n)"
         )
-        .unwrap();
-        writeln!(out, "{{").unwrap();
-        writeln!(out, "    .reg .{ty}   %val, %agg;").unwrap();
-        writeln!(out, "    .reg .u32    %tid, %bid;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "{{").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .{ty}   %val, %agg;").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .u32    %tid, %bid;").map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    .reg .u64    %n, %gid, %ptr_out, %ptr_sums, %addr;"
         )
-        .unwrap();
-        writeln!(out, "    .reg .pred   %p;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .pred   %p;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    ld.param.u64 %ptr_out,  [param_output];").unwrap();
-        writeln!(out, "    ld.param.u64 %ptr_sums, [param_block_sums];").unwrap();
-        writeln!(out, "    ld.param.u64 %n,         [param_n];").unwrap();
-        writeln!(out, "    mov.u32      %tid, %tid.x;").unwrap();
-        writeln!(out, "    mov.u32      %bid, %ctaid.x;").unwrap();
-        writeln!(out, "    mad.lo.u64   %gid, %bid, {bs}, %tid;").unwrap();
+        writeln!(out, "    ld.param.u64 %ptr_out,  [param_output];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u64 %ptr_sums, [param_block_sums];")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u64 %n,         [param_n];").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u32      %tid, %tid.x;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u32      %bid, %ctaid.x;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64   %gid, %bid, {bs}, %tid;").map_err(|e| e.to_string())?;
 
         // Load block aggregate from block_sums[bid]
-        writeln!(out, "    mad.lo.u64 %addr, %bid, {eb}, %ptr_sums;").unwrap();
-        writeln!(out, "    ld.global.{ty} %agg, [%addr];").unwrap();
+        writeln!(out, "    mad.lo.u64 %addr, %bid, {eb}, %ptr_sums;").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.global.{ty} %agg, [%addr];").map_err(|e| e.to_string())?;
 
         // Add aggregate to element
-        writeln!(out, "    setp.lt.u64 %p, %gid, %n;").unwrap();
-        writeln!(out, "    mad.lo.u64  %addr, %gid, {eb}, %ptr_out;").unwrap();
-        writeln!(out, "    @%p ld.global.{ty} %val, [%addr];").unwrap();
-        writeln!(out, "    @%p {op} %val, %val, %agg;").unwrap();
-        writeln!(out, "    @%p st.global.{ty} [%addr], %val;").unwrap();
-        writeln!(out, "    ret;").unwrap();
-        writeln!(out, "}}").unwrap();
+        writeln!(out, "    setp.lt.u64 %p, %gid, %n;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %addr, %gid, {eb}, %ptr_out;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p ld.global.{ty} %val, [%addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p {op} %val, %val, %agg;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p st.global.{ty} [%addr], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "    ret;").map_err(|e| e.to_string())?;
+        writeln!(out, "}}").map_err(|e| e.to_string())?;
 
         Ok(out)
     }

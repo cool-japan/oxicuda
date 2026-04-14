@@ -105,11 +105,15 @@ pub fn capture(plan: &ExecutionPlan) -> GraphResult<Graph> {
 
     for (i, step) in plan.steps.iter().enumerate() {
         let sid = step.stream().0;
-        let my_node = step_to_node[i].unwrap();
+        let my_node = step_to_node[i].ok_or_else(|| {
+            crate::error::GraphError::Internal(format!("step {i} node not populated"))
+        })?;
 
         // Within-stream ordering: depend on the previous step on this stream.
         if let Some(&prev_step) = last_on_stream.get(&sid) {
-            let prev_node = step_to_node[prev_step].unwrap();
+            let prev_node = step_to_node[prev_step].ok_or_else(|| {
+                crate::error::GraphError::Internal(format!("step {prev_step} node not populated"))
+            })?;
             graph.add_dependency(prev_node, my_node).ok();
         }
         last_on_stream.insert(sid, i);
@@ -117,7 +121,11 @@ pub fn capture(plan: &ExecutionPlan) -> GraphResult<Graph> {
         // Cross-stream ordering: EventWait depends on the EventRecord.
         if let PlanStep::EventWait { event_id, .. } = step {
             if let Some(&record_step) = event_record_step.get(event_id) {
-                let record_node = step_to_node[record_step].unwrap();
+                let record_node = step_to_node[record_step].ok_or_else(|| {
+                    crate::error::GraphError::Internal(format!(
+                        "event record step {record_step} node not populated"
+                    ))
+                })?;
                 graph.add_dependency(record_node, my_node).ok();
             }
         }

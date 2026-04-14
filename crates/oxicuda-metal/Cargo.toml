@@ -18,6 +18,7 @@ metal.workspace = true
 oxicuda-backend.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+num-complex.workspace = true
 
 [lints]
 workspace = true

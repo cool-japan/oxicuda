@@ -140,7 +140,7 @@ impl BlockReduceTemplate {
             ".shared .align {elem_bytes} .{ty} smem_partial[{num_warps}];  \
              // one slot per warp"
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
 
         writeln!(
             out,
@@ -149,171 +149,184 @@ impl BlockReduceTemplate {
              .param .u64 param_input,\n    \
              .param .u32 param_n\n)"
         )
-        .unwrap();
-        writeln!(out, "{{").unwrap();
-        writeln!(out, "    .reg .{ty}   %val, %shfl;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "{{").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .{ty}   %val, %shfl;").map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    .reg .u32    %tid, %n, %warpid, %laneid, %mask, %offset;"
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    .reg .u64    %ptr_in, %ptr_out, %addr, %smem_addr;"
         )
-        .unwrap();
-        writeln!(out, "    .reg .pred   %p, %q;").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .pred   %p, %q;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    ld.param.u64 %ptr_out, [param_result];").unwrap();
-        writeln!(out, "    ld.param.u64 %ptr_in,  [param_input];").unwrap();
-        writeln!(out, "    ld.param.u32 %n,        [param_n];").unwrap();
+        writeln!(out, "    ld.param.u64 %ptr_out, [param_result];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u64 %ptr_in,  [param_input];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u32 %n,        [param_n];").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    mov.u32 %tid,    %tid.x;").unwrap();
-        writeln!(out, "    shr.u32 %warpid, %tid, 5;    // warpid = tid / 32").unwrap();
-        writeln!(out, "    and.b32 %laneid, %tid, 31;   // laneid = tid % 32").unwrap();
-        writeln!(out, "    mov.u32 %mask, 0xFFFFFFFF;").unwrap();
+        writeln!(out, "    mov.u32 %tid,    %tid.x;").map_err(|e| e.to_string())?;
+        writeln!(out, "    shr.u32 %warpid, %tid, 5;    // warpid = tid / 32")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    and.b32 %laneid, %tid, 31;   // laneid = tid % 32")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u32 %mask, 0xFFFFFFFF;").map_err(|e| e.to_string())?;
 
         // Load input element (identity if out of bounds)
         let identity = self.cfg.op.identity_literal::<f32>();
         let elem_bytes_usize = elem_bytes as usize;
-        writeln!(out, "    setp.ge.u32 %p, %tid, %n;").unwrap();
+        writeln!(out, "    setp.ge.u32 %p, %tid, %n;").map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    mad.lo.u64  %addr, %tid, {elem_bytes_usize}, %ptr_in;"
         )
-        .unwrap();
-        writeln!(out, "    @!%p ld.global.{ty} %val, [%addr];").unwrap();
-        writeln!(out, "    @%p  mov.{ty} %val, {identity};").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    @!%p ld.global.{ty} %val, [%addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p  mov.{ty} %val, {identity};").map_err(|e| e.to_string())?;
 
         // ── Stage 1: Intra-warp reduction via butterfly shuffle ──────────────
         for offset in [16u32, 8, 4, 2, 1] {
-            writeln!(out, "    mov.u32 %offset, {offset};").unwrap();
+            writeln!(out, "    mov.u32 %offset, {offset};").map_err(|e| e.to_string())?;
             if is_64bit {
-                writeln!(out, "    // 64-bit warp shuffle via lo/hi split").unwrap();
-                writeln!(out, "    {{").unwrap();
-                writeln!(out, "        .reg .u32 %lo64, %hi64, %sl, %sh;").unwrap();
-                writeln!(out, "        .reg .{ty} %shfl64;").unwrap();
-                writeln!(out, "        mov.b64 {{%lo64, %hi64}}, %val;").unwrap();
+                writeln!(out, "    // 64-bit warp shuffle via lo/hi split")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "    {{").map_err(|e| e.to_string())?;
+                writeln!(out, "        .reg .u32 %lo64, %hi64, %sl, %sh;")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "        .reg .{ty} %shfl64;").map_err(|e| e.to_string())?;
+                writeln!(out, "        mov.b64 {{%lo64, %hi64}}, %val;")
+                    .map_err(|e| e.to_string())?;
                 writeln!(
                     out,
                     "        shfl.sync.bfly.b32 %sl, %lo64, %offset, 31, %mask;"
                 )
-                .unwrap();
+                .map_err(|e| e.to_string())?;
                 writeln!(
                     out,
                     "        shfl.sync.bfly.b32 %sh, %hi64, %offset, 31, %mask;"
                 )
-                .unwrap();
-                writeln!(out, "        mov.b64 %shfl64, {{%sl, %sh}};").unwrap();
-                writeln!(out, "        {op} %val, %val, %shfl64;").unwrap();
-                writeln!(out, "    }}").unwrap();
+                .map_err(|e| e.to_string())?;
+                writeln!(out, "        mov.b64 %shfl64, {{%sl, %sh}};")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "        {op} %val, %val, %shfl64;").map_err(|e| e.to_string())?;
+                writeln!(out, "    }}").map_err(|e| e.to_string())?;
             } else {
                 writeln!(
                     out,
                     "    shfl.sync.bfly.b32 %shfl, %val, %offset, 31, %mask;"
                 )
-                .unwrap();
-                writeln!(out, "    {op} %val, %val, %shfl;").unwrap();
+                .map_err(|e| e.to_string())?;
+                writeln!(out, "    {op} %val, %val, %shfl;").map_err(|e| e.to_string())?;
             }
         }
 
         // ── Lane 0 of each warp writes its partial sum to shared memory ──────
-        writeln!(out, "    setp.ne.u32 %p, %laneid, 0;").unwrap();
-        writeln!(out, "    @%p bra AFTER_SMEM_WRITE_{name};").unwrap();
+        writeln!(out, "    setp.ne.u32 %p, %laneid, 0;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p bra AFTER_SMEM_WRITE_{name};").map_err(|e| e.to_string())?;
         // smem_partial[warpid] = val
-        writeln!(out, "    mul.lo.u32  %offset, %warpid, {elem_bytes};").unwrap();
+        writeln!(out, "    mul.lo.u32  %offset, %warpid, {elem_bytes};")
+            .map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    mov.u64     %smem_addr, smem_partial;  // base of shared array"
         )
-        .unwrap();
+        .map_err(|e| e.to_string())?;
         writeln!(
             out,
             "    cvt.u64.u32 %addr, %offset;  // zero-extend offset"
         )
-        .unwrap();
-        writeln!(out, "    add.u64     %smem_addr, %smem_addr, %addr;").unwrap();
-        writeln!(out, "    st.shared.{ty} [%smem_addr], %val;").unwrap();
-        writeln!(out, "AFTER_SMEM_WRITE_{name}:").unwrap();
-        writeln!(out, "    bar.sync 0;   // all warps done writing").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    add.u64     %smem_addr, %smem_addr, %addr;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    st.shared.{ty} [%smem_addr], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "AFTER_SMEM_WRITE_{name}:").map_err(|e| e.to_string())?;
+        writeln!(out, "    bar.sync 0;   // all warps done writing").map_err(|e| e.to_string())?;
 
         // ── Stage 2: Warp 0 reads all partial sums and reduces ───────────────
-        writeln!(out, "    setp.ne.u32 %p, %warpid, 0;").unwrap();
-        writeln!(out, "    @%p bra SKIP_WARP0_{name};").unwrap();
+        writeln!(out, "    setp.ne.u32 %p, %warpid, 0;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p bra SKIP_WARP0_{name};").map_err(|e| e.to_string())?;
 
         // lane `laneid` (0..num_warps-1) loads smem_partial[laneid]
         writeln!(
             out,
             "    setp.ge.u32 %p, %laneid, {num_warps};  // lanes >= num_warps get identity"
         )
-        .unwrap();
-        writeln!(out, "    mul.lo.u32  %offset, %laneid, {elem_bytes};").unwrap();
-        writeln!(out, "    mov.u64     %smem_addr, smem_partial;").unwrap();
-        writeln!(out, "    cvt.u64.u32 %addr, %offset;").unwrap();
-        writeln!(out, "    add.u64     %smem_addr, %smem_addr, %addr;").unwrap();
-        writeln!(out, "    @!%p ld.shared.{ty} %val, [%smem_addr];").unwrap();
-        writeln!(out, "    @%p  mov.{ty} %val, {identity};").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "    mul.lo.u32  %offset, %laneid, {elem_bytes};")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u64     %smem_addr, smem_partial;").map_err(|e| e.to_string())?;
+        writeln!(out, "    cvt.u64.u32 %addr, %offset;").map_err(|e| e.to_string())?;
+        writeln!(out, "    add.u64     %smem_addr, %smem_addr, %addr;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    @!%p ld.shared.{ty} %val, [%smem_addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p  mov.{ty} %val, {identity};").map_err(|e| e.to_string())?;
 
         // Final intra-warp reduction on the partial sums (≤32 warps)
         for offset in [16u32, 8, 4, 2, 1] {
-            writeln!(out, "    mov.u32 %offset, {offset};").unwrap();
+            writeln!(out, "    mov.u32 %offset, {offset};").map_err(|e| e.to_string())?;
             if is_64bit {
-                writeln!(out, "    {{").unwrap();
-                writeln!(out, "        .reg .u32 %lo64, %hi64, %sl, %sh;").unwrap();
-                writeln!(out, "        .reg .{ty} %shfl64;").unwrap();
-                writeln!(out, "        mov.b64 {{%lo64, %hi64}}, %val;").unwrap();
+                writeln!(out, "    {{").map_err(|e| e.to_string())?;
+                writeln!(out, "        .reg .u32 %lo64, %hi64, %sl, %sh;")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "        .reg .{ty} %shfl64;").map_err(|e| e.to_string())?;
+                writeln!(out, "        mov.b64 {{%lo64, %hi64}}, %val;")
+                    .map_err(|e| e.to_string())?;
                 writeln!(
                     out,
                     "        shfl.sync.bfly.b32 %sl, %lo64, %offset, 31, %mask;"
                 )
-                .unwrap();
+                .map_err(|e| e.to_string())?;
                 writeln!(
                     out,
                     "        shfl.sync.bfly.b32 %sh, %hi64, %offset, 31, %mask;"
                 )
-                .unwrap();
-                writeln!(out, "        mov.b64 %shfl64, {{%sl, %sh}};").unwrap();
-                writeln!(out, "        {op} %val, %val, %shfl64;").unwrap();
-                writeln!(out, "    }}").unwrap();
+                .map_err(|e| e.to_string())?;
+                writeln!(out, "        mov.b64 %shfl64, {{%sl, %sh}};")
+                    .map_err(|e| e.to_string())?;
+                writeln!(out, "        {op} %val, %val, %shfl64;").map_err(|e| e.to_string())?;
+                writeln!(out, "    }}").map_err(|e| e.to_string())?;
             } else {
                 writeln!(
                     out,
                     "    shfl.sync.bfly.b32 %shfl, %val, %offset, 31, %mask;"
                 )
-                .unwrap();
-                writeln!(out, "    {op} %val, %val, %shfl;").unwrap();
+                .map_err(|e| e.to_string())?;
+                writeln!(out, "    {op} %val, %val, %shfl;").map_err(|e| e.to_string())?;
             }
         }
 
         // Thread 0 writes result
-        writeln!(out, "    setp.ne.u32 %p, %laneid, 0;").unwrap();
-        writeln!(out, "    @%p bra SKIP_WARP0_{name};").unwrap();
-        writeln!(out, "    st.global.{ty} [%ptr_out], %val;").unwrap();
-        writeln!(out, "SKIP_WARP0_{name}:").unwrap();
+        writeln!(out, "    setp.ne.u32 %p, %laneid, 0;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p bra SKIP_WARP0_{name};").map_err(|e| e.to_string())?;
+        writeln!(out, "    st.global.{ty} [%ptr_out], %val;").map_err(|e| e.to_string())?;
+        writeln!(out, "SKIP_WARP0_{name}:").map_err(|e| e.to_string())?;
 
         // Optional broadcast: write result to smem and let all threads read it
         if self.cfg.broadcast {
-            writeln!(out, "    bar.sync 0;").unwrap();
-            writeln!(out, "    mov.u64 %smem_addr, smem_partial;").unwrap();
+            writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
+            writeln!(out, "    mov.u64 %smem_addr, smem_partial;").map_err(|e| e.to_string())?;
             // Warp 0, lane 0 already wrote result to smem_partial[0]
             // (we need to store it there explicitly)
             // Re-store: lane 0 of warp 0 stores val at smem_partial[0]
-            writeln!(out, "    setp.ne.u32 %p, %tid, 0;").unwrap();
-            writeln!(out, "    @%p bra BCAST_READ_{name};").unwrap();
-            writeln!(out, "    st.shared.{ty} [%smem_addr], %val;").unwrap();
-            writeln!(out, "BCAST_READ_{name}:").unwrap();
-            writeln!(out, "    bar.sync 0;").unwrap();
-            writeln!(out, "    ld.shared.{ty} %val, [%smem_addr];").unwrap();
+            writeln!(out, "    setp.ne.u32 %p, %tid, 0;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%p bra BCAST_READ_{name};").map_err(|e| e.to_string())?;
+            writeln!(out, "    st.shared.{ty} [%smem_addr], %val;").map_err(|e| e.to_string())?;
+            writeln!(out, "BCAST_READ_{name}:").map_err(|e| e.to_string())?;
+            writeln!(out, "    bar.sync 0;").map_err(|e| e.to_string())?;
+            writeln!(out, "    ld.shared.{ty} %val, [%smem_addr];").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    mad.lo.u64  %addr, %tid, {elem_bytes_usize}, %ptr_out;"
             )
-            .unwrap();
-            writeln!(out, "    st.global.{ty} [%addr], %val;").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    st.global.{ty} [%addr], %val;").map_err(|e| e.to_string())?;
         }
 
-        writeln!(out, "    ret;").unwrap();
-        writeln!(out, "}}").unwrap();
+        writeln!(out, "    ret;").map_err(|e| e.to_string())?;
+        writeln!(out, "}}").map_err(|e| e.to_string())?;
         let _ = smem_bytes;
 
         Ok(out)

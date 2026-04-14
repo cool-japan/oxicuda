@@ -99,6 +99,18 @@ impl WebGpuMemoryManager {
         Ok(())
     }
 
+    /// Lock the internal buffer map and return a guard for direct access.
+    ///
+    /// Used by the backend to look up multiple buffers within a single lock scope
+    /// (e.g. when building wgpu bind groups for compute passes).
+    pub(crate) fn lock_buffers(
+        &self,
+    ) -> WebGpuResult<std::sync::MutexGuard<'_, HashMap<u64, WebGpuBufferInfo>>> {
+        self.buffers
+            .lock()
+            .map_err(|_| WebGpuError::BufferMapping("mutex poisoned".into()))
+    }
+
     /// Download the device buffer identified by `handle` into `dst` (host bytes).
     ///
     /// Uses a temporary `MAP_READ` staging buffer and blocks until the GPU

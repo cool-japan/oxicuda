@@ -25,10 +25,13 @@
 //! ```rust
 //! use oxicuda_driver::debug::*;
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = KernelDebugConfig::default();
 //! let mut debugger = KernelDebugger::new(config);
-//! let session = debugger.attach("my_kernel").unwrap();
+//! let session = debugger.attach("my_kernel")?;
 //! assert_eq!(session.kernel_name(), "my_kernel");
+//! # Ok(())
+//! # }
 //! ```
 
 use std::fmt;

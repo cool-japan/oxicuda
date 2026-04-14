@@ -8,6 +8,8 @@ license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
 readme                 = "README.md"
+keywords = ["gpu", "inference", "neural-network", "cuda", "deep-learning"]
+categories = ["science", "algorithms"]
 
 [lints]
 workspace = true

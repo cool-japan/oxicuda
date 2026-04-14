@@ -28,7 +28,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-vulkan = "0.1.0"
+oxicuda-vulkan = "0.1.1"
 ```
 
 ```rust

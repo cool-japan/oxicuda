@@ -248,7 +248,7 @@ pub fn universal_threshold(finest_detail: &[f64]) -> f64 {
     }
     // MAD estimator: σ ≈ median(|d|) / 0.6745
     let mut abs_vals: Vec<f64> = finest_detail.iter().map(|v| v.abs()).collect();
-    abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = abs_vals[abs_vals.len() / 2];
     let sigma = median / 0.674_5;
     let n = finest_detail.len() as f64;

@@ -263,6 +263,18 @@ impl VulkanMemoryManager {
             .ok_or_else(|| VulkanError::InvalidArgument(format!("unknown handle {handle}")))
     }
 
+    /// Returns the raw `vk::Buffer` handle for a given allocation handle.
+    pub fn vk_buffer(&self, handle: u64) -> VulkanResult<vk::Buffer> {
+        let guard = self
+            .buffers
+            .lock()
+            .map_err(|_| VulkanError::InvalidArgument("memory manager lock poisoned".into()))?;
+        guard
+            .get(&handle)
+            .map(|r| r.buffer)
+            .ok_or_else(|| VulkanError::InvalidArgument(format!("unknown handle {handle}")))
+    }
+
     /// Return the number of live allocations (useful for leak detection in tests).
     pub fn live_count(&self) -> usize {
         self.buffers.lock().map(|g| g.len()).unwrap_or(0)

@@ -14,6 +14,7 @@ Vol.1 Foundation covers driver + memory + launch. The driver crate is the lowest
 
 - [x] `loader.rs` -- Runtime dynamic loading of libcuda.so/nvcuda.dll via libloading
 - [x] `ffi.rs` -- CUDA Driver API function pointer table (cuInit, cuCtx*, cuStream*, cuModule*, cuMem*, cuEvent*, cuOccupancy*, cuLaunchKernel)
+  - Refactored: split from 2076-line monolith into 4 files: `ffi.rs` (1158), `ffi_constants.rs` (326), `ffi_launch.rs` (179), `ffi_descriptors.rs` (525)
 - [x] `error.rs` -- CudaError enum with all CUDA error codes, DriverLoadError, CudaResult type alias
 - [x] `context.rs` -- Context RAII wrapper (create, push/pop, destroy, synchronize)
 - [x] `device.rs` -- Device enumeration, attribute queries, best_device selection, list_devices

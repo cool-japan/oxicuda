@@ -54,9 +54,12 @@ pub fn profiler_stop() -> CudaRtResult<()> {
 ///
 /// ```rust,no_run
 /// # use oxicuda_runtime::profiler::ProfilerGuard;
-/// let _guard = ProfilerGuard::new().unwrap();
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let _guard = ProfilerGuard::new()?;
 /// // profiling active here …
 /// // dropped → profiler_stop called automatically
+/// # Ok(())
+/// # }
 /// ```
 pub struct ProfilerGuard {
     active: bool,

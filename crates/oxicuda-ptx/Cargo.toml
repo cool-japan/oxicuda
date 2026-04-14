@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 readme = "README.md"
 keywords = ["cuda", "ptx", "codegen", "gpu", "kernel"]
-categories = ["compilers", "hardware-support"]
+categories = ["development-tools", "hardware-support"]
 
 [dependencies]
 oxicuda-driver.workspace = true

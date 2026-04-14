@@ -95,7 +95,11 @@ pub fn nms_greedy(boxes: &[BBox], scores: &[f32], iou_thresh: f32) -> SignalResu
     }
     // Sort indices by score descending.
     let mut indices: Vec<usize> = (0..boxes.len()).collect();
-    indices.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+    indices.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut keep = Vec::new();
     let mut suppressed = vec![false; boxes.len()];
@@ -157,7 +161,11 @@ pub fn nms_soft(
     let mut soft_scores = scores.to_vec();
     // Sort by score descending initially.
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| soft_scores[b].partial_cmp(&soft_scores[a]).unwrap());
+    order.sort_by(|&a, &b| {
+        soft_scores[b]
+            .partial_cmp(&soft_scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut results = Vec::new();
     let mut remaining: Vec<usize> = order.clone();
@@ -167,8 +175,16 @@ pub fn nms_soft(
         let best_idx = remaining
             .iter()
             .cloned()
-            .max_by(|&a, &b| soft_scores[a].partial_cmp(&soft_scores[b]).unwrap())
-            .unwrap();
+            .max_by(|&a, &b| {
+                soft_scores[a]
+                    .partial_cmp(&soft_scores[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .ok_or_else(|| {
+                SignalError::InvalidParameter(
+                    "remaining boxes is empty during soft-NMS iteration".to_owned(),
+                )
+            })?;
         if soft_scores[best_idx] < score_thresh {
             break;
         }
@@ -186,7 +202,11 @@ pub fn nms_soft(
             }
         }
         // Re-sort remaining by updated scores.
-        remaining.sort_by(|&a, &b| soft_scores[b].partial_cmp(&soft_scores[a]).unwrap());
+        remaining.sort_by(|&a, &b| {
+            soft_scores[b]
+                .partial_cmp(&soft_scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
     Ok(results)
 }

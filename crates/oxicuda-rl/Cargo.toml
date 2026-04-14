@@ -8,6 +8,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["gpu", "reinforcement", "cuda", "deep-learning", "rl"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 oxicuda-driver = { workspace = true }

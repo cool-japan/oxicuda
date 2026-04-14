@@ -20,10 +20,13 @@
 //! ```rust
 //! use oxicuda_rand::host_api::{CurandGenerator, CurandRngType};
 //!
-//! let mut rng = CurandGenerator::new(CurandRngType::PseudoDefault).unwrap();
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut rng = CurandGenerator::new(CurandRngType::PseudoDefault)?;
 //! rng.set_seed(42);
-//! let values = rng.generate_uniform_f32(1000).unwrap();
+//! let values = rng.generate_uniform_f32(1000)?;
 //! assert_eq!(values.len(), 1000);
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::error::{RandError, RandResult};
@@ -410,12 +413,15 @@ fn sobol_generate(n: usize, offset: u64) -> Vec<f32> {
 /// ```rust
 /// use oxicuda_rand::host_api::{CurandGenerator, CurandRngType, CurandOrdering};
 ///
-/// let mut rng = CurandGenerator::new(CurandRngType::PseudoPhilox4_32_10).unwrap();
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut rng = CurandGenerator::new(CurandRngType::PseudoPhilox4_32_10)?;
 /// rng.set_seed(12345);
 /// rng.set_ordering(CurandOrdering::Seeded);
 ///
-/// let uniform = rng.generate_uniform_f32(100).unwrap();
-/// let normal = rng.generate_normal_f32(100, 0.0, 1.0).unwrap();
+/// let uniform = rng.generate_uniform_f32(100)?;
+/// let normal = rng.generate_normal_f32(100, 0.0, 1.0)?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct CurandGenerator {
     rng_type: CurandRngType,

@@ -160,26 +160,27 @@ impl WarpScanTemplate {
              .param .u64 param_input,\n    \
              .param .u32 param_n\n)"
         )
-        .unwrap();
-        writeln!(out, "{{").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "{{").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    .reg .{ty}   %val, %shfl;").unwrap();
-        writeln!(out, "    .reg .u32    %tid, %n, %mask, %laneid, %offset;").unwrap();
-        writeln!(out, "    .reg .u64    %ptr_in, %ptr_out, %addr;").unwrap();
-        writeln!(out, "    .reg .pred   %p, %q;").unwrap();
+        writeln!(out, "    .reg .{ty}   %val, %shfl;").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .u32    %tid, %n, %mask, %laneid, %offset;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .u64    %ptr_in, %ptr_out, %addr;").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .pred   %p, %q;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    ld.param.u64 %ptr_out, [param_output];").unwrap();
-        writeln!(out, "    ld.param.u64 %ptr_in,  [param_input];").unwrap();
-        writeln!(out, "    ld.param.u32 %n,        [param_n];").unwrap();
+        writeln!(out, "    ld.param.u64 %ptr_out, [param_output];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u64 %ptr_in,  [param_input];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u32 %n,        [param_n];").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    mov.u32 %tid, %tid.x;").unwrap();
-        writeln!(out, "    and.b32 %laneid, %tid, 31;").unwrap();
-        writeln!(out, "    mov.u32 %mask, 0xFFFFFFFF;").unwrap();
+        writeln!(out, "    mov.u32 %tid, %tid.x;").map_err(|e| e.to_string())?;
+        writeln!(out, "    and.b32 %laneid, %tid, 31;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u32 %mask, 0xFFFFFFFF;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    setp.ge.u32 %p, %tid, %n;").unwrap();
-        writeln!(out, "    mad.lo.u64  %addr, %tid, 4, %ptr_in;").unwrap();
-        writeln!(out, "    @!%p ld.global.{ty} %val, [%addr];").unwrap();
-        writeln!(out, "    @%p  mov.{ty} %val, {identity};").unwrap();
+        writeln!(out, "    setp.ge.u32 %p, %tid, %n;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %addr, %tid, 4, %ptr_in;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @!%p ld.global.{ty} %val, [%addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p  mov.{ty} %val, {identity};").map_err(|e| e.to_string())?;
 
         // For exclusive scan: save original value, shift down by one lane
         if is_exclusive {
@@ -187,34 +188,35 @@ impl WarpScanTemplate {
                 out,
                 "    // Exclusive: shift val right by 1 lane (insert identity at lane 0)"
             )
-            .unwrap();
+            .map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    shfl.sync.up.b32 %shfl, %val, 1, 0, %mask;  // src from lane i-1"
             )
-            .unwrap();
-            writeln!(out, "    setp.ne.u32 %q, %laneid, 0;").unwrap();
-            writeln!(out, "    @%q  mov.{ty} %val, %shfl;").unwrap();
-            writeln!(out, "    @!%q mov.{ty} %val, {identity};").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    setp.ne.u32 %q, %laneid, 0;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%q  mov.{ty} %val, %shfl;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @!%q mov.{ty} %val, {identity};").map_err(|e| e.to_string())?;
         }
 
         // Hillis-Steele rounds with shfl.sync.up
         for offset in [1u32, 2, 4, 8, 16] {
-            writeln!(out, "    mov.u32 %offset, {offset};").unwrap();
+            writeln!(out, "    mov.u32 %offset, {offset};").map_err(|e| e.to_string())?;
             // shfl.sync.up: dst ← src from lane (laneid - offset) if laneid >= offset, else src unchanged
-            writeln!(out, "    shfl.sync.up.b32 %shfl, %val, %offset, 0, %mask;").unwrap();
+            writeln!(out, "    shfl.sync.up.b32 %shfl, %val, %offset, 0, %mask;")
+                .map_err(|e| e.to_string())?;
             // Only apply op if this lane received a valid predecessor (laneid >= offset)
-            writeln!(out, "    setp.ge.u32 %q, %laneid, %offset;").unwrap();
-            writeln!(out, "    @%q {op} %val, %val, %shfl;").unwrap();
+            writeln!(out, "    setp.ge.u32 %q, %laneid, %offset;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%q {op} %val, %val, %shfl;").map_err(|e| e.to_string())?;
         }
 
         // Write output
-        writeln!(out, "    setp.lt.u32 %p, %tid, %n;").unwrap();
-        writeln!(out, "    mad.lo.u64  %addr, %tid, 4, %ptr_out;").unwrap();
-        writeln!(out, "    @%p st.global.{ty} [%addr], %val;").unwrap();
+        writeln!(out, "    setp.lt.u32 %p, %tid, %n;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %addr, %tid, 4, %ptr_out;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p st.global.{ty} [%addr], %val;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    ret;").unwrap();
-        writeln!(out, "}}").unwrap();
+        writeln!(out, "    ret;").map_err(|e| e.to_string())?;
+        writeln!(out, "}}").map_err(|e| e.to_string())?;
 
         Ok(out)
     }
@@ -236,62 +238,68 @@ impl WarpScanTemplate {
              .param .u64 param_input,\n    \
              .param .u32 param_n\n)"
         )
-        .unwrap();
-        writeln!(out, "{{").unwrap();
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "{{").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    .reg .{ty}   %val, %shfl64;").unwrap();
-        writeln!(out, "    .reg .u32    %lo, %hi, %shfl_lo, %shfl_hi;").unwrap();
-        writeln!(out, "    .reg .u32    %tid, %n, %mask, %laneid, %offset;").unwrap();
-        writeln!(out, "    .reg .u64    %ptr_in, %ptr_out, %addr;").unwrap();
-        writeln!(out, "    .reg .pred   %p, %q;").unwrap();
+        writeln!(out, "    .reg .{ty}   %val, %shfl64;").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .u32    %lo, %hi, %shfl_lo, %shfl_hi;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .u32    %tid, %n, %mask, %laneid, %offset;")
+            .map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .u64    %ptr_in, %ptr_out, %addr;").map_err(|e| e.to_string())?;
+        writeln!(out, "    .reg .pred   %p, %q;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    ld.param.u64 %ptr_out, [param_output];").unwrap();
-        writeln!(out, "    ld.param.u64 %ptr_in,  [param_input];").unwrap();
-        writeln!(out, "    ld.param.u32 %n,        [param_n];").unwrap();
+        writeln!(out, "    ld.param.u64 %ptr_out, [param_output];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u64 %ptr_in,  [param_input];").map_err(|e| e.to_string())?;
+        writeln!(out, "    ld.param.u32 %n,        [param_n];").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    mov.u32 %tid, %tid.x;").unwrap();
-        writeln!(out, "    and.b32 %laneid, %tid, 31;").unwrap();
-        writeln!(out, "    mov.u32 %mask, 0xFFFFFFFF;").unwrap();
+        writeln!(out, "    mov.u32 %tid, %tid.x;").map_err(|e| e.to_string())?;
+        writeln!(out, "    and.b32 %laneid, %tid, 31;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.u32 %mask, 0xFFFFFFFF;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    setp.ge.u32 %p, %tid, %n;").unwrap();
-        writeln!(out, "    mad.lo.u64  %addr, %tid, 8, %ptr_in;").unwrap();
-        writeln!(out, "    @!%p ld.global.{ty} %val, [%addr];").unwrap();
-        writeln!(out, "    @%p  mov.{ty} %val, 0;").unwrap();
-        writeln!(out, "    mov.b64 {{%lo, %hi}}, %val;").unwrap();
+        writeln!(out, "    setp.ge.u32 %p, %tid, %n;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %addr, %tid, 8, %ptr_in;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @!%p ld.global.{ty} %val, [%addr];").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p  mov.{ty} %val, 0;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mov.b64 {{%lo, %hi}}, %val;").map_err(|e| e.to_string())?;
 
         if is_exclusive {
-            writeln!(out, "    shfl.sync.up.b32 %shfl_lo, %lo, 1, 0, %mask;").unwrap();
-            writeln!(out, "    shfl.sync.up.b32 %shfl_hi, %hi, 1, 0, %mask;").unwrap();
-            writeln!(out, "    setp.ne.u32 %q, %laneid, 0;").unwrap();
-            writeln!(out, "    @%q  mov.b64 %val, {{%shfl_lo, %shfl_hi}};").unwrap();
-            writeln!(out, "    @!%q mov.{ty} %val, 0;").unwrap();
-            writeln!(out, "    mov.b64 {{%lo, %hi}}, %val;").unwrap();
+            writeln!(out, "    shfl.sync.up.b32 %shfl_lo, %lo, 1, 0, %mask;")
+                .map_err(|e| e.to_string())?;
+            writeln!(out, "    shfl.sync.up.b32 %shfl_hi, %hi, 1, 0, %mask;")
+                .map_err(|e| e.to_string())?;
+            writeln!(out, "    setp.ne.u32 %q, %laneid, 0;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%q  mov.b64 %val, {{%shfl_lo, %shfl_hi}};")
+                .map_err(|e| e.to_string())?;
+            writeln!(out, "    @!%q mov.{ty} %val, 0;").map_err(|e| e.to_string())?;
+            writeln!(out, "    mov.b64 {{%lo, %hi}}, %val;").map_err(|e| e.to_string())?;
         }
 
         for offset in [1u32, 2, 4, 8, 16] {
-            writeln!(out, "    mov.u32 %offset, {offset};").unwrap();
+            writeln!(out, "    mov.u32 %offset, {offset};").map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    shfl.sync.up.b32 %shfl_lo, %lo, %offset, 0, %mask;"
             )
-            .unwrap();
+            .map_err(|e| e.to_string())?;
             writeln!(
                 out,
                 "    shfl.sync.up.b32 %shfl_hi, %hi, %offset, 0, %mask;"
             )
-            .unwrap();
-            writeln!(out, "    mov.b64 %shfl64, {{%shfl_lo, %shfl_hi}};").unwrap();
-            writeln!(out, "    setp.ge.u32 %q, %laneid, %offset;").unwrap();
-            writeln!(out, "    @%q {op} %val, %val, %shfl64;").unwrap();
-            writeln!(out, "    mov.b64 {{%lo, %hi}}, %val;").unwrap();
+            .map_err(|e| e.to_string())?;
+            writeln!(out, "    mov.b64 %shfl64, {{%shfl_lo, %shfl_hi}};")
+                .map_err(|e| e.to_string())?;
+            writeln!(out, "    setp.ge.u32 %q, %laneid, %offset;").map_err(|e| e.to_string())?;
+            writeln!(out, "    @%q {op} %val, %val, %shfl64;").map_err(|e| e.to_string())?;
+            writeln!(out, "    mov.b64 {{%lo, %hi}}, %val;").map_err(|e| e.to_string())?;
         }
 
-        writeln!(out, "    setp.lt.u32 %p, %tid, %n;").unwrap();
-        writeln!(out, "    mad.lo.u64  %addr, %tid, 8, %ptr_out;").unwrap();
-        writeln!(out, "    @%p st.global.{ty} [%addr], %val;").unwrap();
+        writeln!(out, "    setp.lt.u32 %p, %tid, %n;").map_err(|e| e.to_string())?;
+        writeln!(out, "    mad.lo.u64  %addr, %tid, 8, %ptr_out;").map_err(|e| e.to_string())?;
+        writeln!(out, "    @%p st.global.{ty} [%addr], %val;").map_err(|e| e.to_string())?;
 
-        writeln!(out, "    ret;").unwrap();
-        writeln!(out, "}}").unwrap();
+        writeln!(out, "    ret;").map_err(|e| e.to_string())?;
+        writeln!(out, "}}").map_err(|e| e.to_string())?;
 
         Ok(out)
     }

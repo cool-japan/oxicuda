@@ -29,7 +29,7 @@ WebGpuBackend  (implements ComputeBackend)
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-webgpu = "0.1.0"
+oxicuda-webgpu = "0.1.1"
 ```
 
 ```rust

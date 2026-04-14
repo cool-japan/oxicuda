@@ -11,6 +11,7 @@
 pub mod backend;
 pub mod device;
 pub mod error;
+pub mod hip_kernels;
 pub mod memory;
 
 pub use backend::RocmBackend;

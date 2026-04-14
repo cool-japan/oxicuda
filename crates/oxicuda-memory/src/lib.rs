@@ -16,7 +16,7 @@
 //! | [`PinnedBuffer<T>`]                   | Host (pinned)  | Page-locked host memory for fast DMA     |
 //! | [`UnifiedBuffer<T>`]                  | Unified/managed| Accessible from both host and device     |
 //! | [`MappedBuffer<T>`] *(stub)*          | Host-mapped    | Zero-copy host memory (future)           |
-//! | [`MemoryPool`] *(stub, `pool` feat)*  | Device pool    | Stream-ordered allocation (CUDA 11.2+)   |
+//! | `MemoryPool` *(stub, `pool` feat)*    | Device pool    | Stream-ordered allocation (CUDA 11.2+)   |
 //!
 //! ## Freestanding copy helpers
 //!

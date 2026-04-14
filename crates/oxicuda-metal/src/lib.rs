@@ -50,9 +50,11 @@
 pub mod backend;
 pub mod device;
 pub mod error;
+pub mod fft;
 pub mod memory;
 pub mod msl;
 pub mod pipeline;
 
 pub use backend::MetalBackend;
 pub use error::{MetalError, MetalResult};
+pub use fft::{MetalFftBuffer, MetalFftDirection, MetalFftPlan};

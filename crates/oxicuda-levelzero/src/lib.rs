@@ -13,6 +13,7 @@ pub mod device;
 pub mod error;
 pub mod memory;
 pub mod spirv;
+pub mod spirv_nn;
 
 pub use backend::LevelZeroBackend;
 pub use error::{LevelZeroError, LevelZeroResult};

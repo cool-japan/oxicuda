@@ -8,6 +8,8 @@ repository.workspace = true
 authors.workspace = true
 description = "GPU-accelerated training engine: fused optimizer update kernels, gradient checkpointing, LR schedulers, and ZeRO optimizer state sharding"
 readme = "README.md"
+keywords = ["gpu", "training", "neural-network", "cuda", "deep-learning"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 oxicuda-driver  = { workspace = true }

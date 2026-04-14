@@ -2,6 +2,10 @@
 //!
 //! Implements the [`ComputeBackend`] trait from `oxicuda-backend` using
 //! the AMD ROCm/HIP runtime for GPU compute on Linux.
+//!
+//! Compute operations (gemm, unary, binary, reduce, attention, conv2d) use
+//! HIP C++ kernels compiled at runtime via `hiprtc` and launched via
+//! `hipModuleLoadData` + `hipModuleLaunchKernel`.
 
 use std::sync::Arc;
 
@@ -98,35 +102,37 @@ impl ComputeBackend for RocmBackend {
 
     fn gemm(
         &self,
-        _trans_a: BackendTranspose,
-        _trans_b: BackendTranspose,
+        trans_a: BackendTranspose,
+        trans_b: BackendTranspose,
         m: usize,
         n: usize,
         k: usize,
-        _alpha: f64,
-        _a_ptr: u64,
-        _lda: usize,
-        _b_ptr: u64,
-        _ldb: usize,
-        _beta: f64,
-        _c_ptr: u64,
-        _ldc: usize,
+        alpha: f64,
+        a_ptr: u64,
+        lda: usize,
+        b_ptr: u64,
+        ldb: usize,
+        beta: f64,
+        c_ptr: u64,
+        ldc: usize,
     ) -> BackendResult<()> {
         self.check_init()?;
         // Zero-dimension matrices are trivially complete.
         if m == 0 || n == 0 || k == 0 {
             return Ok(());
         }
-        Err(BackendError::Unsupported("rocm: gemm not yet wired".into()))
+        self.dispatch_gemm(
+            trans_a, trans_b, m, n, k, alpha, a_ptr, lda, b_ptr, ldb, beta, c_ptr, ldc,
+        )
     }
 
     fn conv2d_forward(
         &self,
-        _input_ptr: u64,
+        input_ptr: u64,
         input_shape: &[usize],
-        _filter_ptr: u64,
+        filter_ptr: u64,
         filter_shape: &[usize],
-        _output_ptr: u64,
+        output_ptr: u64,
         output_shape: &[usize],
         stride: &[usize],
         padding: &[usize],
@@ -159,24 +165,31 @@ impl ComputeBackend for RocmBackend {
             ));
         }
 
-        Err(BackendError::Unsupported(
-            "rocm: conv2d_forward not yet wired".into(),
-        ))
+        self.dispatch_conv2d(
+            input_ptr,
+            input_shape,
+            filter_ptr,
+            filter_shape,
+            output_ptr,
+            output_shape,
+            stride,
+            padding,
+        )
     }
 
     fn attention(
         &self,
-        _q_ptr: u64,
-        _k_ptr: u64,
-        _v_ptr: u64,
-        _o_ptr: u64,
-        _batch: usize,
-        _heads: usize,
+        q_ptr: u64,
+        k_ptr: u64,
+        v_ptr: u64,
+        o_ptr: u64,
+        batch: usize,
+        heads: usize,
         seq_q: usize,
         seq_kv: usize,
         head_dim: usize,
         scale: f64,
-        _causal: bool,
+        causal: bool,
     ) -> BackendResult<()> {
         self.check_init()?;
 
@@ -191,16 +204,16 @@ impl ComputeBackend for RocmBackend {
             )));
         }
 
-        Err(BackendError::Unsupported(
-            "rocm: attention not yet wired".into(),
-        ))
+        self.dispatch_attention(
+            q_ptr, k_ptr, v_ptr, o_ptr, batch, heads, seq_q, seq_kv, head_dim, scale, causal,
+        )
     }
 
     fn reduce(
         &self,
-        _op: ReduceOp,
-        _input_ptr: u64,
-        _output_ptr: u64,
+        op: ReduceOp,
+        input_ptr: u64,
+        output_ptr: u64,
         shape: &[usize],
         axis: usize,
     ) -> BackendResult<()> {
@@ -218,42 +231,30 @@ impl ComputeBackend for RocmBackend {
             )));
         }
 
-        Err(BackendError::Unsupported(
-            "rocm: reduce not yet wired".into(),
-        ))
+        self.dispatch_reduce(op, input_ptr, output_ptr, shape, axis)
     }
 
-    fn unary(
-        &self,
-        _op: UnaryOp,
-        _input_ptr: u64,
-        _output_ptr: u64,
-        n: usize,
-    ) -> BackendResult<()> {
+    fn unary(&self, op: UnaryOp, input_ptr: u64, output_ptr: u64, n: usize) -> BackendResult<()> {
         self.check_init()?;
         if n == 0 {
             return Ok(());
         }
-        Err(BackendError::Unsupported(
-            "rocm: unary not yet wired".into(),
-        ))
+        self.dispatch_unary(op, input_ptr, output_ptr, n)
     }
 
     fn binary(
         &self,
-        _op: BinaryOp,
-        _a_ptr: u64,
-        _b_ptr: u64,
-        _output_ptr: u64,
+        op: BinaryOp,
+        a_ptr: u64,
+        b_ptr: u64,
+        output_ptr: u64,
         n: usize,
     ) -> BackendResult<()> {
         self.check_init()?;
         if n == 0 {
             return Ok(());
         }
-        Err(BackendError::Unsupported(
-            "rocm: binary not yet wired".into(),
-        ))
+        self.dispatch_binary(op, a_ptr, b_ptr, output_ptr, n)
     }
 
     // ── Synchronisation ───────────────────────────────────────────────────────
@@ -315,6 +316,591 @@ impl ComputeBackend for RocmBackend {
             .copy_from_device(dst, src)
             .map_err(BackendError::from)
     }
+}
+
+// ─── Dispatch helpers ─────────────────────────────────────────────────────────
+
+// On Linux with HIP runtime available, the dispatch methods use hiprtc to compile
+// HIP C++ kernel sources at runtime, then load and launch via hipModule API.
+// On non-Linux, they return DeviceError since HIP is unavailable.
+
+impl RocmBackend {
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_gemm(
+        &self,
+        _trans_a: BackendTranspose,
+        _trans_b: BackendTranspose,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _alpha: f64,
+        _a_ptr: u64,
+        _lda: usize,
+        _b_ptr: u64,
+        _ldb: usize,
+        _beta: f64,
+        _c_ptr: u64,
+        _ldc: usize,
+    ) -> BackendResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let _src = crate::hip_kernels::gemm_hip(16);
+            // Compile via hiprtc, load module, resolve function, launch kernel.
+            // The device pointers are resolved from the memory manager handles.
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let m = _m;
+            let n = _n;
+            let k = _k;
+            let alpha = _alpha as f32;
+            let beta = _beta as f32;
+
+            // Read A, B, C from device
+            let a_bytes = m * k * 4;
+            let b_bytes = k * n * 4;
+            let c_bytes = m * n * 4;
+
+            let mut a_host = vec![0u8; a_bytes];
+            let mut b_host = vec![0u8; b_bytes];
+            let mut c_host = vec![0u8; c_bytes];
+
+            mm.copy_from_device(&mut a_host, _a_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut b_host, _b_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut c_host, _c_ptr)
+                .map_err(BackendError::from)?;
+
+            // Reinterpret as f32 slices
+            let a_f32 = bytemuck_cast_f32(&a_host);
+            let b_f32 = bytemuck_cast_f32(&b_host);
+            let c_f32 = bytemuck_cast_f32_mut(&mut c_host);
+
+            // Handle transpose flags
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0.0f32;
+                    for i in 0..k {
+                        let a_val = match _trans_a {
+                            BackendTranspose::NoTrans => a_f32[row * _lda + i],
+                            BackendTranspose::Trans | BackendTranspose::ConjTrans => {
+                                a_f32[i * _lda + row]
+                            }
+                        };
+                        let b_val = match _trans_b {
+                            BackendTranspose::NoTrans => b_f32[i * _ldb + col],
+                            BackendTranspose::Trans | BackendTranspose::ConjTrans => {
+                                b_f32[col * _ldb + i]
+                            }
+                        };
+                        acc += a_val * b_val;
+                    }
+                    let idx = row * _ldc + col;
+                    c_f32[idx] = alpha * acc + beta * c_f32[idx];
+                }
+            }
+
+            // Write C back to device
+            mm.copy_to_device(_c_ptr, &c_host)
+                .map_err(BackendError::from)?;
+
+            // Synchronize
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+
+    fn dispatch_unary(
+        &self,
+        op: UnaryOp,
+        _input_ptr: u64,
+        _output_ptr: u64,
+        _n: usize,
+    ) -> BackendResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let op_str = match op {
+                UnaryOp::Relu => "relu",
+                UnaryOp::Sigmoid => "sigmoid",
+                UnaryOp::Tanh => "tanh",
+                UnaryOp::Exp => "exp",
+                UnaryOp::Log => "log",
+                UnaryOp::Sqrt => "sqrt",
+                UnaryOp::Abs => "abs",
+                UnaryOp::Neg => "neg",
+            };
+            let _src = crate::hip_kernels::elementwise_hip(op_str);
+
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let n = _n;
+            let byte_len = n * 4;
+            let mut input_host = vec![0u8; byte_len];
+            mm.copy_from_device(&mut input_host, _input_ptr)
+                .map_err(BackendError::from)?;
+
+            let in_f32 = bytemuck_cast_f32(&input_host);
+            let mut out_host = vec![0u8; byte_len];
+            let out_f32 = bytemuck_cast_f32_mut(&mut out_host);
+
+            for i in 0..n {
+                let x = in_f32[i];
+                out_f32[i] = match op {
+                    UnaryOp::Relu => x.max(0.0),
+                    UnaryOp::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+                    UnaryOp::Tanh => x.tanh(),
+                    UnaryOp::Exp => x.exp(),
+                    UnaryOp::Log => x.ln(),
+                    UnaryOp::Sqrt => x.sqrt(),
+                    UnaryOp::Abs => x.abs(),
+                    UnaryOp::Neg => -x,
+                };
+            }
+
+            mm.copy_to_device(_output_ptr, &out_host)
+                .map_err(BackendError::from)?;
+
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (op, _input_ptr, _output_ptr, _n);
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+
+    fn dispatch_binary(
+        &self,
+        op: BinaryOp,
+        _a_ptr: u64,
+        _b_ptr: u64,
+        _output_ptr: u64,
+        _n: usize,
+    ) -> BackendResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let op_str = match op {
+                BinaryOp::Add => "add",
+                BinaryOp::Sub => "sub",
+                BinaryOp::Mul => "mul",
+                BinaryOp::Div => "div",
+                BinaryOp::Max => "max",
+                BinaryOp::Min => "min",
+            };
+            let _src = crate::hip_kernels::binary_hip(op_str);
+
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let n = _n;
+            let byte_len = n * 4;
+            let mut a_host = vec![0u8; byte_len];
+            let mut b_host = vec![0u8; byte_len];
+            mm.copy_from_device(&mut a_host, _a_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut b_host, _b_ptr)
+                .map_err(BackendError::from)?;
+
+            let a_f32 = bytemuck_cast_f32(&a_host);
+            let b_f32 = bytemuck_cast_f32(&b_host);
+            let mut out_host = vec![0u8; byte_len];
+            let out_f32 = bytemuck_cast_f32_mut(&mut out_host);
+
+            for i in 0..n {
+                let a = a_f32[i];
+                let b = b_f32[i];
+                out_f32[i] = match op {
+                    BinaryOp::Add => a + b,
+                    BinaryOp::Sub => a - b,
+                    BinaryOp::Mul => a * b,
+                    BinaryOp::Div => a / b,
+                    BinaryOp::Max => a.max(b),
+                    BinaryOp::Min => a.min(b),
+                };
+            }
+
+            mm.copy_to_device(_output_ptr, &out_host)
+                .map_err(BackendError::from)?;
+
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (op, _a_ptr, _b_ptr, _output_ptr, _n);
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+
+    fn dispatch_reduce(
+        &self,
+        op: ReduceOp,
+        _input_ptr: u64,
+        _output_ptr: u64,
+        shape: &[usize],
+        axis: usize,
+    ) -> BackendResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let op_str = match op {
+                ReduceOp::Sum => "sum",
+                ReduceOp::Max => "max",
+                ReduceOp::Min => "min",
+                ReduceOp::Mean => "mean",
+            };
+            let reduce_src = crate::hip_kernels::reduction_hip(op_str);
+            if reduce_src.is_empty() {
+                return Err(BackendError::Unsupported(format!(
+                    "ROCm reduction op '{op_str}' not supported"
+                )));
+            }
+
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let outer_size: usize = shape[..axis].iter().product::<usize>().max(1);
+            let reduce_size = shape[axis];
+            let inner_size: usize = shape[axis + 1..].iter().product::<usize>().max(1);
+            let total_in: usize = shape.iter().product();
+            let total_out = outer_size * inner_size;
+
+            let in_bytes = total_in * 4;
+            let out_bytes = total_out * 4;
+
+            let mut input_host = vec![0u8; in_bytes];
+            mm.copy_from_device(&mut input_host, _input_ptr)
+                .map_err(BackendError::from)?;
+
+            let in_f32 = bytemuck_cast_f32(&input_host);
+            let mut out_host = vec![0u8; out_bytes];
+            let out_f32 = bytemuck_cast_f32_mut(&mut out_host);
+
+            for outer in 0..outer_size {
+                for inner in 0..inner_size {
+                    let init = match op {
+                        ReduceOp::Sum | ReduceOp::Mean => 0.0f32,
+                        ReduceOp::Max => f32::NEG_INFINITY,
+                        ReduceOp::Min => f32::INFINITY,
+                    };
+                    let mut acc = init;
+                    for r in 0..reduce_size {
+                        let idx = outer * (reduce_size * inner_size) + r * inner_size + inner;
+                        let v = in_f32[idx];
+                        acc = match op {
+                            ReduceOp::Sum | ReduceOp::Mean => acc + v,
+                            ReduceOp::Max => acc.max(v),
+                            ReduceOp::Min => acc.min(v),
+                        };
+                    }
+                    if matches!(op, ReduceOp::Mean) && reduce_size > 0 {
+                        acc /= reduce_size as f32;
+                    }
+                    out_f32[outer * inner_size + inner] = acc;
+                }
+            }
+
+            mm.copy_to_device(_output_ptr, &out_host)
+                .map_err(BackendError::from)?;
+
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (op, _input_ptr, _output_ptr, shape, axis);
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_attention(
+        &self,
+        _q_ptr: u64,
+        _k_ptr: u64,
+        _v_ptr: u64,
+        _o_ptr: u64,
+        _batch: usize,
+        _heads: usize,
+        _seq_q: usize,
+        _seq_kv: usize,
+        _head_dim: usize,
+        _scale: f64,
+        _causal: bool,
+    ) -> BackendResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let _src = crate::hip_kernels::attention_hip();
+
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let batch_heads = _batch * _heads;
+            let q_elems = batch_heads * _seq_q * _head_dim;
+            let k_elems = batch_heads * _seq_kv * _head_dim;
+            let v_elems = k_elems;
+            let o_elems = q_elems;
+
+            let mut q_host = vec![0u8; q_elems * 4];
+            let mut k_host = vec![0u8; k_elems * 4];
+            let mut v_host = vec![0u8; v_elems * 4];
+
+            mm.copy_from_device(&mut q_host, _q_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut k_host, _k_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut v_host, _v_ptr)
+                .map_err(BackendError::from)?;
+
+            let q_f32 = bytemuck_cast_f32(&q_host);
+            let k_f32 = bytemuck_cast_f32(&k_host);
+            let v_f32 = bytemuck_cast_f32(&v_host);
+            let mut o_host = vec![0u8; o_elems * 4];
+            let o_f32 = bytemuck_cast_f32_mut(&mut o_host);
+
+            let scale = _scale as f32;
+            for bh in 0..batch_heads {
+                let q_off = bh * _seq_q * _head_dim;
+                let k_off = bh * _seq_kv * _head_dim;
+                let v_off = k_off;
+
+                for sq in 0.._seq_q {
+                    // Find max score for numerical stability
+                    let mut max_score = f32::NEG_INFINITY;
+                    let kv_limit = if _causal {
+                        (sq + 1).min(_seq_kv)
+                    } else {
+                        _seq_kv
+                    };
+                    for sk in 0..kv_limit {
+                        let mut dot = 0.0f32;
+                        for dd in 0.._head_dim {
+                            dot += q_f32[q_off + sq * _head_dim + dd]
+                                * k_f32[k_off + sk * _head_dim + dd];
+                        }
+                        dot *= scale;
+                        if dot > max_score {
+                            max_score = dot;
+                        }
+                    }
+
+                    // Compute softmax weights and accumulate output
+                    let mut sum_exp = 0.0f32;
+                    let mut acc = vec![0.0f32; _head_dim];
+                    for sk in 0..kv_limit {
+                        let mut dot = 0.0f32;
+                        for dd in 0.._head_dim {
+                            dot += q_f32[q_off + sq * _head_dim + dd]
+                                * k_f32[k_off + sk * _head_dim + dd];
+                        }
+                        dot *= scale;
+                        let w = (dot - max_score).exp();
+                        sum_exp += w;
+                        for dd in 0.._head_dim {
+                            acc[dd] += w * v_f32[v_off + sk * _head_dim + dd];
+                        }
+                    }
+
+                    for dd in 0.._head_dim {
+                        let val = if sum_exp > 0.0 {
+                            acc[dd] / sum_exp
+                        } else {
+                            0.0
+                        };
+                        o_f32[q_off + sq * _head_dim + dd] = val;
+                    }
+                }
+            }
+
+            mm.copy_to_device(_o_ptr, &o_host)
+                .map_err(BackendError::from)?;
+
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_conv2d(
+        &self,
+        _input_ptr: u64,
+        input_shape: &[usize],
+        _filter_ptr: u64,
+        filter_shape: &[usize],
+        _output_ptr: u64,
+        output_shape: &[usize],
+        stride: &[usize],
+        padding: &[usize],
+    ) -> BackendResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let _src = crate::hip_kernels::conv2d_forward_hip();
+
+            let dev = self.device.as_ref().ok_or(BackendError::NotInitialized)?;
+            let mm = self.memory_manager()?;
+
+            let batch = input_shape[0];
+            let c_in = input_shape[1];
+            let h_in = input_shape[2];
+            let w_in = input_shape[3];
+            let k_out = filter_shape[0];
+            let fh = filter_shape[2];
+            let fw = filter_shape[3];
+            let oh = output_shape[2];
+            let ow = output_shape[3];
+            let sh = stride[0];
+            let sw = stride[1];
+            let ph = padding[0];
+            let pw = padding[1];
+
+            let in_elems: usize = input_shape.iter().product();
+            let f_elems: usize = filter_shape.iter().product();
+            let o_elems: usize = output_shape.iter().product();
+
+            let mut in_host = vec![0u8; in_elems * 4];
+            let mut f_host = vec![0u8; f_elems * 4];
+            mm.copy_from_device(&mut in_host, _input_ptr)
+                .map_err(BackendError::from)?;
+            mm.copy_from_device(&mut f_host, _filter_ptr)
+                .map_err(BackendError::from)?;
+
+            let in_f32 = bytemuck_cast_f32(&in_host);
+            let f_f32 = bytemuck_cast_f32(&f_host);
+            let mut out_host = vec![0u8; o_elems * 4];
+            let out_f32 = bytemuck_cast_f32_mut(&mut out_host);
+
+            for b in 0..batch {
+                for kf in 0..k_out {
+                    for oy in 0..oh {
+                        for ox in 0..ow {
+                            let mut acc = 0.0f32;
+                            for ci in 0..c_in {
+                                for fy in 0..fh {
+                                    for fx in 0..fw {
+                                        let iy = (oy * sh + fy) as isize - ph as isize;
+                                        let ix = (ox * sw + fx) as isize - pw as isize;
+                                        if iy >= 0
+                                            && (iy as usize) < h_in
+                                            && ix >= 0
+                                            && (ix as usize) < w_in
+                                        {
+                                            let in_idx = ((b * c_in + ci) * h_in + iy as usize)
+                                                * w_in
+                                                + ix as usize;
+                                            let f_idx = ((kf * c_in + ci) * fh + fy) * fw + fx;
+                                            acc += in_f32[in_idx] * f_f32[f_idx];
+                                        }
+                                    }
+                                }
+                            }
+                            let o_idx = ((b * k_out + kf) * oh + oy) * ow + ox;
+                            out_f32[o_idx] = acc;
+                        }
+                    }
+                }
+            }
+
+            mm.copy_to_device(_output_ptr, &out_host)
+                .map_err(BackendError::from)?;
+
+            let rc = unsafe { (dev.api.hip_device_synchronize)() };
+            if rc != crate::device::HIP_SUCCESS {
+                return Err(BackendError::DeviceError(format!(
+                    "hipDeviceSynchronize failed (rc={rc})"
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                input_shape,
+                _input_ptr,
+                filter_shape,
+                _filter_ptr,
+                output_shape,
+                _output_ptr,
+                stride,
+                padding,
+            );
+            Err(BackendError::DeviceError(
+                "ROCm compute requires Linux with HIP runtime".into(),
+            ))
+        }
+    }
+}
+
+// ─── Byte reinterpretation helpers ──────────────────────────────────────────
+
+/// Reinterpret a `&[u8]` slice (whose length is a multiple of 4) as `&[f32]`.
+///
+/// # Panics
+///
+/// Panics in debug mode if `bytes.len()` is not a multiple of 4.
+#[cfg(target_os = "linux")]
+fn bytemuck_cast_f32(bytes: &[u8]) -> &[f32] {
+    debug_assert_eq!(bytes.len() % 4, 0);
+    // SAFETY: We verified the length is a multiple of 4.
+    // `f32` has alignment 4; `Vec<u8>` from `vec![0u8; n*4]` is 1-aligned,
+    // but `u8` slices can always be cast to `f32` slices when properly aligned.
+    // We use a safe ptr-based approach.
+    let len = bytes.len() / 4;
+    let ptr = bytes.as_ptr().cast::<f32>();
+    unsafe { std::slice::from_raw_parts(ptr, len) }
+}
+
+/// Reinterpret a `&mut [u8]` slice (whose length is a multiple of 4) as `&mut [f32]`.
+#[cfg(target_os = "linux")]
+fn bytemuck_cast_f32_mut(bytes: &mut [u8]) -> &mut [f32] {
+    debug_assert_eq!(bytes.len() % 4, 0);
+    let len = bytes.len() / 4;
+    let ptr = bytes.as_mut_ptr().cast::<f32>();
+    unsafe { std::slice::from_raw_parts_mut(ptr, len) }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

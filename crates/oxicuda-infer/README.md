@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-infer = "0.1.0"
+oxicuda-infer = "0.1.1"
 ```
 
 ```rust

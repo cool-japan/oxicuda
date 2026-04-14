@@ -256,7 +256,9 @@ pub fn analyse(graph: &ComputeGraph) -> GraphResult<FusionPlan> {
                 continue;
             }
             // 2. Dominator: the last member must dominate succ.
-            let last_member = *members.last().unwrap();
+            let last_member = *members.last().ok_or_else(|| {
+                GraphError::Internal("fusion group members unexpectedly empty".into())
+            })?;
             if !dt.dominates(last_member, succ_id) {
                 continue;
             }
@@ -279,7 +281,11 @@ pub fn analyse(graph: &ComputeGraph) -> GraphResult<FusionPlan> {
             format!(
                 "fused_{}..{}",
                 graph.node(members[0])?.display_name(),
-                graph.node(*members.last().unwrap())?.display_name()
+                graph
+                    .node(*members.last().ok_or_else(|| {
+                        GraphError::Internal("fusion group members unexpectedly empty".into())
+                    })?)?
+                    .display_name()
             )
         } else {
             format!("solo_{}", graph.node(node_id)?.display_name())

@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 readme = "README.md"
+keywords = ["gpu", "quantization", "compression", "cuda", "deep-learning"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 oxicuda-driver = { workspace = true }

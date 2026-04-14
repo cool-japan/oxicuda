@@ -160,7 +160,11 @@ pub fn analyse(graph: &ComputeGraph, max_streams: usize) -> GraphResult<StreamPl
                     .enumerate()
                     .min_by_key(|(_, (alap, _, _))| *alap)
                     .map(|(i, (_, _, sid))| (i, *sid))
-                    .unwrap();
+                    .ok_or_else(|| {
+                        GraphError::StreamPartitioningFailed(
+                            "no streams available for assignment".into(),
+                        )
+                    })?;
                 stream_last[best.0] = (node_alap, node_id, best.1);
                 best.1
             };

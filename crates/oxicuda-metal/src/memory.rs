@@ -20,13 +20,13 @@ use crate::{
 // ─── Internal buffer record ──────────────────────────────────────────────────
 
 /// Bookkeeping entry for a single allocated Metal buffer.
-struct MetalBufferInfo {
+pub(crate) struct MetalBufferInfo {
     /// The GPU-resident (shared-mode) buffer.
     #[cfg(target_os = "macos")]
-    buffer: metal::Buffer,
+    pub(crate) buffer: metal::Buffer,
     /// Byte size of the allocation.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    size: u64,
+    pub(crate) size: u64,
 }
 
 // ─── Memory manager ──────────────────────────────────────────────────────────
@@ -54,6 +54,18 @@ impl MetalMemoryManager {
             buffers: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         }
+    }
+
+    /// Lock the internal buffer map, returning a guard for buffer access.
+    ///
+    /// Used by the backend to bind Metal buffers to compute command encoders.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn lock_buffers(
+        &self,
+    ) -> MetalResult<std::sync::MutexGuard<'_, HashMap<u64, MetalBufferInfo>>> {
+        self.buffers
+            .lock()
+            .map_err(|_| MetalError::CommandBufferError("mutex poisoned".into()))
     }
 
     /// Allocate `bytes` bytes of shared-mode device memory.

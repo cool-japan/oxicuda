@@ -1,7 +1,7 @@
 //! Launch telemetry / tracing integration.
 //!
 //! This module provides the [`kernel_launch_span!`] macro that emits a
-//! [`tracing`] instrumentation span around every kernel launch when the
+//! `tracing` instrumentation span around every kernel launch when the
 //! `tracing` Cargo feature is enabled. When the feature is disabled the
 //! macro expands to a unit expression `()` with zero overhead.
 //!

@@ -556,7 +556,7 @@ mod tests {
         let Some(b) = try_init_wasm() else {
             return;
         };
-        // Non-zero dims → should return Unsupported (not panic).
+        // Non-zero dims with invalid handles → should return an error (not panic).
         let result = b.gemm(
             BackendTranspose::NoTrans,
             BackendTranspose::NoTrans,
@@ -573,7 +573,7 @@ mod tests {
             4,
         );
         match result {
-            Err(BackendError::Unsupported(_)) | Ok(()) => {}
+            Err(BackendError::Unsupported(_)) | Err(BackendError::InvalidArgument(_)) | Ok(()) => {}
             Err(e) => panic!("unexpected error: {e}"),
         }
     }
@@ -619,7 +619,7 @@ mod tests {
             &[0, 0],
         );
         match result {
-            Err(BackendError::Unsupported(_)) | Ok(()) => {}
+            Err(BackendError::Unsupported(_)) | Err(BackendError::InvalidArgument(_)) | Ok(()) => {}
             Err(e) => panic!("unexpected error: {e}"),
         }
     }

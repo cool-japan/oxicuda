@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-quant = "0.1.0"
+oxicuda-quant = "0.1.1"
 ```
 
 ```rust

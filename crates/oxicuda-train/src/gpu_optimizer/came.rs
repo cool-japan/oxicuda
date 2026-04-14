@@ -309,7 +309,9 @@ impl GpuOptimizer for GpuCame {
                 .ok_or(TrainError::NoGradient { index: i })?
                 .clone();
 
-            let state = self.states[i].as_mut().unwrap();
+            let state = self.states[i]
+                .as_mut()
+                .expect("state guaranteed by ensure_states()");
             match &mut state.v {
                 CameV::Flat { v } => {
                     Self::update_flat(

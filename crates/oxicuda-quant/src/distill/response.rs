@@ -144,13 +144,14 @@ impl ResponseDistiller {
                 got: teacher_batch.len(),
             });
         }
-        let total: f32 = (0..batch_size)
+        let losses: QuantResult<Vec<f32>> = (0..batch_size)
             .map(|b| {
                 let s = &student_batch[b * n_classes..(b + 1) * n_classes];
                 let t = &teacher_batch[b * n_classes..(b + 1) * n_classes];
-                self.compute_loss(s, t, hard_labels[b]).unwrap_or(0.0)
+                self.compute_loss(s, t, hard_labels[b])
             })
-            .sum();
+            .collect();
+        let total: f32 = losses?.iter().sum();
         Ok(total / batch_size as f32)
     }
 }

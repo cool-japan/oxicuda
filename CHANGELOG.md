@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-14
+
+### Added
+
+- `oxicuda-blas`: New elementwise operations — `Ceil`, `Floor`, `HardSigmoid`, `HardSwish`, `Softplus`, and `LeakyRelu`
+
+### Changed
+
+- General enhancements across crates: improved robustness, performance, and internal code quality
+
 ## [0.1.0] - 2026-04-13
 
 ### Added

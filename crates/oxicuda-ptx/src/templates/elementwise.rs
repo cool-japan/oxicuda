@@ -75,6 +75,18 @@ pub enum ElementwiseOp {
     Scale,
     /// Add scalar: `b[i] = a[i] + scalar`.
     AddScalar,
+    /// Ceiling (round toward +inf): `b[i] = ceil(a[i])`.
+    Ceil,
+    /// Floor (round toward -inf): `b[i] = floor(a[i])`.
+    Floor,
+    /// Hard sigmoid: `b[i] = max(0, min(1, 0.2*a[i] + 0.5))`.
+    HardSigmoid,
+    /// Hard swish: `b[i] = a[i] * max(0, min(6, a[i]+3)) / 6`.
+    HardSwish,
+    /// Softplus: `b[i] = ln(1 + exp(a[i]))`.
+    Softplus,
+    /// Leaky relu: `b[i] = a[i] >= 0 ? a[i] : 0.01 * a[i]`.
+    LeakyRelu,
     /// Fused add-relu: `c[i] = relu(a[i] + b[i])`.
     FusedAddRelu,
     /// Fused scale-add: `c[i] = alpha * a[i] + beta * b[i]`.
@@ -101,6 +113,12 @@ impl ElementwiseOp {
             Self::Rsqrt => "rsqrt",
             Self::Exp => "exp",
             Self::Log => "log",
+            Self::Ceil => "ceil",
+            Self::Floor => "floor",
+            Self::HardSigmoid => "hard_sigmoid",
+            Self::HardSwish => "hard_swish",
+            Self::Softplus => "softplus",
+            Self::LeakyRelu => "leaky_relu",
             Self::Scale => "scale",
             Self::AddScalar => "add_scalar",
             Self::FusedAddRelu => "fused_add_relu",
@@ -192,6 +210,12 @@ impl ElementwiseTemplate {
             ElementwiseOp::Rsqrt => self.generate_rsqrt(),
             ElementwiseOp::Exp => self.generate_exp(),
             ElementwiseOp::Log => self.generate_log(),
+            ElementwiseOp::Ceil => self.generate_ceil(),
+            ElementwiseOp::Floor => self.generate_floor(),
+            ElementwiseOp::HardSigmoid => self.generate_hard_sigmoid(),
+            ElementwiseOp::HardSwish => self.generate_hard_swish(),
+            ElementwiseOp::Softplus => self.generate_softplus(),
+            ElementwiseOp::LeakyRelu => self.generate_leaky_relu(),
             ElementwiseOp::Scale => self.generate_scale(),
             ElementwiseOp::AddScalar => self.generate_add_scalar(),
             ElementwiseOp::FusedAddRelu => self.generate_fused_add_relu(),
@@ -737,6 +761,273 @@ impl ElementwiseTemplate {
                         "ld.global{ty} %f_x, [%rd_a];\n    \
                          lg2.approx{ty} %f_lg, %f_x;\n    \
                          mul{ty} %f_y, %f_lg, 0f3F317218;\n    \
+                         st.global{ty} [%rd_b], %f_y;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a ceil kernel: `b[i] = ceil(a[i])`.
+    ///
+    /// Uses `cvt.rpi` (round-to-positive-infinity) for ceiling.
+    fn generate_ceil(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_x, [%rd_a];\n    \
+                         cvt.rpi{ty}{ty} %f_y, %f_x;\n    \
+                         st.global{ty} [%rd_b], %f_y;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a floor kernel: `b[i] = floor(a[i])`.
+    ///
+    /// Uses `cvt.rmi` (round-to-minus-infinity) for floor.
+    fn generate_floor(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_x, [%rd_a];\n    \
+                         cvt.rmi{ty}{ty} %f_y, %f_x;\n    \
+                         st.global{ty} [%rd_b], %f_y;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a hard-sigmoid kernel: `max(0, min(1, alpha*x + beta))`.
+    ///
+    /// Uses ONNX default constants: alpha=0.2 (0f3E4CCCCD), beta=0.5 (0f3F000000).
+    fn generate_hard_sigmoid(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let zero_lit = float_zero_literal(self.precision);
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;"
+                    ));
+
+                    // HardSigmoid: max(0, min(1, 0.2*x + 0.5))
+                    // 0.2 = 0f3E4CCCCD, 0.5 = 0f3F000000, 1.0 = 0f3F800000
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_x, [%rd_a];\n    \
+                         mul{ty} %f_ax, %f_x, 0f3E4CCCCD;\n    \
+                         add{ty} %f_lin, %f_ax, 0f3F000000;\n    \
+                         min{ty} %f_clip, %f_lin, 0f3F800000;\n    \
+                         max{ty} %f_y, %f_clip, {zero_lit};\n    \
+                         st.global{ty} [%rd_b], %f_y;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a hard-swish kernel: `x * max(0, min(6, x+3)) / 6`.
+    ///
+    /// IEEE 754 hex: 3.0=0f40400000, 6.0=0f40C00000, 1/6=0f3E2AAAAB.
+    fn generate_hard_swish(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let zero_lit = float_zero_literal(self.precision);
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;"
+                    ));
+
+                    // HardSwish: x * max(0, min(6, x+3)) / 6
+                    // 3.0 = 0f40400000, 6.0 = 0f40C00000, 1/6 = 0f3E2AAAAB
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_x, [%rd_a];\n    \
+                         add{ty} %f_xp3, %f_x, 0f40400000;\n    \
+                         min{ty} %f_clip, %f_xp3, 0f40C00000;\n    \
+                         max{ty} %f_clip, %f_clip, {zero_lit};\n    \
+                         mul{ty} %f_div, %f_clip, 0f3E2AAAAB;\n    \
+                         mul{ty} %f_y, %f_x, %f_div;\n    \
+                         st.global{ty} [%rd_b], %f_y;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a softplus kernel: `ln(1 + exp(x))`.
+    ///
+    /// Uses exp(x) = 2^(x * log2(e)) and ln(z) = lg2(z) * ln(2).
+    fn generate_softplus(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;"
+                    ));
+
+                    // softplus(x) = ln(1 + exp(x))
+                    // exp(x) = 2^(x * log2(e)),  log2(e) = 0f3FB8AA3B
+                    // ln(z) = lg2(z) * ln(2),    ln(2) = 0f3F317218
+                    // 1.0 = 0f3F800000
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_x, [%rd_a];\n    \
+                         mul{ty} %f_xe, %f_x, 0f3FB8AA3B;\n    \
+                         ex2.approx{ty} %f_exp, %f_xe;\n    \
+                         add{ty} %f_sum, %f_exp, 0f3F800000;\n    \
+                         lg2.approx{ty} %f_lg, %f_sum;\n    \
+                         mul{ty} %f_y, %f_lg, 0f3F317218;\n    \
+                         st.global{ty} [%rd_b], %f_y;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a leaky-relu kernel: `x >= 0 ? x : alpha*x` (alpha=0.01).
+    ///
+    /// IEEE 754 hex: 0.01 = 0f3C23D70A.
+    fn generate_leaky_relu(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let zero_lit = float_zero_literal(self.precision);
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;"
+                    ));
+
+                    // LeakyRelu: x >= 0 ? x : 0.01*x
+                    // Compute both paths then select via setp + selp
+                    // 0.01 = 0f3C23D70A
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_x, [%rd_a];\n    \
+                         mul{ty} %f_leak, %f_x, 0f3C23D70A;\n    \
+                         setp.ge{ty} %p_ge, %f_x, {zero_lit};\n    \
+                         selp{ty} %f_y, %f_x, %f_leak, %p_ge;\n    \
                          st.global{ty} [%rd_b], %f_y;"
                     ));
                 });

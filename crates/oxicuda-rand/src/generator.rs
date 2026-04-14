@@ -62,11 +62,11 @@ impl std::fmt::Display for RngEngine {
 /// # use oxicuda_memory::DeviceBuffer;
 /// # use oxicuda_rand::generator::{RngEngine, RngGenerator};
 /// # fn main() -> oxicuda_rand::RandResult<()> {
-/// # oxicuda_driver::init().unwrap();
-/// # let dev = Device::get(0).unwrap();
-/// # let ctx = Arc::new(Context::new(&dev).unwrap());
+/// # oxicuda_driver::init()?;
+/// # let dev = Device::get(0)?;
+/// # let ctx = Arc::new(Context::new(&dev)?);
 /// let mut rng = RngGenerator::new(RngEngine::Philox, 42, &ctx)?;
-/// let mut buf = DeviceBuffer::<f32>::alloc(1024).unwrap();
+/// let mut buf = DeviceBuffer::<f32>::alloc(1024)?;
 /// rng.generate_uniform_f32(&mut buf)?;
 /// # Ok(())
 /// # }

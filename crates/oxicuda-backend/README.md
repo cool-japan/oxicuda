@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-backend = "0.1.0"
+oxicuda-backend = "0.1.1"
 ```
 
 ```rust
