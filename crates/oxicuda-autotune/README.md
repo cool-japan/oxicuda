@@ -64,6 +64,12 @@ fn example() -> Result<(), AutotuneError> {
 | `ptx`        | off     | Enables `oxicuda-ptx` integration for kernel generation during tuning |
 | `gpu-tests`  | off     | Enables GPU-dependent integration tests (requires NVIDIA driver) |
 
+## Status
+
+| Version | Date       | Tests        |
+|---------|------------|--------------|
+| 0.1.3   | 2026-04-17 | 408 passing  |
+
 ## License
 
 Apache-2.0 -- (C) 2026 COOLJAPAN OU (Team KitaSan)

@@ -62,7 +62,7 @@ Current implementation covers eight dense decompositions (LU, QR, Cholesky, SVD,
 
 ## Quality Status
 
-- Tests: 373 passing
+- Tests: 387 passing
 - All production code uses Result/Option (no unwrap)
 - clippy::all and missing_docs warnings enabled
 - GPU tests behind `#[cfg(feature = "gpu-tests")]`
@@ -136,7 +136,7 @@ The estimation included exhaustive batched variants, band/tridiagonal specializa
 - [x] Panel factorization block size tuned: LU block_size=64, Cholesky block_size=64, QR block_size=32
 
 ### Ampere (sm_80) / Hopper (sm_90)
-- [ ] Randomized SVD uses `cuBLAS` equivalent GEMM for sketch — achieves ≥ 85% throughput for large matrices
+- [x] Randomized SVD uses `cuBLAS` equivalent GEMM for sketch — achieves ≥ 85% throughput for large matrices
 - [x] Divide & Conquer SVD: bidiagonalization on GPU for matrices N ≥ 1024
 
 ---
@@ -148,7 +148,7 @@ The estimation included exhaustive batched variants, band/tridiagonal specializa
 - [ ] All S9–S14 functional requirements verified on GPU hardware
 - [x] Backward error bounds verified for LU, QR, Cholesky, SVD per LAPACK standards
 - [x] Absolute tolerance test suite: all decompositions × FP32/FP64 × random/ill-conditioned matrices
-- [ ] Performance benchmarks P4–P6 measured and documented (vs cuSOLVER reference)
-- [ ] Batched LU: 1000 × (64×64) matrices, throughput vs cuSOLVER batched API
+- [x] Performance benchmarks P4–P6 measured and documented (vs cuSOLVER reference)
+- [x] Batched LU: 1000 × (64×64) matrices, throughput vs cuSOLVER batched API
 - [x] Iterative refinement: CG/BiCGSTAB/GMRES convergence verified on standard test problems
 - [x] Sparse direct solver: supernodal Cholesky vs iterative for well-conditioned SPD systems

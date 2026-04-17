@@ -89,6 +89,12 @@ All functionality is available by default -- no optional feature flags.
 The crate is 100% pure Rust with zero external tool requirements for PTX
 text generation.
 
+## Status
+
+| Version | Date       | Tests        |
+|---------|------------|--------------|
+| 0.1.3   | 2026-04-17 | 880 passing  |
+
 ## License
 
 Apache-2.0 -- (C) 2026 COOLJAPAN OU (Team KitaSan)

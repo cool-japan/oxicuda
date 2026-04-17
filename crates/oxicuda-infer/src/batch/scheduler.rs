@@ -296,6 +296,34 @@ impl Scheduler {
     pub fn free_blocks(&self) -> usize {
         self.free_blocks
     }
+
+    /// Return the current conditioning token for a sequence.
+    ///
+    /// Searches running, waiting, and preempted queues. Returns `None` if the
+    /// sequence is unknown or already finished/removed.
+    #[must_use]
+    pub fn last_token(&self, seq_id: SequenceId) -> Option<u32> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .chain(self.preempted.iter())
+            .find(|s| s.id == seq_id)
+            .map(Sequence::last_token)
+    }
+
+    /// Return the total logical sequence length (prompt + generated tokens).
+    ///
+    /// Searches running, waiting, and preempted queues. Returns `None` if the
+    /// sequence is unknown or already finished/removed.
+    #[must_use]
+    pub fn total_len(&self, seq_id: SequenceId) -> Option<usize> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .chain(self.preempted.iter())
+            .find(|s| s.id == seq_id)
+            .map(Sequence::total_len)
+    }
 }
 
 // ── Module-level helpers ──────────────────────────────────────────────────────

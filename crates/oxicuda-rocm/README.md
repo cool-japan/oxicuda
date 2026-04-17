@@ -9,8 +9,11 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 ## Features
 
 - **Dynamic HIP loading** — `libamdhip64.so` is loaded at runtime; no HIP SDK needed at compile time
+- **hipRTC integration** — runtime compilation of HIP kernel source strings via `libhiprtc.so`; no ROCm toolchain required at compile time
+- **hipBLAS interop** — optional high-performance BLAS via `libhipblas.so` with automatic kernel fallback when not installed
 - **Device management** — Enumerate and select AMD GPU devices
 - **Memory operations** — Allocate, free, and transfer device memory
+- **Multi-GPU support** — `MultiDeviceDispatcher` distributes matrix work across all available AMD GPUs
 - **Backend abstraction** — Implements `oxicuda-backend`'s `ComputeBackend` trait for unified multi-GPU-API programming
 - **Pure Rust** — Zero C/Fortran in the default feature set
 
@@ -27,7 +30,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-rocm = "0.1.2"
+oxicuda-rocm = "0.1.3"
 ```
 
 ```rust
@@ -39,6 +42,11 @@ match backend.init() {
     Err(e) => println!("ROCm not available: {e}"),
 }
 ```
+
+## Status
+
+- **Version**: 0.1.3 (2026-04-17)
+- **Tests**: 104 passing
 
 ## License
 

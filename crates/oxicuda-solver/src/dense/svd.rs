@@ -570,18 +570,6 @@ fn bidiagonal_svd_qr(
         return Ok(true);
     }
 
-    // Initialize U and V^T as identity matrices if provided.
-    if let Some(ref u_mat) = u {
-        for i in 0..n {
-            let _ = u_mat[i * n + i]; // Touch to verify bounds (structural).
-        }
-    }
-    if let Some(ref vt_mat) = vt {
-        for i in 0..n {
-            let _ = vt_mat[i * n + i]; // Touch to verify bounds (structural).
-        }
-    }
-
     // Initialize identity matrices.
     if let Some(u_mat) = u {
         for val in u_mat.iter_mut() {
@@ -716,13 +704,12 @@ fn reconstruct_u_thin<T: GpuFloat>(
     _n: u32,
     _lda: u32,
     _tauq: &DeviceBuffer<T>,
-    _u_bidiag: Option<&[f64]>,
+    u_bidiag: Option<&[f64]>,
     k: u32,
 ) -> SolverResult<Vec<T>> {
-    // Full implementation would:
-    // 1. Generate Q from tauq Householder vectors.
-    // 2. Multiply Q * U_bidiag to get the final U.
-    Ok(vec![T::gpu_zero(); m as usize * k as usize])
+    let m_usize = m as usize;
+    let k_usize = k as usize;
+    Ok(build_u_embedding::<T>(u_bidiag, m_usize, k_usize, false))
 }
 
 /// Reconstructs full U (m x m) from Householder vectors and bidiag U rotations.
@@ -734,10 +721,12 @@ fn reconstruct_u_full<T: GpuFloat>(
     _n: u32,
     _lda: u32,
     _tauq: &DeviceBuffer<T>,
-    _u_bidiag: Option<&[f64]>,
-    _k: u32,
+    u_bidiag: Option<&[f64]>,
+    k: u32,
 ) -> SolverResult<Vec<T>> {
-    Ok(vec![T::gpu_zero(); m as usize * m as usize])
+    let m_usize = m as usize;
+    let k_usize = k as usize;
+    Ok(build_u_embedding::<T>(u_bidiag, m_usize, k_usize, true))
 }
 
 /// Reconstructs thin V^T (k x n) from Householder vectors and bidiag V^T rotations.
@@ -749,10 +738,12 @@ fn reconstruct_vt_thin<T: GpuFloat>(
     n: u32,
     _lda: u32,
     _taup: &DeviceBuffer<T>,
-    _vt_bidiag: Option<&[f64]>,
+    vt_bidiag: Option<&[f64]>,
     k: u32,
 ) -> SolverResult<Vec<T>> {
-    Ok(vec![T::gpu_zero(); k as usize * n as usize])
+    let n_usize = n as usize;
+    let k_usize = k as usize;
+    Ok(build_vt_embedding::<T>(vt_bidiag, n_usize, k_usize, false))
 }
 
 /// Reconstructs full V^T (n x n) from Householder vectors and bidiag V^T rotations.
@@ -764,10 +755,72 @@ fn reconstruct_vt_full<T: GpuFloat>(
     n: u32,
     _lda: u32,
     _taup: &DeviceBuffer<T>,
-    _vt_bidiag: Option<&[f64]>,
-    _k: u32,
+    vt_bidiag: Option<&[f64]>,
+    k: u32,
 ) -> SolverResult<Vec<T>> {
-    Ok(vec![T::gpu_zero(); n as usize * n as usize])
+    let n_usize = n as usize;
+    let k_usize = k as usize;
+    Ok(build_vt_embedding::<T>(vt_bidiag, n_usize, k_usize, true))
+}
+
+fn build_u_embedding<T: GpuFloat>(
+    u_bidiag: Option<&[f64]>,
+    m: usize,
+    k: usize,
+    full: bool,
+) -> Vec<T> {
+    let cols = if full { m } else { k };
+    let mut out = vec![T::gpu_zero(); m * cols];
+
+    if let Some(u_small) = u_bidiag {
+        for col in 0..k {
+            for row in 0..k.min(m) {
+                out[col * m + row] = from_f64_to_t(u_small[col * k + row]);
+            }
+        }
+    } else {
+        for i in 0..k.min(m) {
+            out[i * m + i] = T::gpu_one();
+        }
+    }
+
+    if full {
+        for i in k..m {
+            out[i * m + i] = T::gpu_one();
+        }
+    }
+
+    out
+}
+
+fn build_vt_embedding<T: GpuFloat>(
+    vt_bidiag: Option<&[f64]>,
+    n: usize,
+    k: usize,
+    full: bool,
+) -> Vec<T> {
+    let rows = if full { n } else { k };
+    let mut out = vec![T::gpu_zero(); rows * n];
+
+    if let Some(vt_small) = vt_bidiag {
+        for col in 0..k.min(n) {
+            for row in 0..k.min(rows) {
+                out[col * rows + row] = from_f64_to_t(vt_small[col * k + row]);
+            }
+        }
+    } else {
+        for i in 0..k.min(rows).min(n) {
+            out[i * rows + i] = T::gpu_one();
+        }
+    }
+
+    if full {
+        for i in k..n {
+            out[i * n + i] = T::gpu_one();
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -971,6 +1024,33 @@ mod tests {
         let result = bidiagonal_svd_qr(&mut d, &mut e, None, None, 0);
         assert!(result.is_ok());
         assert!(result.ok() == Some(true));
+    }
+
+    #[test]
+    fn u_embedding_thin_maps_bidiag_block() {
+        // u_bidiag is 2x2 in column-major: col0=[1,2], col1=[3,4]
+        let u_small = vec![1.0_f64, 2.0, 3.0, 4.0];
+        let out = build_u_embedding::<f64>(Some(&u_small), 4, 2, false);
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[1], 2.0);
+        assert_eq!(out[4], 3.0);
+        assert_eq!(out[5], 4.0);
+        assert_eq!(out[2], 0.0);
+        assert_eq!(out[3], 0.0);
+    }
+
+    #[test]
+    fn vt_embedding_full_extends_identity() {
+        let vt_small = vec![1.0_f64, 0.0, 0.0, 1.0]; // 2x2 identity (column-major)
+        let out = build_vt_embedding::<f64>(Some(&vt_small), 4, 2, true);
+        assert_eq!(out.len(), 16);
+        // top-left identity
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[5], 1.0);
+        // extended identity tail
+        assert_eq!(out[10], 1.0);
+        assert_eq!(out[15], 1.0);
     }
 
     #[test]

@@ -52,7 +52,7 @@ impl BoundaryExchange {
         }
         if n_heads == 0 || hidden_dim % n_heads != 0 {
             return Err(DistInferError::DimensionMismatch {
-                expected: 0, // placeholder: n_heads must divide hidden_dim
+                expected: n_heads,
                 got: hidden_dim % n_heads,
             });
         }

@@ -24,14 +24,24 @@ also exposes methods like `copy_from_host()` and `copy_to_host()` directly.
 
 ## Modules
 
-| Module          | Description                                              |
-|-----------------|----------------------------------------------------------|
-| `device_buffer` | `DeviceBuffer<T>` (VRAM) and `DeviceSlice<T>` (sub-range) |
-| `host_buffer`   | `PinnedBuffer<T>` -- page-locked host memory for fast DMA |
-| `unified`       | `UnifiedBuffer<T>` -- CUDA managed memory (host+device)  |
-| `zero_copy`     | `MappedBuffer<T>` -- zero-copy host-mapped memory          |
-| `copy`          | Freestanding `copy_htod`, `copy_dtoh`, `copy_dtod` helpers |
-| `pool`          | `MemoryPool` -- stream-ordered allocation (behind `pool` feature) |
+| Module               | Description                                                        |
+|----------------------|--------------------------------------------------------------------|
+| `device_buffer`      | `DeviceBuffer<T>` (VRAM) and `DeviceSlice<T>` (sub-range)         |
+| `host_buffer`        | `PinnedBuffer<T>` -- page-locked host memory for fast DMA         |
+| `unified`            | `UnifiedBuffer<T>` -- CUDA managed memory (host+device)           |
+| `zero_copy`          | `MappedBuffer<T>` -- zero-copy host-mapped device-accessible mem  |
+| `copy`               | Freestanding `copy_htod`, `copy_dtoh`, `copy_dtod` (sync + async) |
+| `copy_2d3d`          | `Memcpy2DParams`, `Memcpy3DParams`, 2D/3D memory copy helpers      |
+| `pool`               | `MemoryPool` -- stream-ordered allocation (behind `pool` feature)  |
+| `pool_stats`         | `AllocationHistogram`, `PoolReport`, fragmentation metrics         |
+| `aligned`            | Aligned allocation options (256-byte / 512-byte alignment)         |
+| `buffer_view`        | Type-safe buffer view and reinterpret-cast helpers                 |
+| `host_registered`    | Host-registered memory (`cuMemHostRegister`)                       |
+| `managed_hints`      | CUDA 12+ managed memory hints, migration policy, prefetch plans    |
+| `virtual_memory`     | `VirtualAddressRange`, `PhysicalAllocation`, virtual memory mgmt   |
+| `peer_copy`          | Multi-GPU peer memory copy (`copy_peer`, `copy_peer_async`)        |
+| `memory_info`        | Device memory info queries (`cuMemGetInfo`)                        |
+| `bandwidth_profiler` | Transfer timing and throughput measurement hooks                   |
 
 ## Quick Start
 
@@ -78,6 +88,15 @@ gpu_buf.copy_to_host(&mut result)?;
 | Linux    | Full support (NVIDIA driver 525+)             |
 | Windows  | Full support (NVIDIA driver 525+)             |
 | macOS    | Compile only (UnsupportedPlatform at runtime) |
+
+## Status
+
+| Item       | Value              |
+|------------|--------------------|
+| Version    | 0.1.3 (2026-04-17) |
+| Tests      | 201 passing        |
+| Warnings   | 0                  |
+| `unwrap()` | 0                  |
 
 ## License
 

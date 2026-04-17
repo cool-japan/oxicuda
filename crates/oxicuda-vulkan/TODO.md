@@ -7,7 +7,7 @@ SPIR-V compute shader dispatch. Part of [OxiCUDA](https://github.com/cool-japan/
 
 ## Implementation Status
 
-- **Tests**: 77 passing
+- **Tests**: 86 passing
 - **Status**: Memory + Compute operations via SPIR-V
 
 ### Completed
@@ -50,6 +50,6 @@ SPIR-V compute shader dispatch. Part of [OxiCUDA](https://github.com/cool-japan/
 ## Quality Status
 
 - Warnings: 0
-- Tests: 77 passing
+- Tests: 86 passing
 - unwrap() calls: 0
 - Clippy: clean

@@ -231,9 +231,10 @@ impl ContinuousBatcher {
         let mut seq_lens = Vec::with_capacity(all_ids.len());
 
         for &seq_id in &all_ids {
-            // For now, use token_id = 0 as placeholder (in a real engine
-            // we'd look up the actual last token from the sequence).
-            token_ids.push(0_u32);
+            // Condition the model on the actual current token for this sequence.
+            // For prefill this is the last prompt token; for decode this is
+            // the most recently generated token.
+            token_ids.push(self.scheduler.last_token(seq_id).unwrap_or(0));
 
             let btbl = self
                 .cache_manager
@@ -244,7 +245,12 @@ impl ContinuousBatcher {
                 .collect();
             block_tables.push(btbl);
 
-            let len = self.cache_manager.seq_length(seq_id).unwrap_or(0);
+            // Prefer logical sequence length from scheduler state. Fall back to
+            // cache-manager length when the scheduler no longer tracks the id.
+            let len = self
+                .scheduler
+                .total_len(seq_id)
+                .unwrap_or_else(|| self.cache_manager.seq_length(seq_id).unwrap_or(0));
             seq_lens.push(len);
         }
 
@@ -295,6 +301,7 @@ impl ContinuousBatcher {
 mod tests {
     use super::*;
     use crate::cache::kv_cache::PagedKvCache;
+    use std::cell::Cell;
 
     fn make_batcher() -> ContinuousBatcher {
         let cfg = BatcherConfig::default_test();
@@ -432,5 +439,36 @@ mod tests {
         let out = b.step(greedy_model).unwrap();
         assert!(!out.is_empty());
         assert!(!out[0].output_tokens.is_empty());
+    }
+
+    #[test]
+    fn model_input_uses_last_prompt_token() {
+        let mut b = make_batcher();
+        let params = SamplingParams {
+            max_new_tokens: 1,
+            eos_token_id: Some(1),
+            ..Default::default()
+        };
+        b.add_request(vec![7, 8, 9], params);
+
+        let saw_expected_token = Cell::new(false);
+        let out = b
+            .step(|tokens, _btables, _seq_lens| {
+                if tokens == [9] {
+                    saw_expected_token.set(true);
+                }
+                let mut v = vec![vec![0.0_f32; 256]; tokens.len()];
+                for logits in &mut v {
+                    logits[1] = 10.0;
+                }
+                Ok(v)
+            })
+            .unwrap();
+
+        assert!(
+            saw_expected_token.get(),
+            "expected prompt tail token as model input"
+        );
+        assert_eq!(out.len(), 1);
     }
 }

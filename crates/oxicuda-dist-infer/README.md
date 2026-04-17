@@ -6,6 +6,12 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 
 `oxicuda-dist-infer` (Vol.12) is a production-grade distributed GPU inference engine for large language models. It implements three orthogonal parallelism strategies — tensor parallelism (TP), sequence parallelism (SP), and expert parallelism (EP) — along with a distributed KV cache and affinity-aware request routing to efficiently scale LLM serving across GPU clusters.
 
+## Status
+
+| Version | Tests | Date |
+|---------|-------|------|
+| 0.1.3 | 80 passing | 2026-04-17 |
+
 ## Features
 
 - **Tensor parallelism**: `ColumnLinear` and `RowLinear` shards with all-gather and all-reduce collectives
@@ -22,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-dist-infer = "0.1.2"
+oxicuda-dist-infer = "0.1.3"
 ```
 
 ```rust

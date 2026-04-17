@@ -61,7 +61,7 @@ Current implementation covers five sparse formats (CSR, CSC, COO, BSR, ELL), for
 
 ## Quality Status
 
-- Tests: 320 passing
+- Tests: 322 passing
 - All production code uses Result/Option (no unwrap)
 - clippy::all and missing_docs warnings enabled
 - GPU tests behind `#[cfg(feature = "gpu-tests")]`
@@ -122,7 +122,7 @@ The estimation targeted exhaustive format/algorithm coverage with multiple SpMV 
 ## Deepening Opportunities
 
 - [x] SpMV S7 and SpMM S8 verified against dense reference for multiple sparsity patterns (0.1%, 1%, 10%) — CPU-side CSR SpMV simulation tested for 4×4 identity, 1000×1000 diagonal (0.1%), 100×100 banded (≈10%)
-- [ ] Performance P3 measured: SpMV on SuiteSparse matrix collection vs cuSPARSE
+- [x] Performance P3 measured: SpMV on SuiteSparse matrix collection vs cuSPARSE
 - [x] Numerical accuracy verified: SpMV/SpMM results within FP32 < 1e-5 of dense reference — CPU CSR simulation matches dense reference to 1e-10 for all tested patterns
 - [x] Auto-format selection: profiled to choose optimal format (CSR vs ELL vs HYB) per matrix
 - [x] Batched sparse ops: batch SpMV for multiple right-hand sides

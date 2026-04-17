@@ -837,17 +837,22 @@ fn backward_one(
         }
         GradFn::Conv2d {
             input,
-            col_data: _,
-            weight_data: _,
+            col_data,
+            weight_data,
             input_shape,
-            kernel_size: _,
-            stride: _,
-            padding: _,
+            kernel_size,
+            stride,
+            padding,
         } => {
-            // Simplified: pass gradient through for now
-            let numel: usize = input_shape.iter().product();
-            let da = vec![0.0; numel]; // TODO: full conv2d backward
-            accumulate(grads, *input, &da);
+            backward_conv2d(
+                out_grad,
+                col_data,
+                weight_data,
+                input_shape,
+                (*kernel_size, *stride, *padding),
+                *input,
+                grads,
+            )?;
         }
         GradFn::MaxPool2d {
             input,
@@ -1139,6 +1144,162 @@ fn backward_avg_pool2d(
     accumulate(grads, input_id, &da);
 }
 
+fn backward_conv2d(
+    out_grad: &[f64],
+    col_data: &SavedTensor,
+    weight_data: &SavedTensor,
+    input_shape: &[usize],
+    conv_params: ((usize, usize), (usize, usize), (usize, usize)),
+    input_id: TensorId,
+    grads: &mut HashMap<TensorId, Vec<f64>>,
+) -> Result<(), TensorError> {
+    if input_shape.len() != 4 {
+        return Err(TensorError::AutogradError(
+            "conv2d backward requires 4D input".into(),
+        ));
+    }
+
+    let (kernel_size, stride, padding) = conv_params;
+    let (k_h, k_w) = kernel_size;
+    let (stride_h, stride_w) = stride;
+    let (pad_h, pad_w) = padding;
+    if stride_h == 0 || stride_w == 0 {
+        return Err(TensorError::AutogradError(
+            "conv2d backward requires non-zero stride".into(),
+        ));
+    }
+
+    let n = input_shape[0];
+    let c_in = input_shape[1];
+    let h = input_shape[2];
+    let w = input_shape[3];
+    let col_rows = c_in
+        .checked_mul(k_h)
+        .and_then(|v| v.checked_mul(k_w))
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward shape overflow".into()))?;
+    let padded_h =
+        h.checked_add(pad_h.checked_mul(2).ok_or_else(|| {
+            TensorError::AutogradError("conv2d backward padding overflow".into())
+        })?)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward padding overflow".into()))?;
+    let padded_w =
+        w.checked_add(pad_w.checked_mul(2).ok_or_else(|| {
+            TensorError::AutogradError("conv2d backward padding overflow".into())
+        })?)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward padding overflow".into()))?;
+    if padded_h < k_h || padded_w < k_w {
+        return Err(TensorError::AutogradError(
+            "conv2d backward kernel larger than padded input".into(),
+        ));
+    }
+
+    let out_h = (padded_h - k_h) / stride_h + 1;
+    let out_w = (padded_w - k_w) / stride_w + 1;
+    let col_cols = out_h
+        .checked_mul(out_w)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward shape overflow".into()))?;
+    let patch_count = n
+        .checked_mul(col_cols)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward shape overflow".into()))?;
+
+    if col_data.shape.len() != 3
+        || col_data.shape[0] != n
+        || col_data.shape[1] != col_rows
+        || col_data.shape[2] != col_cols
+    {
+        return Err(TensorError::AutogradError(
+            "conv2d backward saved im2col shape mismatch".into(),
+        ));
+    }
+    let expected_col_len = patch_count
+        .checked_mul(col_rows)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward shape overflow".into()))?;
+    if col_data.data.len() != expected_col_len {
+        return Err(TensorError::AutogradError(
+            "conv2d backward saved im2col data mismatch".into(),
+        ));
+    }
+
+    let c_out = weight_data
+        .data
+        .len()
+        .checked_div(col_rows)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward invalid weight shape".into()))?;
+    if c_out == 0 || weight_data.data.len() != c_out * col_rows {
+        return Err(TensorError::AutogradError(
+            "conv2d backward invalid weight shape".into(),
+        ));
+    }
+
+    let expected_out_grad = patch_count
+        .checked_mul(c_out)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward shape overflow".into()))?;
+    if out_grad.len() != expected_out_grad {
+        return Err(TensorError::AutogradError(
+            "conv2d backward output gradient shape mismatch".into(),
+        ));
+    }
+
+    let numel = n
+        .checked_mul(c_in)
+        .and_then(|v| v.checked_mul(h))
+        .and_then(|v| v.checked_mul(w))
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward shape overflow".into()))?;
+    let max_h = pad_h
+        .checked_add(h)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward shape overflow".into()))?;
+    let max_w = pad_w
+        .checked_add(w)
+        .ok_or_else(|| TensorError::AutogradError("conv2d backward shape overflow".into()))?;
+
+    let mut d_col = vec![0.0; expected_col_len];
+    for batch in 0..n {
+        for patch in 0..col_cols {
+            let patch_idx = batch * col_cols + patch;
+            for kc in 0..col_rows {
+                let mut sum = 0.0;
+                for co in 0..c_out {
+                    let out_idx = (batch * c_out + co) * col_cols + patch;
+                    sum += out_grad[out_idx] * weight_data.data[co * col_rows + kc];
+                }
+                d_col[patch_idx * col_rows + kc] = sum;
+            }
+        }
+    }
+
+    let mut da = vec![0.0; numel];
+    for patch_idx in 0..patch_count {
+        let batch = patch_idx / col_cols;
+        let patch = patch_idx % col_cols;
+        let oh = patch / out_w;
+        let ow = patch % out_w;
+        for c in 0..c_in {
+            for kh_idx in 0..k_h {
+                for kw_idx in 0..k_w {
+                    let ih_padded = oh * stride_h + kh_idx;
+                    let iw_padded = ow * stride_w + kw_idx;
+                    if ih_padded < pad_h
+                        || ih_padded >= max_h
+                        || iw_padded < pad_w
+                        || iw_padded >= max_w
+                    {
+                        continue;
+                    }
+
+                    let ih = ih_padded - pad_h;
+                    let iw = iw_padded - pad_w;
+                    let kc = c * k_h * k_w + kh_idx * k_w + kw_idx;
+                    let input_idx = ((batch * c_in + c) * h + ih) * w + iw;
+                    da[input_idx] += d_col[patch_idx * col_rows + kc];
+                }
+            }
+        }
+    }
+
+    accumulate(grads, input_id, &da);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn backward_group_norm(
     out_grad: &[f64],
@@ -1245,6 +1406,7 @@ impl Default for GradientCheckpointing {
 mod tests {
     use super::*;
     use crate::tensor_backend::dtype::TensorDtype;
+    use crate::tensor_backend::ops::conv2d;
 
     #[test]
     fn test_no_grad_context() {
@@ -1486,5 +1648,38 @@ mod tests {
             assert!((g.host_data()[1] - 1.0).abs() < 1e-10); // 2 -> 1
             assert!((g.host_data()[2] - 0.0).abs() < 1e-10); // 0 -> 0
         }
+    }
+
+    #[test]
+    fn conv2d_backward_col2im_correctness() {
+        let mut tape = AutogradTape::new();
+        let mut input = GpuTensor::from_host_f64(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            &[1, 1, 3, 3],
+            0,
+        )
+        .unwrap();
+        input.set_requires_grad(true);
+        let weight = GpuTensor::from_host_f64(&[1.0, 1.0, 1.0, 1.0], &[1, 1, 2, 2], 0).unwrap();
+
+        let output = conv2d(&input, &weight, None, (1, 1), (0, 0), Some(&mut tape)).unwrap();
+        let input_id = input.id();
+        let output_id = output.id();
+
+        let mut tensors = HashMap::new();
+        tensors.insert(input_id, input);
+        tensors.insert(output_id, output);
+
+        tape.backward(output_id, &mut tensors).unwrap();
+
+        let input_grad = tensors
+            .get(&input_id)
+            .and_then(GpuTensor::grad)
+            .map(|grad| grad.host_data().to_vec())
+            .unwrap();
+        assert_eq!(
+            input_grad,
+            vec![1.0, 2.0, 1.0, 2.0, 4.0, 2.0, 1.0, 2.0, 1.0]
+        );
     }
 }

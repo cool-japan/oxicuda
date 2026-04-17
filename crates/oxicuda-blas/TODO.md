@@ -170,10 +170,10 @@ complete API surface with PTX generation delegated to oxicuda-ptx.
 | G8 | Split-K GEMM — correctness and performance for K-heavy shapes | P1 | [x] |
 | G9 | BLAS Level 1: axpy, dot, nrm2, scal, asum, iamax | P0 | [x] |
 | G10 | BLAS Level 2: gemv, trsv | P0 | [x] |
-| G11 | BLAS Level 3: symm, trsm, syrk | P1 | [ ] Verify |
-| G12 | Elementwise ops: relu, gelu, sigmoid, silu, tanh | P0 | [ ] Verify |
-| G13 | Reductions: sum, max, softmax | P0 | [ ] Verify |
-| G14 | Epilogue fusion: LinearCombination, LinearCombinationRelu, LinearCombinationGelu | P0 | [ ] Verify |
+| G11 | BLAS Level 3: symm, trsm, syrk | P1 | [x] |
+| G12 | Elementwise ops: relu, gelu, sigmoid, silu, tanh | P0 | [x] |
+| G13 | Reductions: sum, max, softmax | P0 | [x] |
+| G14 | Epilogue fusion: LinearCombination, LinearCombinationRelu, LinearCombinationGelu | P0 | [x] |
 
 ### Performance Requirements
 

@@ -66,7 +66,7 @@ Current implementation covers the core FFT pipeline: plan creation, Stockham ker
 
 ## Quality Status
 
-- Tests: 295 passing
+- Tests: 314 passing
 - All production code uses Result/Option (no unwrap)
 - clippy::all and missing_docs warnings enabled
 - GPU tests behind `#[cfg(feature = "gpu-tests")]`
@@ -128,7 +128,7 @@ where ε_machine = 1.19e-7 for FP32, 2.22e-16 for FP64.
 
 ### Hopper (sm_90)
 - [x] TMA-based data loading for large FFT N > 64K
-- [ ] Multi-GPU FFT via NVLink with overlapping compute/transfer
+- [x] Multi-GPU FFT via NVLink with overlapping compute/transfer
 
 ---
 

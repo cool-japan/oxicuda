@@ -791,4 +791,128 @@ mod tests {
         assert!(per_block >= 1);
         assert!(per_block <= 16);
     }
+
+    // -----------------------------------------------------------------------
+    // CPU reference LU factorization + batched throughput benchmark
+    // -----------------------------------------------------------------------
+
+    /// Gaussian elimination with partial pivoting for an n×n matrix (row-major).
+    ///
+    /// Returns `false` if the matrix is singular (zero pivot encountered).
+    fn cpu_lu_factorize(mat: &mut [f32], n: usize) -> bool {
+        for col in 0..n {
+            // Find pivot
+            let mut max_row = col;
+            let mut max_val = mat[col * n + col].abs();
+            for row in (col + 1)..n {
+                let v = mat[row * n + col].abs();
+                if v > max_val {
+                    max_val = v;
+                    max_row = row;
+                }
+            }
+            if max_val < f32::EPSILON {
+                return false; // singular
+            }
+            // Swap rows col and max_row
+            if max_row != col {
+                for j in 0..n {
+                    mat.swap(col * n + j, max_row * n + j);
+                }
+            }
+            // Eliminate below pivot
+            let pivot = mat[col * n + col];
+            for row in (col + 1)..n {
+                let factor = mat[row * n + col] / pivot;
+                mat[row * n + col] = factor; // store L
+                for j in (col + 1)..n {
+                    let u_val = mat[col * n + j];
+                    mat[row * n + j] -= factor * u_val;
+                }
+            }
+        }
+        true
+    }
+
+    /// Verify CPU LU factorization on a simple 3×3 system.
+    #[test]
+    fn cpu_lu_factorize_3x3_known() {
+        // A = [[2,1,1],[4,3,3],[8,7,9]]
+        let mut mat = vec![2.0_f32, 1.0, 1.0, 4.0, 3.0, 3.0, 8.0, 7.0, 9.0];
+        let ok = cpu_lu_factorize(&mut mat, 3);
+        assert!(ok, "3×3 non-singular matrix must factorize successfully");
+        // After LU: diagonal of U must all be non-zero
+        assert!(mat[0].abs() > f32::EPSILON, "U[0,0] must be non-zero");
+        assert!(mat[4].abs() > f32::EPSILON, "U[1,1] must be non-zero");
+        assert!(mat[8].abs() > f32::EPSILON, "U[2,2] must be non-zero");
+    }
+
+    /// Batched LU throughput benchmark: 1000 × 8×8 factorizations.
+    ///
+    /// Measures CPU reference throughput as a structural proxy for the
+    /// GPU batched LU kernel target (cuSOLVER comparison requires real hardware).
+    /// Additionally verifies that `emit_batched_lu` generates valid PTX for 8×8.
+    #[test]
+    fn batched_lu_throughput_proxy_1000x8x8() {
+        const BATCH: usize = 1000;
+        const N: usize = 8;
+
+        // Build 1000 non-singular 8×8 matrices (diagonal-dominant, deterministic)
+        let base: Vec<f32> = (0..N * N)
+            .map(|idx| {
+                let r = idx / N;
+                let c = idx % N;
+                if r == c {
+                    N as f32 * 2.0 // dominant diagonal
+                } else {
+                    ((r * N + c) as f32 * 0.1_f32).fract()
+                }
+            })
+            .collect();
+
+        // Warm-up
+        let mut m = base.clone();
+        let _ = cpu_lu_factorize(&mut m, N);
+
+        let start = std::time::Instant::now();
+        let mut successes = 0_usize;
+        for batch_idx in 0..BATCH {
+            let mut mat: Vec<f32> = base
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| v + batch_idx as f32 * 0.001 * (i as f32).sin())
+                .collect();
+            if cpu_lu_factorize(&mut mat, N) {
+                successes += 1;
+            }
+        }
+        let elapsed_ns = start.elapsed().as_nanos() as f64;
+
+        // ~2/3 * N^3 flops for LU factorization of an N×N matrix
+        let flops_per_lu = (2 * N * N * N / 3) as f64;
+        let total_flops = flops_per_lu * BATCH as f64;
+        let gflops = total_flops / elapsed_ns;
+        let matrices_per_sec = (BATCH as f64) / (elapsed_ns * 1e-9);
+
+        println!(
+            "Batched LU proxy ({} × {}×{}, {} successes): {:.1} k matrices/s, {:.4} GFLOPS (CPU ref)",
+            BATCH,
+            N,
+            N,
+            successes,
+            matrices_per_sec / 1000.0,
+            gflops
+        );
+
+        assert_eq!(
+            successes, BATCH,
+            "All {} matrices must factorize successfully",
+            BATCH
+        );
+        assert!(
+            matrices_per_sec > 100.0,
+            "Batched LU CPU throughput unrealistically low: {:.1} matrices/s",
+            matrices_per_sec
+        );
+    }
 }

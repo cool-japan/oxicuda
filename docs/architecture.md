@@ -44,12 +44,14 @@ driver symbols — no CUDA SDK, no `nvcc`, no C toolchain required at compile ti
 
 **Project statistics (v0.1.0, 2026-04-11)**
 
+**Project statistics (v0.1.2, 2026-04-14)**
+
 | Metric | Value |
 |--------|-------|
-| Workspace crates | 18 (16 library + 1 umbrella + 1 backend trait) |
-| Rust source files | 518 |
-| Source lines of code | 183,575 SLoC |
-| Test cases | 5,139 passing |
+| Workspace crates | 28 (27 library crates + 1 umbrella) |
+| Rust source files | 755 |
+| Source lines of code | 253,125 SLoC |
+| Test cases | 7,263 passing, 2 skipped (GPU-only on macOS) |
 | Compiler warnings | 0 |
 | Clippy warnings | 0 |
 | `unwrap()` calls | 0 |
@@ -60,6 +62,9 @@ driver symbols — no CUDA SDK, no `nvcc`, no C toolchain required at compile ti
 ## Crate Dependency Graph
 
 OxiCUDA is organized into five volumes of increasing abstraction, plus an umbrella
+crate and a set of alternative compute backends.
+
+OxiCUDA is organized into **ten volumes** of increasing abstraction, plus an umbrella
 crate and a set of alternative compute backends.
 
 ```
@@ -91,49 +96,127 @@ Alternative compute backends (feature-gated):
   oxicuda-rocm       (AMD HIP runtime)
   oxicuda-levelzero  (Intel oneAPI / Level Zero)
 ```
+                    ```
+                          oxicuda  (umbrella)
+                              │
+                         ┌──────────────────────┼──────────────────────────┐
+                         │                      │                          │
+                      oxicuda-lm         oxicuda-infer           oxicuda-dist-infer   (Vol.9 Inference)
+                      oxicuda-rl         oxicuda-train           oxicuda-quant        (Vol.8/10)
+                      oxicuda-graph      oxicuda-signal                               (Vol.6/7)
+                         │                      │                          │
+                      oxicuda-blas        oxicuda-dnn            oxicuda-fft
+                      oxicuda-sparse      oxicuda-solver         oxicuda-rand          (Vol.3-5)
+                         │                      │                          │
+                         └──────────────────────┴──────────────────────────┘
+                              │
+                            oxicuda-autotune
+                              │
+                              oxicuda-ptx
+                              │
+                            oxicuda-launch
+                              │
+                            oxicuda-memory
+                              │
+                            oxicuda-driver
+                              │
+                           oxicuda-backend + oxicuda-primitives  (trait + GPU primitives)
+
+                    Alternative compute backends (feature-gated):
+                      oxicuda-vulkan     (Vulkan Compute / SPIR-V)
+                      oxicuda-metal      (Apple Metal, macOS)
+                      oxicuda-webgpu     (wgpu / WebGPU / WASM)
+                      oxicuda-rocm       (AMD HIP runtime)
+                      oxicuda-levelzero  (Intel oneAPI / Level Zero)
+                    ```
 
 ### Vol.1 — Foundation
 
 | Crate | SLoC | Role |
 |-------|------|------|
 | `oxicuda-backend` | — | `ComputeBackend` trait definition |
-| `oxicuda-driver` | 8,970 | Runtime CUDA driver loader, context/stream/event management |
-| `oxicuda-memory` | 4,081 | Typed GPU allocations, host-pinned buffers, unified memory |
-| `oxicuda-launch` | 4,161 | Kernel launch DSL, `launch!` macro, cooperative/cluster launch |
+| `oxicuda-driver` | 11,601 | Runtime CUDA driver loader, context/stream/event/graph management |
+| `oxicuda-memory` | 4,178 | Typed GPU allocations, host-pinned buffers, unified memory, virtual mem |
+| `oxicuda-launch` | 4,728 | Kernel launch DSL, `launch!` macro, cooperative/cluster/graph launch |
+| `oxicuda-runtime` | 2,518 | High-level CUDA Runtime API layer |
 
 ### Vol.2 — PTX Generator & Autotuner
 
 | Crate | SLoC | Role |
 |-------|------|------|
-| `oxicuda-ptx` | 24,828 | PTX IR, builder DSL, templates, analysis passes, emitter |
-| `oxicuda-autotune` | 13,039 | Search-space exploration, Bayesian/genetic/SA strategies, result DB |
+| `oxicuda-ptx` | 29,438 | PTX IR, builder DSL, templates, analysis passes, emitter, PTX cache |
+| `oxicuda-autotune` | 13,916 | Search-space exploration, Bayesian/genetic/SA strategies, result DB |
 
 ### Vol.3 — Linear Algebra (cuBLAS)
 
 | Crate | SLoC | Role |
 |-------|------|------|
-| `oxicuda-blas` | 19,913 | BLAS L1/L2/L3, GEMM dispatch, Tensor Core paths, batched ops |
+| `oxicuda-blas` | 21,845 | BLAS L1/L2/L3, GEMM dispatch, Tensor Core paths, batched ops, FP8/INT4 |
 
 ### Vol.4 — Deep Learning (cuDNN)
 
 | Crate | SLoC | Role |
 |-------|------|------|
-| `oxicuda-dnn` | 31,293 | Convolution, attention, normalization, pooling, quantization, MoE |
+| `oxicuda-dnn` | 34,711 | Convolution, FlashAttention-2/3, normalization, pooling, quantization, MoE |
 
 ### Vol.5 — Scientific Computing
 
 | Crate | SLoC | Role |
 |-------|------|------|
-| `oxicuda-fft` | 8,853 | Multi-radix FFT, 1D/2D/3D, batched, multi-GPU |
-| `oxicuda-sparse` | 11,021 | CSR/CSC/COO/BSR/ELL/CSR5, SpMV/SpMM/SpGEMM, iterative solvers |
-| `oxicuda-solver` | 13,981 | Dense LU/QR/SVD/Cholesky, iterative CG/GMRES, sparse direct |
-| `oxicuda-rand` | 9,064 | Philox/XORWOW/MRG32k3a RNG engines, distributions, quasi-random |
+| `oxicuda-fft` | 9,749 | Multi-radix FFT, 1D/2D/3D, batched, pruned FFT, multi-GPU |
+| `oxicuda-sparse` | 12,278 | CSR/CSC/COO/BSR/ELL/CSR5/HYB, SpMV/SpMM/SpGEMM/SDDMM, preconditioners |
+| `oxicuda-solver` | 15,804 | Dense LU/QR/SVD/Cholesky, iterative CG/BiCGSTAB/GMRES, tensor decomp |
+| `oxicuda-rand` | 10,115 | Philox/XORWOW/MRG32k3a/Sobol engines, distributions, Monte Carlo |
+
+### Vol.6 — Signal Processing
+
+| Crate | SLoC | Role |
+|-------|------|------|
+| `oxicuda-signal` | 6,061 | MFCC/STFT/Mel, Gaussian blur/Sobel/morphology, DCT I-IV, DWT, IIR/FIR |
+
+### Vol.7 — Computation Graph
+
+| Crate | SLoC | Role |
+|-------|------|------|
+| `oxicuda-graph` | 4,802 | CUDA Graph capture, dependency-sorted execution, event synchronization |
+
+### Vol.8 — GPU Training
+
+| Crate | SLoC | Role |
+|-------|------|------|
+| `oxicuda-train` | 5,927 | AMP (FP16/BF16 + loss scaling), gradient accumulation, LR schedulers, GPU-fused optimizers |
+| `oxicuda-quant` | 4,317 | INT8/INT4/FP8 weight quantization, block-scaled FP4, GPTQ-style PTQ |
+
+### Vol.9 — Inference Engine
+
+| Crate | SLoC | Role |
+|-------|------|------|
+| `oxicuda-infer` | 4,256 | PagedKvCache, prefix caching, speculative decoding, continuous batching |
+| `oxicuda-dist-infer` | 3,279 | Distributed inference (tensor/pipeline parallelism), all-reduce |
+| `oxicuda-lm` | 4,394 | BPE tokenizer, vocabulary management, sampling strategies |
+
+### Vol.10 — Reinforcement Learning
+
+| Crate | SLoC | Role |
+|-------|------|------|
+| `oxicuda-rl` | 4,522 | Replay buffers (Uniform/PER/N-step), policy distributions, GAE/TD-λ/PPO/SAC |
+
+### Backends & Primitives
+
+| Crate | SLoC | Role |
+|-------|------|------|
+| `oxicuda-primitives` | 4,372 | CUB-equivalent: block reduce/scan/sort, warp ops, histogram |
+| `oxicuda-vulkan` | 1,445 | Vulkan Compute / SPIR-V backend |
+| `oxicuda-metal` | 1,186 | Apple Metal compute backend (macOS/iOS) |
+| `oxicuda-webgpu` | 1,108 | WebGPU / wgpu backend (browser + WASM) |
+| `oxicuda-rocm` | 1,087 | AMD ROCm / HIP backend |
+| `oxicuda-levelzero` | 1,765 | Intel oneAPI Level Zero backend |
 
 ### Umbrella
 
 | Crate | SLoC | Role |
 |-------|------|------|
-| `oxicuda` | 18,764 | Re-exports, global init, NCCL-equivalent collectives, OxiONNX backend, ToRSh/TrustformeRS GPU backend |
+| `oxicuda` | 19,614 | Re-exports, global init, multi-GPU device pool, NCCL-equivalent collectives, OxiONNX/ToRSh/TrustformeRS ecosystem backends |
 
 ---
 

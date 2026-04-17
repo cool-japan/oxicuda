@@ -22,6 +22,8 @@
 //! computed by independent thread blocks (concurrently on GPU).
 
 use crate::{
+    dwt::biorthogonal::{bior_forward, bior_inverse},
+    dwt::coiflet::{coif_forward, coif_inverse},
     dwt::daubechies::{db_forward, db_inverse},
     dwt::haar::{haar_forward, haar_inverse},
     dwt::sym::sym_forward,
@@ -149,11 +151,8 @@ fn single_level_forward(x: &[f64], family: WaveletFamily) -> SignalResult<(Vec<f
         }
         WaveletFamily::Daubechies(order) => db_forward(x, order),
         WaveletFamily::Symlet(order) => sym_forward(x, order),
-        WaveletFamily::Coiflet(_) | WaveletFamily::Biorthogonal(_, _) => {
-            Err(SignalError::UnsupportedPlatform(
-                "Coiflet and Biorthogonal wavelets are not yet implemented".to_owned(),
-            ))
-        }
+        WaveletFamily::Coiflet(order) => coif_forward(x, order),
+        WaveletFamily::Biorthogonal(p, q) => bior_forward(x, p, q),
     }
 }
 
@@ -202,11 +201,8 @@ fn single_level_inverse(
             }
             Ok(out)
         }
-        WaveletFamily::Coiflet(_) | WaveletFamily::Biorthogonal(_, _) => {
-            Err(SignalError::UnsupportedPlatform(
-                "Coiflet and Biorthogonal wavelets are not yet implemented".to_owned(),
-            ))
-        }
+        WaveletFamily::Coiflet(order) => coif_inverse(approx, detail, order),
+        WaveletFamily::Biorthogonal(p, q) => bior_inverse(approx, detail, p, q),
     }
 }
 

@@ -74,6 +74,14 @@ use oxicuda_solver::prelude::*;
 | `f16`            | Half-precision (fp16) solver support     |
 | `sparse-solvers` | Enable sparse iterative solvers (pulls in `oxicuda-sparse`) |
 
+## Status
+
+| Metric | Value |
+|--------|-------|
+| Version | 0.1.3 |
+| Tests passing | 387 |
+| Release date | 2026-04-17 |
+
 ## License
 
 Apache-2.0 -- (C) 2026 COOLJAPAN OU (Team KitaSan)

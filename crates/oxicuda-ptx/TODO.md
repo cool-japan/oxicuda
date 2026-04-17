@@ -104,7 +104,7 @@ The PTX crate is the largest in Vol.1+2 and the core differentiator of OxiCUDA. 
 ## Quality Status
 
 - Warnings: 0
-- Tests: 873 passing
+- Tests: 880 passing
 - unwrap() calls: 0
 - Clippy: clean (pedantic + nursery)
 - `#![deny(unsafe_code)]` -- entire crate is safe Rust
@@ -194,7 +194,7 @@ PTX generation is CPU-bound and should be fast enough for JIT scenarios:
 - [x] All SM versions (sm_75 through sm_120) generate valid PTX with correct .target and .version (P8, 21 tests)
 - [x] FP8 type gating: sm<89 cannot emit FP8 parameters
 - [x] PTX .address_size 64 present for all SM versions
-- [ ] GEMM template numerical output matches cuBLAS reference within precision tolerance
+- [x] GEMM template numerical output matches cuBLAS reference within precision tolerance
 - [x] Elementwise template `relu/sigmoid/gelu/tanh` precision vs CPU reference < 1 ULP for f32
 
 ### Code Quality

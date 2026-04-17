@@ -6,6 +6,12 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 
 `oxicuda-lm` provides the model-layer abstractions for LLM inference: a BPE tokenizer, transformer layer building blocks with incremental KV-cache support, and complete GPT-2 and LLaMA-2/3 model implementations. All forward passes are pure-Rust CPU reference implementations suitable for testing; GPU acceleration is provided by the included PTX kernel strings once a CUDA driver is available at runtime.
 
+## Status
+
+| Version | Tests | Date |
+|---------|-------|------|
+| 0.1.3 | 182 passing | 2026-04-17 |
+
 ## Features
 
 - **BPE tokenizer**: `BpeBuilder` / `BpeTokenizer` with full encode/decode round-trip and special-token support
@@ -21,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-lm = "0.1.2"
+oxicuda-lm = "0.1.3"
 ```
 
 ```rust

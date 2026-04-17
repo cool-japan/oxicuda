@@ -535,6 +535,145 @@ extern "C" __global__ void elementwise_f16(
     )
 }
 
+// ─── Wave-size-aware GEMM ─────────────────────────────────────────────────────
+
+/// AMD GCN / RDNA wavefront size: 64 threads (legacy GCN, Vega, CDNA).
+pub const WAVE_SIZE_64: u32 = 64;
+
+/// AMD RDNA2+ wavefront size: 32 threads (Navi2x, Navi3x, RDNA2/3).
+pub const WAVE_SIZE_32: u32 = 32;
+
+/// Detected AMD wave size variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveSize {
+    /// 64-thread wavefronts (Vega, MI-series CDNA).
+    Wave64,
+    /// 32-thread wavefronts (RDNA2, RDNA3 consumer GPUs).
+    Wave32,
+}
+
+impl WaveSize {
+    /// Heuristically detect the wave size from an `hipGetDeviceProperties`
+    /// device name string.
+    ///
+    /// Returns [`WaveSize::Wave64`] for Vega / MI-series identifiers, and
+    /// [`WaveSize::Wave32`] for RDNA2+ (gfx1xxx) identifiers.  When the
+    /// architecture is unknown the default is [`WaveSize::Wave64`].
+    pub fn detect(device_name: &str) -> WaveSize {
+        let name = device_name.to_ascii_lowercase();
+        // RDNA2+ devices usually advertise gfx10xx or gfx11xx ISA names,
+        // or consumer names "RX 6xxx" / "RX 7xxx".
+        if name.contains("gfx10")
+            || name.contains("gfx11")
+            || name.contains("navi")
+            || name.contains("rx 6")
+            || name.contains("rx 7")
+            || name.contains("rdna")
+        {
+            WaveSize::Wave32
+        } else {
+            WaveSize::Wave64
+        }
+    }
+
+    /// Return the integer wavefront width.
+    pub fn width(self) -> u32 {
+        match self {
+            WaveSize::Wave64 => WAVE_SIZE_64,
+            WaveSize::Wave32 => WAVE_SIZE_32,
+        }
+    }
+}
+
+/// HIP C++ source for a wave-64 optimised GEMM kernel.
+///
+/// Uses `__attribute__((amdgpu_waves_per_eu(4)))` and a 64-thread
+/// `reqd_work_group_size` hint for GCN / CDNA wavefront scheduling.
+///
+/// Grid: `dim3((n+63)/64, (m+1)/2)`, Block: `dim3(64, 2)`.
+pub fn gemm_hip_wave64(tile_size: u32) -> String {
+    format!(
+        r#"
+extern "C"
+__attribute__((amdgpu_waves_per_eu(4)))
+__attribute__((reqd_work_group_size(64, 1, 1)))
+__global__ void gemm_f32_wave64(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float*       __restrict__ c,
+    unsigned int m,
+    unsigned int n,
+    unsigned int k,
+    float alpha,
+    float beta
+) {{
+    unsigned int row = hipBlockIdx_y * {ts} + hipThreadIdx_y;
+    unsigned int col = hipBlockIdx_x * 64 + hipThreadIdx_x;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    for (unsigned int i = 0; i < k; ++i) {{
+        acc += a[row * k + i] * b[i * n + col];
+    }}
+
+    unsigned int idx = row * n + col;
+    c[idx] = alpha * acc + beta * c[idx];
+}}
+"#,
+        ts = tile_size,
+    )
+}
+
+/// HIP C++ source for a wave-32 optimised GEMM kernel.
+///
+/// Uses `__attribute__((amdgpu_waves_per_eu(8)))` and a 32-thread
+/// `reqd_work_group_size` hint for RDNA2+ wavefront scheduling.
+///
+/// Grid: `dim3((n+31)/32, (m+1)/2)`, Block: `dim3(32, 2)`.
+pub fn gemm_hip_wave32(tile_size: u32) -> String {
+    format!(
+        r#"
+extern "C"
+__attribute__((amdgpu_waves_per_eu(8)))
+__attribute__((reqd_work_group_size(32, 1, 1)))
+__global__ void gemm_f32_wave32(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float*       __restrict__ c,
+    unsigned int m,
+    unsigned int n,
+    unsigned int k,
+    float alpha,
+    float beta
+) {{
+    unsigned int row = hipBlockIdx_y * {ts} + hipThreadIdx_y;
+    unsigned int col = hipBlockIdx_x * 32 + hipThreadIdx_x;
+    if (row >= m || col >= n) return;
+
+    float acc = 0.0f;
+    for (unsigned int i = 0; i < k; ++i) {{
+        acc += a[row * k + i] * b[i * n + col];
+    }}
+
+    unsigned int idx = row * n + col;
+    c[idx] = alpha * acc + beta * c[idx];
+}}
+"#,
+        ts = tile_size,
+    )
+}
+
+/// Return the wave-size-appropriate GEMM kernel source for `device_name`.
+///
+/// Detects whether the device uses 64- or 32-thread wavefronts and returns
+/// the matching kernel source.  Falls back to wave-64 for unknown devices.
+pub fn gemm_hip_waveaware(device_name: &str, tile_size: u32) -> String {
+    match WaveSize::detect(device_name) {
+        WaveSize::Wave32 => gemm_hip_wave32(tile_size),
+        WaveSize::Wave64 => gemm_hip_wave64(tile_size),
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -785,5 +924,56 @@ mod tests {
         // Unknown op is identity.
         let unknown = elementwise_hip_f16("unknown_op");
         assert!(unknown.contains("__float2half(x)"));
+    }
+
+    // ── Wave-size detection ───────────────────────────────────────────────
+
+    #[test]
+    fn wave_size_detect_rdna() {
+        assert_eq!(WaveSize::detect("AMD Radeon RX 6700 XT"), WaveSize::Wave32);
+        assert_eq!(WaveSize::detect("gfx1030"), WaveSize::Wave32);
+        assert_eq!(WaveSize::detect("Navi 23"), WaveSize::Wave32);
+        assert_eq!(WaveSize::detect("RDNA 3 gfx1100"), WaveSize::Wave32);
+    }
+
+    #[test]
+    fn wave_size_detect_gcn_cdna() {
+        assert_eq!(WaveSize::detect("Vega 20"), WaveSize::Wave64);
+        assert_eq!(WaveSize::detect("AMD Instinct MI250X"), WaveSize::Wave64);
+        assert_eq!(WaveSize::detect("gfx906"), WaveSize::Wave64);
+        assert_eq!(WaveSize::detect("Unknown GPU"), WaveSize::Wave64);
+    }
+
+    #[test]
+    fn wave_size_width() {
+        assert_eq!(WaveSize::Wave64.width(), 64);
+        assert_eq!(WaveSize::Wave32.width(), 32);
+    }
+
+    #[test]
+    fn gemm_wave64_kernel_attributes() {
+        let src = gemm_hip_wave64(16);
+        assert!(src.contains("__global__"));
+        assert!(src.contains("gemm_f32_wave64"));
+        assert!(src.contains("amdgpu_waves_per_eu(4)"));
+        assert!(src.contains("reqd_work_group_size(64"));
+    }
+
+    #[test]
+    fn gemm_wave32_kernel_attributes() {
+        let src = gemm_hip_wave32(16);
+        assert!(src.contains("__global__"));
+        assert!(src.contains("gemm_f32_wave32"));
+        assert!(src.contains("amdgpu_waves_per_eu(8)"));
+        assert!(src.contains("reqd_work_group_size(32"));
+    }
+
+    #[test]
+    fn gemm_waveaware_selects_correct_variant() {
+        let rdna = gemm_hip_waveaware("RX 6700 XT", 16);
+        assert!(rdna.contains("gemm_f32_wave32"));
+
+        let cdna = gemm_hip_waveaware("MI250X", 16);
+        assert!(cdna.contains("gemm_f32_wave64"));
     }
 }

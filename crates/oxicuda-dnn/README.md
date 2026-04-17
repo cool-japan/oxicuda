@@ -131,6 +131,16 @@ Convolution forward aims for 90% of cuDNN throughput on common CNN shapes
 (ResNet-50, EfficientNet). FlashAttention-2 targets parity with the reference
 Tri Dao kernel at sequence lengths 512--8192.
 
+## Status
+
+| Item | Value |
+|------|-------|
+| Version | 0.1.3 |
+| Release date | 2026-04-17 |
+| Tests | 960 passing |
+| Warnings | 0 (clippy clean) |
+| `unwrap()` | 0 (production code) |
+
 ## License
 
 Apache-2.0 -- (C) 2026 COOLJAPAN OU (Team KitaSan)

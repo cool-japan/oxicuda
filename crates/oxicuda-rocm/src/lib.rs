@@ -12,7 +12,10 @@ pub mod backend;
 pub mod device;
 pub mod error;
 pub mod hip_kernels;
+pub mod hipblas;
+pub mod hiprtc;
 pub mod memory;
+pub mod multi_device;
 
 pub use backend::RocmBackend;
 pub use error::{RocmError, RocmResult};

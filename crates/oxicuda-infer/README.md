@@ -6,6 +6,12 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 
 `oxicuda-infer` (Vol.11) is a production-grade GPU inference engine for large language models built on the OxiCUDA stack. It implements the core algorithms for efficient LLM serving: PagedAttention KV cache, continuous batching, speculative decoding, beam search, and a rich sampling suite — all in pure Rust with no CUDA SDK dependency at compile time.
 
+## Status
+
+| Version | Tests | Date |
+|---------|-------|------|
+| 0.1.3 | 139 passing | 2026-04-17 |
+
 ## Features
 
 - **PagedAttention** (Kwon et al., 2023): fixed-size physical KV blocks with per-sequence block tables for non-contiguous allocation and O(1) prefix sharing
@@ -21,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-infer = "0.1.2"
+oxicuda-infer = "0.1.3"
 ```
 
 ```rust

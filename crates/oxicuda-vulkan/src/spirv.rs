@@ -719,6 +719,23 @@ pub fn reduce_compute_shader(op: ReduceOp) -> Vec<u32> {
     let (_, _, output_var) = emit_float_ssbo(&mut m, &b, 1);
     let (_, _, params_var) = emit_uint_ssbo(&mut m, &b, 2);
 
+    let c_uint_2 = m.alloc_id();
+    m.emit_constant_u32(b.ty_uint, c_uint_2, 2);
+
+    let init_val = match op {
+        ReduceOp::Sum | ReduceOp::Mean => b.c_float_0,
+        ReduceOp::Max => {
+            let neg_inf = m.alloc_id();
+            m.emit_constant_f32(b.ty_float, neg_inf, f32::NEG_INFINITY);
+            neg_inf
+        }
+        ReduceOp::Min => {
+            let pos_inf = m.alloc_id();
+            m.emit_constant_f32(b.ty_float, pos_inf, f32::INFINITY);
+            pos_inf
+        }
+    };
+
     let label_entry = m.alloc_id();
     let label_bounds_body = m.alloc_id();
     let label_bounds_merge = m.alloc_id();
@@ -734,8 +751,6 @@ pub fn reduce_compute_shader(op: ReduceOp) -> Vec<u32> {
 
     let outer_size = load_param_uint(&mut m, &b, params_var, b.c_uint_0);
     let reduce_size = load_param_uint(&mut m, &b, params_var, b.c_uint_1);
-    let c_uint_2 = m.alloc_id();
-    m.emit_constant_u32(b.ty_uint, c_uint_2, 2);
     let inner_size = load_param_uint(&mut m, &b, params_var, c_uint_2);
 
     let total_output = m.alloc_id();
@@ -767,20 +782,6 @@ pub fn reduce_compute_shader(op: ReduceOp) -> Vec<u32> {
 
     let var_acc = m.alloc_id();
     m.emit_variable(b.ty_ptr_func_float, var_acc, STORAGE_CLASS_FUNCTION);
-
-    let init_val = match op {
-        ReduceOp::Sum | ReduceOp::Mean => b.c_float_0,
-        ReduceOp::Max => {
-            let neg_inf = m.alloc_id();
-            m.emit_constant_f32(b.ty_float, neg_inf, f32::NEG_INFINITY);
-            neg_inf
-        }
-        ReduceOp::Min => {
-            let pos_inf = m.alloc_id();
-            m.emit_constant_f32(b.ty_float, pos_inf, f32::INFINITY);
-            pos_inf
-        }
-    };
     m.emit_store(var_acc, init_val);
 
     m.emit_branch(label_loop_header);

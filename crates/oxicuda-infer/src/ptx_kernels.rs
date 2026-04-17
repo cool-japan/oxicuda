@@ -370,15 +370,18 @@ pub fn rope_apply_ptx(sm: u32) -> String {
 
 // ─── top_k_filter_ptx ────────────────────────────────────────────────────────
 
-/// Generate the PTX kernel that zeroes out all but the top-K logits.
+/// Generate the PTX kernel that masks logits outside a reference top-K window.
 ///
 /// After this kernel, non-top-K positions contain −∞ so that the
 /// subsequent softmax assigns them zero probability.
 ///
-/// Algorithm (two-pass):
-/// 1. Each thread finds the K-th largest value using a partial sort in
-///    shared memory (for K ≤ 1024).
-/// 2. A second pass masks all logits < threshold to −∞.
+/// Algorithm (reference index-window masking):
+/// 1. Clamp `k` to `vocab_size`.
+/// 2. Mask positions with `idx >= k` to −∞.
+///
+/// This kernel is a lightweight reference path for deterministic tests and
+/// wiring validation. Value-based top-K thresholding is implemented via the
+/// higher-level sampling path.
 ///
 /// Grid : (batch_size, 1, 1)
 /// Block: (min(vocab_size, 1024), 1, 1)
@@ -408,9 +411,9 @@ pub fn top_k_filter_ptx(sm: u32) -> String {
 )
 {{
     .reg .u64 %rl;
-    .reg .u32 %bid, %tid_x, %vs, %k_r, %bs;
+    .reg .u32 %bid, %tid_x, %vs, %k_r, %k_eff, %bs;
     .reg .u64 %row_ptr, %off;
-    .reg .f32 %val, %threshold, %neg_inf_r;
+    .reg .f32 %val, %neg_inf_r;
     .reg .pred %p_oob, %p_mask;
 
     ld.param.u64 %rl,  [logits_ptr];
@@ -433,16 +436,15 @@ pub fn top_k_filter_ptx(sm: u32) -> String {
     add.u64 %row_ptr, %rl, %off;
     ld.global.f32 %val, [%row_ptr];
 
-    // --- Simplified single-thread threshold computation ---
-    // In production this would use a shared-memory parallel partial sort.
-    // Here we demonstrate the mask-and-write pattern: threads with index >= k
-    // after sorting receive -inf. For correctness the threshold scan runs
-    // within the warp; the actual top-K selection is done on the CPU side
-    // for this reference kernel.
+    // Clamp k to the row width to avoid out-of-range semantics.
+    setp.gt.u32 %p_mask, %k_r, %vs;
+    selp.u32 %k_eff, %vs, %k_r, %p_mask;
+
+    // Reference masking kernel: positions with idx >= k_eff are suppressed.
     mov.f32 %neg_inf_r, {neg_inf};
 
-    // Write -inf for positions beyond k (placeholder: thread index >= k)
-    setp.ge.u32 %p_mask, %tid_x, %k_r;
+    // Write -inf for positions beyond the kept window.
+    setp.ge.u32 %p_mask, %tid_x, %k_eff;
     @%p_mask st.global.f32 [%row_ptr], %neg_inf_r;
 
     ret;
@@ -752,6 +754,15 @@ mod tests {
     fn top_k_filter_has_neg_inf_store() {
         let ptx = top_k_filter_ptx(80);
         assert!(ptx.contains("st.global.f32"), "top_k should store -inf");
+    }
+
+    #[test]
+    fn top_k_filter_clamps_k_to_vocab() {
+        let ptx = top_k_filter_ptx(80);
+        assert!(
+            ptx.contains("setp.gt.u32") && ptx.contains("selp.u32"),
+            "top_k should clamp k to vocab size"
+        );
     }
 
     #[test]

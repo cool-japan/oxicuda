@@ -1048,6 +1048,14 @@ pub fn generate_batched_spmv_ptx<T: GpuFloat>() -> String {
         8 => ".f64",
         _ => ".f32",
     };
+    let elem_size = match T::SIZE {
+        8 => 8,
+        _ => 4,
+    };
+    let zero_literal = match T::SIZE {
+        8 => "0d0000000000000000",
+        _ => "0f00000000",
+    };
 
     format!(
         r#"//
@@ -1096,6 +1104,81 @@ pub fn generate_batched_spmv_ptx<T: GpuFloat>() -> String {
     // Early exit if tid >= row_count
     setp.ge.u32 %p1, %r2, %r3;
     @%p1 ret;
+
+    // Load row_ptr offset for this matrix
+    ld.param.u64 %rd3, [batch_offsets_rp];
+    mad.wide.u32 %rd4, %r0, 4, %rd3;
+    ld.global.u32 %r4, [%rd4];
+
+    // row_start = concat_row_ptr[rp_offset + tid], row_end = next entry
+    ld.param.u64 %rd5, [concat_row_ptr];
+    add.u32 %r11, %r4, %r2;
+    mul.wide.u32 %rd6, %r11, 4;
+    add.u64 %rd5, %rd5, %rd6;
+    ld.global.u32 %r5, [%rd5];
+    add.u64 %rd6, %rd5, 4;
+    ld.global.u32 %r6, [%rd6];
+
+    // Load nnz offset for this matrix
+    ld.param.u64 %rd7, [batch_offsets_nnz];
+    mad.wide.u32 %rd8, %r0, 4, %rd7;
+    ld.global.u32 %r7, [%rd8];
+
+    // Load x and y pointers for this matrix
+    ld.param.u64 %rd9, [x_ptrs];
+    mad.wide.u32 %rd10, %r0, 8, %rd9;
+    ld.global.u64 %rd10, [%rd10];
+    ld.param.u64 %rd11, [y_ptrs];
+    mad.wide.u32 %rd12, %r0, 8, %rd11;
+    ld.global.u64 %rd11, [%rd12];
+
+    // Load concatenated col_idx / values bases and alpha / beta scalars
+    ld.param.u64 %rd12, [concat_col_idx];
+    ld.param.u64 %rd13, [concat_values];
+    ld.param{ptx_type} %f6, [alpha];
+    ld.param{ptx_type} %f7, [beta];
+
+    // acc = 0; iterate row_start .. row_end
+    mov{ptx_type} %f0, {zero_literal};
+    mov.u32 %r8, %r5;
+
+$ROW_LOOP:
+    setp.lt.u32 %p2, %r8, %r6;
+    @!%p2 bra $ROW_DONE;
+
+    // k = nnz_offset + absolute row nnz index
+    add.u32 %r10, %r7, %r8;
+
+    // col = concat_col_idx[k]
+    mul.wide.u32 %rd14, %r10, 4;
+    add.u64 %rd15, %rd12, %rd14;
+    ld.global.u32 %r9, [%rd15];
+
+    // val = concat_values[k]
+    mul.wide.u32 %rd16, %r10, {elem_size};
+    add.u64 %rd17, %rd13, %rd16;
+    ld.global{ptx_type} %f1, [%rd17];
+
+    // x_val = x[col]
+    mul.wide.u32 %rd18, %r9, {elem_size};
+    add.u64 %rd19, %rd10, %rd18;
+    ld.global{ptx_type} %f2, [%rd19];
+
+    // acc += val * x_val
+    fma.rn{ptx_type} %f0, %f1, %f2, %f0;
+
+    add.u32 %r8, %r8, 1;
+    bra $ROW_LOOP;
+
+$ROW_DONE:
+    // y[tid] = alpha * acc + beta * y[tid]
+    mul.wide.u32 %rd20, %r2, {elem_size};
+    add.u64 %rd21, %rd11, %rd20;
+    ld.global{ptx_type} %f3, [%rd21];
+    mul.rn{ptx_type} %f4, %f6, %f0;
+    mul.rn{ptx_type} %f5, %f7, %f3;
+    add.rn{ptx_type} %f4, %f4, %f5;
+    st.global{ptx_type} [%rd21], %f4;
 
     ret;
 }}
@@ -1683,6 +1766,14 @@ mod tests {
         let ptx = generate_batched_spmv_ptx::<f64>();
         assert!(ptx.contains("batched_spmv_f64"));
         assert!(ptx.contains(".f64"));
+    }
+
+    #[test]
+    fn batched_spmv_ptx_contains_loop() {
+        let ptx = generate_batched_spmv_ptx::<f32>();
+        assert!(ptx.contains("ROW_LOOP"));
+        assert!(ptx.contains("fma.rn"));
+        assert!(ptx.contains("ld.global"));
     }
 
     // -- BatchedSpGEMM host test --------------------------------------------

@@ -840,8 +840,6 @@ pub fn generate_packed_vector_spmv_ptx(
                 b.raw_ptx(&format!("ld.global.b32 {packed_val}, [{v_addr}];"));
 
                 // Unpack low half (first FP16)
-                let val_lo = b.alloc_reg(storage.ptx_type());
-                b.raw_ptx(&format!("mov.b16 {val_lo}, {{0}}; // placeholder"));
                 // Extract low 16 bits
                 let lo_bits = b.alloc_reg(PtxType::B16);
                 b.raw_ptx("{ .reg .b16 __hi;");

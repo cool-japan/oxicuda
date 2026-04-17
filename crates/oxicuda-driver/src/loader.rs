@@ -1021,7 +1021,7 @@ impl DriverApi {
                 // Propagate the error; the OnceLock will store this Err and
                 // return CudaError::NotInitialized on every subsequent
                 // try_driver() call — matching behaviour on no-GPU machines.
-                return Err(DriverLoadError::InitializationFailed { code: rc as u32 });
+                return Err(DriverLoadError::InitializationFailed { code: rc });
             }
             Ok(api)
         }

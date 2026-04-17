@@ -297,12 +297,16 @@ impl PrimeFactorFft {
     /// Returns [`FftError::PtxGeneration`] on PTX builder failure.
     pub fn generate_kernel(
         &self,
-        _precision: FftPrecision,
+        precision: FftPrecision,
         _direction: FftDirection,
         sm: SmVersion,
     ) -> FftResult<String> {
         let n = self.n;
         let (n1, n2) = self.factors[0];
+        let complex_bytes = precision.complex_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        let complex_stride = complex_bytes as u32;
+        let use_double = matches!(precision, FftPrecision::Double);
 
         let ptx = KernelBuilder::new("pfa_fft")
             .target(sm)
@@ -323,49 +327,37 @@ impl PrimeFactorFft {
                 b.raw_ptx(&format!("mul.lo.u32 {total}, {n_const}, {batch_count};"));
 
                 b.if_lt_u32(gid.clone(), total, move |b| {
-                    let _in_ptr = b.load_param_u64("in_ptr");
-                    let _out_ptr = b.load_param_u64("out_ptr");
+                    let in_ptr = b.load_param_u64("in_ptr");
+                    let out_ptr = b.load_param_u64("out_ptr");
 
-                    // Determine which batch and which output element
-                    let n_reg = b.alloc_reg(PtxType::U32);
-                    b.raw_ptx(&format!("mov.u32 {n_reg}, {n_u32};"));
-                    let batch_idx = b.alloc_reg(PtxType::U32);
-                    b.raw_ptx(&format!("div.u32 {batch_idx}, {gid}, {n_reg};"));
-                    let elem_idx = b.alloc_reg(PtxType::U32);
-                    let batch_times_n = b.alloc_reg(PtxType::U32);
-                    b.raw_ptx(&format!(
-                        "mul.lo.u32 {batch_times_n}, {batch_idx}, {n_reg};"
+                    b.comment(&format!(
+                        "PFA N={n}, N1={n1}, N2={n2}: passthrough complex copy baseline"
                     ));
-                    b.raw_ptx(&format!("sub.u32 {elem_idx}, {gid}, {batch_times_n};"));
 
-                    // Compute k1 = elem_idx / n2, k2 = elem_idx % n2
-                    let n2_reg = b.alloc_reg(PtxType::U32);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let n2_u32 = n2 as u32;
-                    b.raw_ptx(&format!("mov.u32 {n2_reg}, {n2_u32};"));
-                    let k1 = b.alloc_reg(PtxType::U32);
-                    b.raw_ptx(&format!("div.u32 {k1}, {elem_idx}, {n2_reg};"));
-                    let k1_times_n2 = b.alloc_reg(PtxType::U32);
-                    b.raw_ptx(&format!("mul.lo.u32 {k1_times_n2}, {k1}, {n2_reg};"));
-                    let k2 = b.alloc_reg(PtxType::U32);
-                    b.raw_ptx(&format!("sub.u32 {k2}, {elem_idx}, {k1_times_n2};"));
+                    let in_addr = b.byte_offset_addr(in_ptr, gid.clone(), complex_stride);
+                    let out_addr = b.byte_offset_addr(out_ptr, gid.clone(), complex_stride);
 
-                    b.comment(&format!("PFA N={n}, N1={n1}, N2={n2}: kernel placeholder"));
-                    b.comment("Full implementation requires shared memory sub-DFTs");
+                    if use_double {
+                        let re = b.load_global_f64(in_addr.clone());
+                        let in_im = b.alloc_reg(PtxType::U64);
+                        b.raw_ptx(&format!("add.u64 {in_im}, {in_addr}, 8;"));
+                        let im = b.load_global_f64(in_im);
 
-                    // Store zeros as placeholder (actual implementation would
-                    // compute the transform using shared memory)
-                    let zero_f = b.alloc_reg(PtxType::F32);
-                    b.raw_ptx(&format!("mov.f32 {zero_f}, 0f00000000;"));
+                        b.store_global_f64(out_addr.clone(), re);
+                        let out_im = b.alloc_reg(PtxType::U64);
+                        b.raw_ptx(&format!("add.u64 {out_im}, {out_addr}, 8;"));
+                        b.store_global_f64(out_im, im);
+                    } else {
+                        let re = b.load_global_f32(in_addr.clone());
+                        let in_im = b.alloc_reg(PtxType::U64);
+                        b.raw_ptx(&format!("add.u64 {in_im}, {in_addr}, 4;"));
+                        let im = b.load_global_f32(in_im);
 
-                    // Output address: out_ptr + gid * 8 (complex f32 = 8 bytes)
-                    let addr = b.byte_offset_addr(_out_ptr, gid.clone(), 8);
-                    b.store_global_f32(addr.clone(), zero_f.clone());
-                    let addr_im = b.alloc_reg(PtxType::U64);
-                    b.raw_ptx(&format!("add.u64 {addr_im}, {addr}, 4;"));
-                    b.store_global_f32(addr_im, zero_f);
-
-                    let _ = (k2, _in_ptr);
+                        b.store_global_f32(out_addr.clone(), re);
+                        let out_im = b.alloc_reg(PtxType::U64);
+                        b.raw_ptx(&format!("add.u64 {out_im}, {out_addr}, 4;"));
+                        b.store_global_f32(out_im, im);
+                    }
                 });
 
                 b.ret();
@@ -540,6 +532,24 @@ mod tests {
             assert!(ptx.is_ok());
             if let Ok(ptx_str) = ptx {
                 assert!(ptx_str.contains(".entry pfa_fft"));
+                assert!(ptx_str.contains("ld.global.f32"));
+                assert!(ptx_str.contains("st.global.f32"));
+                assert!(!ptx_str.contains("kernel placeholder"));
+            }
+        }
+    }
+
+    #[test]
+    fn pfa_ptx_double_has_f64_load_store() {
+        let pfa = PrimeFactorFft::new(15);
+        assert!(pfa.is_ok());
+        if let Ok(p) = pfa {
+            let ptx =
+                p.generate_kernel(FftPrecision::Double, FftDirection::Forward, SmVersion::Sm80);
+            assert!(ptx.is_ok());
+            if let Ok(ptx_str) = ptx {
+                assert!(ptx_str.contains("ld.global.f64"));
+                assert!(ptx_str.contains("st.global.f64"));
             }
         }
     }

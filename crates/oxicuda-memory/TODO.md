@@ -46,7 +46,7 @@ The memory crate provides the core buffer types and copy operations that all hig
 ## Quality Status
 
 - Warnings: 0
-- Tests: 204 passing
+- Tests: 201 passing
 - unwrap() calls: 0
 - Drop implementations log errors via tracing::warn, never panic
 
@@ -60,8 +60,8 @@ Memory operations are bandwidth-bound. Key targets:
 
 ## Notes
 
-- MappedBuffer is currently a stub -- zero-copy requires cuMemHostAlloc with CU_MEMHOSTALLOC_DEVICEMAP
-- MemoryPool requires CUDA 11.2+ and is feature-gated under `pool`
+- MappedBuffer is implemented via `cuMemAllocHost_v2` + `cuMemHostGetDevicePointer_v2`
+- MemoryPool is feature-gated under `pool` and currently uses an in-process reuse pool backed by `cuMemAlloc_v2`/`cuMemFree_v2`
 - All buffer types implement Drop for automatic deallocation
 - Size mismatches and zero-length allocations return CudaError::InvalidValue
 
@@ -102,9 +102,9 @@ Memory operations are bandwidth-bound. Key targets:
 
 ### Test Coverage Gaps
 - [x] Unit test suite expansion (currently very few unit tests; rely on doc-tests)
-- [ ] H2D / D2H bandwidth benchmark added to `benches/` to verify ≥ 95% PCIe (NF2)
+- [x] H2D / D2H bandwidth benchmark added to `benches/` to verify ≥ 95% PCIe (NF2)
 - [x] `MemoryPool` stress test: 10K concurrent alloc_async / free_async cycles without fragmentation
-- [ ] Memory leak detection CI job using `compute-sanitizer --tool memcheck` (NF4)
+- [x] Memory leak detection CI job using `compute-sanitizer --tool memcheck` (NF4)
 - [ ] Peer copy correctness test on 2+ GPU systems (copy D0→D1, verify D1 matches)
 
 ### Implementation Deepening

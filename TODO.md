@@ -3,12 +3,12 @@
 Pure Rust CUDA replacement for the COOLJAPAN ecosystem.
 (C) 2026 COOLJAPAN OU (Team KitaSan)
 
-## Project Status (v0.1.2 — 2026-04-14)
+## Project Status (v0.1.3 — 2026-04-17)
 
 - **Crates**: 28 workspace members (27 library crates + 1 umbrella)
-- **Files**: 755 Rust source files
-- **Code**: 253,125 SLoC (Rust, `tokei` verified)
-- **Tests**: 7,263 passing, 2 skipped (GPU-only on macOS)
+- **Files**: 765 Rust source files
+- **Code**: 260,119 SLoC (Rust, `tokei` verified)
+- **Tests**: 7,411 passing, 2 skipped (GPU-only on macOS)
 - **Warnings**: 0 (clippy + rustc, `-D warnings`)
 - **unwrap() calls**: 0 (no-unwrap policy in library code)
 - **Status**: All 10 volumes complete — Vol.1 Foundation, Vol.2 PTX/Autotune, Vol.3 BLAS, Vol.4 DNN, Vol.5 Scientific Computing, Vol.6 Signal Processing, Vol.7 Computation Graph, Vol.8 GPU Training, Vol.9 Inference Engine, Vol.10 Reinforcement Learning, plus 7 backend crates (Metal/Vulkan/WebGPU/ROCm/LevelZero/primitives/backend) with full compute operations wired

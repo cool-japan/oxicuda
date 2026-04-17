@@ -885,4 +885,82 @@ mod tests {
             "avg_nnz=256.0 (> 64 bracket) must select Vector"
         );
     }
+
+    /// CPU-proxy throughput benchmark: SpMV on a synthetic 10k×10k 5-point stencil matrix.
+    ///
+    /// Simulates the type of sparse matrix found in the SuiteSparse collection.
+    /// Measures CPU reference throughput and reports GFLOPS as a structural
+    /// lower-bound for the GPU target (cuSPARSE comparison requires real hardware).
+    #[test]
+    fn spmv_suitesparse_proxy_throughput_10k() {
+        // 2D 5-point Laplacian stencil on a 100×100 grid → 10k×10k sparse matrix.
+        // Each interior row has 5 non-zeros; boundary rows have 3–4.
+        let grid = 100_usize;
+        let n = grid * grid; // 10_000 rows
+
+        let mut row_ptr: Vec<usize> = Vec::with_capacity(n + 1);
+        let mut col_idx: Vec<usize> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+
+        row_ptr.push(0);
+        for row in 0..n {
+            let r = row / grid;
+            let c = row % grid;
+            // North neighbour
+            if r > 0 {
+                col_idx.push(row - grid);
+                values.push(-1.0);
+            }
+            // West neighbour
+            if c > 0 {
+                col_idx.push(row - 1);
+                values.push(-1.0);
+            }
+            // Self (diagonal = 4)
+            col_idx.push(row);
+            values.push(4.0);
+            // East neighbour
+            if c + 1 < grid {
+                col_idx.push(row + 1);
+                values.push(-1.0);
+            }
+            // South neighbour
+            if r + 1 < grid {
+                col_idx.push(row + grid);
+                values.push(-1.0);
+            }
+            row_ptr.push(col_idx.len());
+        }
+
+        let nnz = col_idx.len();
+        let x: Vec<f64> = (0..n).map(|i| (i as f64) * 0.0001 + 1.0).collect();
+
+        // Warm-up pass
+        let _ = csr_spmv_sim(n, &row_ptr, &col_idx, &values, &x);
+
+        const ITERS: usize = 10;
+        let start = std::time::Instant::now();
+        let mut y = vec![0.0_f64; n];
+        for _ in 0..ITERS {
+            y = csr_spmv_sim(n, &row_ptr, &col_idx, &values, &x);
+        }
+        let elapsed_ns = start.elapsed().as_nanos() as f64;
+
+        // 2 flops per non-zero (one multiply + one add)
+        let total_flops = 2.0 * nnz as f64 * ITERS as f64;
+        let gflops = total_flops / elapsed_ns; // (flops) / (ns) = GFlops/s
+
+        println!(
+            "SpMV SuiteSparse proxy (10k×10k 5-pt stencil, {} nnz, {} iters): {:.3} GFLOPS (CPU reference)",
+            nnz, ITERS, gflops
+        );
+
+        // Sanity: result must be non-zero and throughput must be measurable
+        assert!(y[n / 2] != 0.0, "SpMV result must be non-zero");
+        assert!(
+            gflops > 0.001,
+            "SpMV CPU reference throughput unrealistically low: {:.6} GFLOPS",
+            gflops
+        );
+    }
 }

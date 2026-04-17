@@ -25,12 +25,23 @@ a given number of work items.
 
 ## Modules
 
-| Module   | Description                                                   |
-|----------|---------------------------------------------------------------|
-| `grid`   | `Dim3` struct, `grid_size_for()` helper                       |
-| `params` | `LaunchParams` and `LaunchParamsBuilder` (builder pattern)    |
-| `kernel` | `Kernel` struct, `KernelArgs` trait (tuple impls up to 24)    |
-| `macros` | `launch!` macro for ergonomic kernel dispatch                 |
+| Module                | Description                                                    |
+|-----------------------|----------------------------------------------------------------|
+| `grid`                | `Dim3` struct, `grid_size_for()`, `auto_grid_for()` helpers    |
+| `params`              | `LaunchParams` and `LaunchParamsBuilder` (builder pattern)     |
+| `kernel`              | `Kernel` struct, `KernelArgs` trait (tuple impls up to 24)     |
+| `macros`              | `launch!` macro for ergonomic kernel dispatch                  |
+| `error`               | Launch-specific error types and validation                     |
+| `cooperative`         | Cooperative kernel launch (`cuLaunchCooperativeKernel`)        |
+| `cluster`             | Cluster launch support (Hopper+, `CUlaunchConfig`)             |
+| `graph_launch`        | Graph-based launch recording and replay                        |
+| `async_launch`        | Async kernel launch with future/poll-based completion          |
+| `dynamic_parallelism` | Device-side kernel launch (nested kernels)                     |
+| `multi_stream`        | Multi-stream kernel dispatch helpers                           |
+| `named_args`          | Named kernel arguments (`named_args!()`, `launch_named!()`)    |
+| `arg_serialize`       | Kernel argument serialization and debug display                |
+| `telemetry`           | Launch telemetry: timing, occupancy achieved, register usage   |
+| `trace`               | `tracing` crate span integration per kernel launch             |
 
 ## Quick Start
 
@@ -83,6 +94,15 @@ stream.synchronize()?;
 | Linux    | Full support (NVIDIA driver 525+)             |
 | Windows  | Full support (NVIDIA driver 525+)             |
 | macOS    | Compile only (UnsupportedPlatform at runtime) |
+
+## Status
+
+| Item       | Value              |
+|------------|--------------------|
+| Version    | 0.1.3 (2026-04-17) |
+| Tests      | 207 passing        |
+| Warnings   | 0                  |
+| `unwrap()` | 0                  |
 
 ## License
 

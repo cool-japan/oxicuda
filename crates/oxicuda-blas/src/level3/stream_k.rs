@@ -291,10 +291,7 @@ fn generate_stream_k_ptx<T: GpuFloat>(
     wl(&mut p, "    mov.u32 %r0, %ctaid.x;  // cta_id")?;
     wl(&mut p, "")?;
 
-    // Compute iteration range for this CTA
-    // base_iters = total_iters / cta_count
-    // remainder = total_iters % cta_count
-    // CTAs [0..remainder) get base_iters+1, rest get base_iters
+    // Compute iteration range for this CTA.
     wl(&mut p, &format!("    // total_iters = {total_iters}"))?;
     wl(&mut p, &format!("    // cta_count = {cta_count}"))?;
     wl(&mut p, &format!("    // iters_per_tile = {iters_per_tile}"))?;
@@ -309,9 +306,6 @@ fn generate_stream_k_ptx<T: GpuFloat>(
         _ => (0, 0),
     };
 
-    // Compute iter_start and iter_count for this CTA
-    // if cta_id < remainder: start = cta_id * (base+1), count = base+1
-    // else: start = remainder * (base+1) + (cta_id - remainder) * base, count = base
     wl(
         &mut p,
         &format!("    mov.u32 %r1, {};  // base_iters", base_iters),
@@ -321,11 +315,8 @@ fn generate_stream_k_ptx<T: GpuFloat>(
         &format!("    mov.u32 %r2, {};  // remainder", remainder),
     )?;
     wl(&mut p, "    setp.lt.u32 %p0, %r0, %r2;")?;
-
-    // Branch for CTAs with extra iteration
     wl(&mut p, "    @%p0 bra $SK_EXTRA;")?;
 
-    // Normal CTAs: start = remainder * (base+1) + (cta_id - remainder) * base
     wl(
         &mut p,
         &format!("    mov.u32 %r3, {};  // base+1", base_iters + 1),
@@ -347,7 +338,7 @@ fn generate_stream_k_ptx<T: GpuFloat>(
     wl(&mut p, "$SK_COMPUTE:")?;
     wl(&mut p, "")?;
 
-    // Load matrix pointers and parameters
+    // Load matrix pointers and parameters.
     wl(&mut p, "    ld.param.u64 %rd0, [%param_a];")?;
     wl(&mut p, "    ld.param.u64 %rd1, [%param_b];")?;
     wl(&mut p, "    ld.param.u64 %rd2, [%param_c];")?;
@@ -367,62 +358,202 @@ fn generate_stream_k_ptx<T: GpuFloat>(
     )?;
     wl(&mut p, "")?;
 
-    // Main iteration loop: for each iteration in [iter_start, iter_start + iter_count)
+    // Main iteration loop: for each iteration in [iter_start, iter_start + iter_count).
     wl(&mut p, "    mov.u32 %r11, 0;  // local_iter")?;
     wl(&mut p, "$SK_ITER_LOOP:")?;
     wl(&mut p, "    setp.ge.u32 %p1, %r11, %r7;")?;
     wl(&mut p, "    @%p1 bra $SK_ITER_DONE;")?;
     wl(&mut p, "")?;
 
-    // Global iteration index
     wl(&mut p, "    add.u32 %r12, %r6, %r11;  // global_iter")?;
-
-    // Decode tile index and k-slice from global_iter
-    // tile_idx = global_iter / iters_per_tile
-    // k_slice  = global_iter % iters_per_tile
     wl(
         &mut p,
         &format!("    mov.u32 %r13, {};  // iters_per_tile", iters_per_tile),
     )?;
     wl(&mut p, "    div.u32 %r14, %r12, %r13;  // tile_idx")?;
     wl(&mut p, "    rem.u32 %r15, %r12, %r13;  // k_slice")?;
-
-    // Decode tile row and column
-    // tile_row = tile_idx / tiles_n
-    // tile_col = tile_idx % tiles_n
     wl(
         &mut p,
         &format!("    mov.u32 %r16, {};  // tiles_n", tiles_n),
     )?;
     wl(&mut p, "    div.u32 %r17, %r14, %r16;  // tile_row")?;
     wl(&mut p, "    rem.u32 %r18, %r14, %r16;  // tile_col")?;
-
-    // Compute the output element coordinates (simplified: one element per thread
-    // within the tile, using threadIdx for intra-tile position)
     wl(&mut p, "    mov.u32 %r19, %tid.x;  // thread within block")?;
 
-    // Init accumulator for this iteration
+    // Init accumulator for this K-slice.
     wl(
         &mut p,
         &format!("    mov.{ld_ty} %{fr}0, {zero_lit};  // acc"),
     )?;
 
-    // Placeholder: actual K-slice accumulation would go here
-    // Each thread accumulates tile_k elements from A and B
+    // Simplified scalar Stream-K mapping: one output element per thread.
+    wl(
+        &mut p,
+        &format!(
+            "    rem.u32 %r23, %r19, {};  // thread_row = tid % tile_m",
+            config.tile_m
+        ),
+    )?;
+    wl(
+        &mut p,
+        &format!(
+            "    div.u32 %r24, %r19, {};  // thread_col = tid / tile_m",
+            config.tile_m
+        ),
+    )?;
+    wl(
+        &mut p,
+        &format!(
+            "    mad.lo.u32 %r25, %r17, {}, %r23;  // row_m",
+            config.tile_m
+        ),
+    )?;
+    wl(
+        &mut p,
+        &format!(
+            "    mad.lo.u32 %r26, %r18, {}, %r24;  // col_n",
+            config.tile_n
+        ),
+    )?;
+    wl(&mut p, "    setp.ge.u32 %p2, %r25, %r8;")?;
+    wl(&mut p, "    setp.ge.u32 %p3, %r26, %r9;")?;
+    wl(&mut p, "    or.pred %p4, %p2, %p3;")?;
+    wl(&mut p, "    @%p4 bra $SK_ITER_STEP_DONE;")?;
+    wl(
+        &mut p,
+        &format!(
+            "    mul.lo.u32 %r27, %r15, {};  // k_base = k_slice * tile_k",
+            config.tile_k
+        ),
+    )?;
 
+    for kk in 0..config.tile_k {
+        wl(
+            &mut p,
+            &format!("    add.u32 %r28, %r27, {kk};  // k_global"),
+        )?;
+        wl(&mut p, "    setp.ge.u32 %p5, %r28, %r10;")?;
+        wl(&mut p, &format!("    @%p5 bra $SK_SKIP_FMA_{kk};"))?;
+        wl(
+            &mut p,
+            "    mad.lo.u32 %r29, %r25, %r20, %r28;  // A linear index",
+        )?;
+        wl(
+            &mut p,
+            &format!("    mul.wide.u32 %rd10, %r29, {byte_size};  // A byte offset"),
+        )?;
+        wl(&mut p, "    add.u64 %rd11, %rd0, %rd10;  // A addr")?;
+        wl(
+            &mut p,
+            &format!("    ld.global.{ld_ty} %{fr}1, [%rd11];  // a_val"),
+        )?;
+        wl(
+            &mut p,
+            "    mad.lo.u32 %r30, %r28, %r21, %r26;  // B linear index",
+        )?;
+        wl(
+            &mut p,
+            &format!("    mul.wide.u32 %rd12, %r30, {byte_size};  // B byte offset"),
+        )?;
+        wl(&mut p, "    add.u64 %rd13, %rd1, %rd12;  // B addr")?;
+        wl(
+            &mut p,
+            &format!("    ld.global.{ld_ty} %{fr}2, [%rd13];  // b_val"),
+        )?;
+        wl(
+            &mut p,
+            &format!("    fma.rn.{ld_ty} %{fr}0, %{fr}1, %{fr}2, %{fr}0;  // acc += A * B"),
+        )?;
+        wl(&mut p, &format!("$SK_SKIP_FMA_{kk}:"))?;
+    }
+
+    // Partial K-slices reduce via atom.add.
+    wl(
+        &mut p,
+        "    mad.lo.u32 %r31, %r25, %r22, %r26;  // C linear index",
+    )?;
+    wl(
+        &mut p,
+        &format!("    mul.wide.u32 %rd14, %r31, {byte_size};  // C byte offset"),
+    )?;
+    wl(&mut p, "    add.u64 %rd15, %rd2, %rd14;  // C addr")?;
+    wl(
+        &mut p,
+        &format!("    mul.rn.{ld_ty} %{fr}3, %{fr}8, %{fr}0;  // alpha * acc"),
+    )?;
+    wl(
+        &mut p,
+        &format!("    atom.add.{ld_ty} [%rd15], %{fr}3;  // partial tile reduction"),
+    )?;
+    wl(&mut p, "$SK_ITER_STEP_DONE:")?;
     wl(&mut p, "")?;
     wl(&mut p, "    add.u32 %r11, %r11, 1;")?;
     wl(&mut p, "    bra $SK_ITER_LOOP;")?;
+
     wl(&mut p, "$SK_ITER_DONE:")?;
     wl(&mut p, "")?;
 
-    // Store results (partial tiles use atomicAdd)
+    // Final C read/write store after the last processed iteration.
     wl(
         &mut p,
-        &format!("    // Partial results use atom.add.{ld_ty}"),
+        &format!(
+            "    rem.u32 %r23, %r19, {};  // thread_row = tid % tile_m",
+            config.tile_m
+        ),
+    )?;
+    wl(
+        &mut p,
+        &format!(
+            "    div.u32 %r24, %r19, {};  // thread_col = tid / tile_m",
+            config.tile_m
+        ),
+    )?;
+    wl(
+        &mut p,
+        &format!(
+            "    mad.lo.u32 %r25, %r17, {}, %r23;  // row_m",
+            config.tile_m
+        ),
+    )?;
+    wl(
+        &mut p,
+        &format!(
+            "    mad.lo.u32 %r26, %r18, {}, %r24;  // col_n",
+            config.tile_n
+        ),
+    )?;
+    wl(&mut p, "    setp.ge.u32 %p2, %r25, %r8;")?;
+    wl(&mut p, "    setp.ge.u32 %p3, %r26, %r9;")?;
+    wl(&mut p, "    or.pred %p4, %p2, %p3;")?;
+    wl(&mut p, "    @%p4 bra $SK_RET;")?;
+    wl(
+        &mut p,
+        "    mad.lo.u32 %r31, %r25, %r22, %r26;  // C linear index",
+    )?;
+    wl(
+        &mut p,
+        &format!("    mul.wide.u32 %rd14, %r31, {byte_size};  // C byte offset"),
+    )?;
+    wl(&mut p, "    add.u64 %rd15, %rd2, %rd14;  // C addr")?;
+    wl(
+        &mut p,
+        &format!("    ld.global.{ld_ty} %{fr}4, [%rd15];  // old C"),
+    )?;
+    wl(
+        &mut p,
+        &format!("    mul.rn.{ld_ty} %{fr}3, %{fr}8, %{fr}0;  // alpha * acc"),
+    )?;
+    wl(
+        &mut p,
+        &format!("    fma.rn.{ld_ty} %{fr}5, %{fr}9, %{fr}4, %{fr}3;  // beta * C + alpha * acc"),
+    )?;
+    wl(
+        &mut p,
+        &format!("    st.global.{ld_ty} [%rd15], %{fr}5;  // final C write"),
     )?;
     wl(&mut p, "")?;
 
+    wl(&mut p, "$SK_RET:")?;
     wl(&mut p, "    ret;")?;
     wl(&mut p, "}")?;
 

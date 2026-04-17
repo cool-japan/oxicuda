@@ -6,11 +6,15 @@
 //! - **Symlets** (sym2–sym10) — near-symmetric Daubechies variants
 //! - **Multi-level** — successive application over dyadic tree
 
+pub mod biorthogonal;
+pub mod coiflet;
 pub mod daubechies;
 pub mod haar;
 pub mod multilevel;
 pub mod sym;
 
+pub use biorthogonal::{bior_forward, bior_inverse, bior_lowpass_pair};
+pub use coiflet::{coif_forward, coif_inverse, coif_lowpass};
 pub use daubechies::{
     db_filter_len, db_forward, db_highpass, db_inverse, db_lowpass, db_recon_highpass,
     db_recon_lowpass,

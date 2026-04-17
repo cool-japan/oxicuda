@@ -598,26 +598,18 @@ pub fn generate_panel_trsm_ptx(
                 //
                 // For correctness we emit the inner-product subtraction loop (over p=0..j)
                 // and the final division, fully unrolled over j but using a runtime index i.
-                // Here we emit the pattern for the first tile row (i=k+bs) as demonstration;
-                // a real kernel would loop over rows with a runtime counter.
-                let i_row = k_off.clone(); // placeholder: row k+bs would be k_off + block_size
+                // We anchor i to the first panel row: i = k_offset + block_dim.
+                let i_row = b.add_u32(k_off.clone(), _blk_dim.clone());
 
                 // Inner product subtraction: subtract contributions from columns 0..j
                 for p in 0..j {
-                    let pu = p as u32;
-                    let aip_addr = emit_element_addr(
-                        b,
-                        base_ptr.clone(),
-                        ld.clone(),
-                        pu,
-                        i_row.name.len() as u32,
-                    );
+                    let _pu = p as u32;
                     // We emit as raw PTX comment since the full runtime-row iteration
                     // requires a loop counter not expressible with pure unrolling.
                     b.comment(&format!(
                         "    subtract p={p}: A[i,k+{j}] -= A[i,k+{p}] * L[k+{p},k+{j}]"
                     ));
-                    let _ = aip_addr;
+                    let _ = &i_row;
                 }
 
                 // Normalise: A[i, k+j] *= rcp(L[k+j,k+j])

@@ -14,10 +14,128 @@ use oxicuda_launch::kernel::Kernel;
 use oxicuda_launch::params::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
+use oxicuda_ptx::builder::KernelBuilder;
+use oxicuda_ptx::error::PtxGenError;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::engines::{mrg32k3a, philox, philox_optimized, xorwow};
 use crate::error::{RandError, RandResult};
+
+const LOG_NORMAL_EXP_KERNEL_F32: &str = "log_normal_exp_f32";
+const LOG_NORMAL_EXP_KERNEL_F64: &str = "log_normal_exp_f64";
+const POISSON_POSTPROCESS_KERNEL_F32: &str = "poisson_postprocess_f32";
+
+fn log_normal_exp_kernel_name(precision: PtxType) -> &'static str {
+    match precision {
+        PtxType::F32 => LOG_NORMAL_EXP_KERNEL_F32,
+        PtxType::F64 => LOG_NORMAL_EXP_KERNEL_F64,
+        _ => LOG_NORMAL_EXP_KERNEL_F32,
+    }
+}
+
+fn poisson_postprocess_kernel_name() -> &'static str {
+    POISSON_POSTPROCESS_KERNEL_F32
+}
+
+fn generate_log_normal_exp_ptx(precision: PtxType, sm: SmVersion) -> Result<String, PtxGenError> {
+    let kernel_name = log_normal_exp_kernel_name(precision);
+    let stride_bytes = precision.size_bytes() as u32;
+
+    KernelBuilder::new(kernel_name)
+        .target(sm)
+        .param("out_ptr", PtxType::U64)
+        .param("n", PtxType::U32)
+        .max_threads_per_block(256)
+        .body(move |b| {
+            let gid = b.global_thread_id_x();
+            let n_reg = b.load_param_u32("n");
+
+            b.if_lt_u32(gid.clone(), n_reg, move |b| {
+                let out_ptr = b.load_param_u64("out_ptr");
+                let addr = b.byte_offset_addr(out_ptr, gid.clone(), stride_bytes);
+
+                match precision {
+                    PtxType::F32 => {
+                        let normal_val = b.load_global_f32(addr.clone());
+                        let log2e = b.alloc_reg(PtxType::F32);
+                        b.raw_ptx(&format!("mov.f32 {log2e}, 0f3FB8AA3B;"));
+                        let scaled = b.alloc_reg(PtxType::F32);
+                        b.raw_ptx(&format!("mul.rn.f32 {scaled}, {normal_val}, {log2e};"));
+                        let result = b.alloc_reg(PtxType::F32);
+                        b.raw_ptx(&format!("ex2.approx.f32 {result}, {scaled};"));
+                        b.store_global_f32(addr, result);
+                    }
+                    PtxType::F64 => {
+                        let normal_val = b.load_global_f64(addr.clone());
+                        let narrow = b.alloc_reg(PtxType::F32);
+                        b.raw_ptx(&format!("cvt.rn.f32.f64 {narrow}, {normal_val};"));
+
+                        let log2e = b.alloc_reg(PtxType::F32);
+                        b.raw_ptx(&format!("mov.f32 {log2e}, 0f3FB8AA3B;"));
+                        let scaled = b.alloc_reg(PtxType::F32);
+                        b.raw_ptx(&format!("mul.rn.f32 {scaled}, {narrow}, {log2e};"));
+                        let exp_f32 = b.alloc_reg(PtxType::F32);
+                        b.raw_ptx(&format!("ex2.approx.f32 {exp_f32}, {scaled};"));
+
+                        let result = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("cvt.f64.f32 {result}, {exp_f32};"));
+                        b.store_global_f64(addr, result);
+                    }
+                    _ => {}
+                }
+            });
+
+            b.ret();
+        })
+        .build()
+}
+
+fn generate_poisson_postprocess_f32_ptx(sm: SmVersion) -> Result<String, PtxGenError> {
+    let kernel_name = poisson_postprocess_kernel_name();
+
+    KernelBuilder::new(kernel_name)
+        .target(sm)
+        .param("out_ptr", PtxType::U64)
+        .param("n", PtxType::U32)
+        .max_threads_per_block(256)
+        .body(move |b| {
+            let gid = b.global_thread_id_x();
+            let n_reg = b.load_param_u32("n");
+
+            b.if_lt_u32(gid.clone(), n_reg, move |b| {
+                let out_ptr = b.load_param_u64("out_ptr");
+                let addr = b.byte_offset_addr(out_ptr, gid, 4);
+                let value = b.load_global_f32(addr.clone());
+
+                let rounded_i32 = b.alloc_reg(PtxType::S32);
+                b.raw_ptx(&format!("cvt.rni.s32.f32 {rounded_i32}, {value};"));
+
+                let zero_i32 = b.alloc_reg(PtxType::S32);
+                b.raw_ptx(&format!("mov.s32 {zero_i32}, 0;"));
+
+                let clamped_i32 = b.alloc_reg(PtxType::S32);
+                b.raw_ptx(&format!(
+                    "max.s32 {clamped_i32}, {rounded_i32}, {zero_i32};"
+                ));
+
+                let clamped_f32 = b.alloc_reg(PtxType::F32);
+                b.raw_ptx(&format!("cvt.rn.f32.s32 {clamped_f32}, {clamped_i32};"));
+                b.store_global_f32(addr, clamped_f32);
+            });
+
+            b.ret();
+        })
+        .build()
+}
+
+fn validate_poisson_lambda(lambda: f64) -> RandResult<f32> {
+    if !lambda.is_finite() || lambda < 0.0 {
+        return Err(RandError::InvalidParameter(format!(
+            "lambda must be finite and >= 0, got {lambda}"
+        )));
+    }
+    Ok(lambda as f32)
+}
 
 // ---------------------------------------------------------------------------
 // Engine selection
@@ -248,12 +366,16 @@ impl RngGenerator {
         mean: f32,
         stddev: f32,
     ) -> RandResult<()> {
-        // Log-normal is implemented as: generate normal, then exponentiate.
-        // For now, delegate to normal generation (the PTX kernel would need
-        // to include the exp transform). This is a placeholder that generates
-        // normal values -- the actual log-normal transform happens on-device
-        // in a production implementation.
-        self.generate_normal_f32(output, mean, stddev)
+        let n = output.len();
+        self.generate_normal_f32(output, mean, stddev)?;
+        let ptx_source = self.get_log_normal_exp_ptx(PtxType::F32)?;
+        self.compile_and_launch_log_normal_exp(
+            &ptx_source,
+            PtxType::F32,
+            output.as_device_ptr(),
+            n,
+        )?;
+        Ok(())
     }
 
     /// Generates log-normally distributed f64 values.
@@ -267,13 +389,22 @@ impl RngGenerator {
         mean: f64,
         stddev: f64,
     ) -> RandResult<()> {
-        self.generate_normal_f64(output, mean, stddev)
+        let n = output.len();
+        self.generate_normal_f64(output, mean, stddev)?;
+        let ptx_source = self.get_log_normal_exp_ptx(PtxType::F64)?;
+        self.compile_and_launch_log_normal_exp(
+            &ptx_source,
+            PtxType::F64,
+            output.as_device_ptr(),
+            n,
+        )?;
+        Ok(())
     }
 
     /// Generates Poisson-distributed f32 values.
     ///
-    /// For small lambda (< 30), uses Knuth's algorithm.
-    /// For large lambda (>= 30), uses normal approximation.
+    /// Uses a normal approximation: `Normal(lambda, sqrt(lambda))` followed by
+    /// in-place rounding to nearest integer and clamping to `>= 0`.
     ///
     /// # Errors
     ///
@@ -283,14 +414,16 @@ impl RngGenerator {
         output: &mut DeviceBuffer<f32>,
         lambda: f64,
     ) -> RandResult<()> {
-        // Poisson generation uses the normal approximation path for large lambda.
-        // For small lambda, Knuth's algorithm is used.
-        // Both require uniform/normal generation as a building block.
-        let _lambda_f32 = lambda as f32;
-        let _n = output.len();
-        // Placeholder: generate uniform values that would be transformed.
-        // Full Poisson kernel would combine the engine + distribution transform.
-        self.generate_uniform_f32(output)
+        let lambda_f32 = validate_poisson_lambda(lambda)?;
+        let stddev = lambda.sqrt() as f32;
+        let n = output.len();
+
+        // Consume RNG state using normal generation; postprocessing is deterministic.
+        self.generate_normal_f32(output, lambda_f32, stddev)?;
+
+        let ptx_source = self.get_poisson_postprocess_f32_ptx()?;
+        self.compile_and_launch_poisson_postprocess_f32(&ptx_source, output.as_device_ptr(), n)?;
+        Ok(())
     }
 
     /// Generates raw u32 random values.
@@ -350,6 +483,16 @@ impl RngGenerator {
             }
         };
         Ok(ptx)
+    }
+
+    /// Returns PTX for the in-place exp transform used by log-normal generation.
+    fn get_log_normal_exp_ptx(&self, precision: PtxType) -> RandResult<String> {
+        generate_log_normal_exp_ptx(precision, self.sm_version).map_err(RandError::from)
+    }
+
+    /// Returns PTX for in-place Poisson approximation postprocessing.
+    fn get_poisson_postprocess_f32_ptx(&self) -> RandResult<String> {
+        generate_poisson_postprocess_f32_ptx(self.sm_version).map_err(RandError::from)
     }
 
     /// Returns the kernel entry point name for uniform kernels.
@@ -569,6 +712,57 @@ impl RngGenerator {
         self.stream.synchronize().map_err(RandError::Cuda)?;
         Ok(())
     }
+
+    /// Compiles PTX and launches an in-place unary exp kernel for log-normal.
+    fn compile_and_launch_log_normal_exp(
+        &self,
+        ptx_source: &str,
+        precision: PtxType,
+        out_ptr: u64,
+        n: usize,
+    ) -> RandResult<()> {
+        let module = Arc::new(Module::from_ptx(ptx_source).map_err(RandError::Cuda)?);
+        let kernel_name = log_normal_exp_kernel_name(precision);
+        let kernel = Kernel::from_module(module, kernel_name).map_err(RandError::Cuda)?;
+
+        let n_u32 = u32::try_from(n)
+            .map_err(|_| RandError::InvalidSize(format!("output size {n} exceeds u32::MAX")))?;
+        let grid = grid_size_for(n_u32, 256);
+        let params = LaunchParams::new(grid, 256u32);
+
+        let args = (out_ptr, n_u32);
+        kernel
+            .launch(&params, &self.stream, &args)
+            .map_err(RandError::Cuda)?;
+
+        self.stream.synchronize().map_err(RandError::Cuda)?;
+        Ok(())
+    }
+
+    /// Compiles PTX and launches in-place Poisson postprocessing for f32 output.
+    fn compile_and_launch_poisson_postprocess_f32(
+        &self,
+        ptx_source: &str,
+        out_ptr: u64,
+        n: usize,
+    ) -> RandResult<()> {
+        let module = Arc::new(Module::from_ptx(ptx_source).map_err(RandError::Cuda)?);
+        let kernel_name = poisson_postprocess_kernel_name();
+        let kernel = Kernel::from_module(module, kernel_name).map_err(RandError::Cuda)?;
+
+        let n_u32 = u32::try_from(n)
+            .map_err(|_| RandError::InvalidSize(format!("output size {n} exceeds u32::MAX")))?;
+        let grid = grid_size_for(n_u32, 256);
+        let params = LaunchParams::new(grid, 256u32);
+
+        let args = (out_ptr, n_u32);
+        kernel
+            .launch(&params, &self.stream, &args)
+            .map_err(RandError::Cuda)?;
+
+        self.stream.synchronize().map_err(RandError::Cuda)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -611,5 +805,58 @@ mod tests {
     fn ptx_generation_mrg32k3a_uniform() {
         let ptx = mrg32k3a::generate_mrg32k3a_uniform_ptx(PtxType::F32, SmVersion::Sm80);
         assert!(ptx.is_ok());
+    }
+
+    #[test]
+    fn log_normal_exp_f32_ptx_generation() {
+        let ptx = generate_log_normal_exp_ptx(PtxType::F32, SmVersion::Sm80)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(ptx.contains(".entry log_normal_exp_f32"));
+        assert!(ptx.contains("ex2.approx.f32"));
+        assert!(ptx.contains("0f3FB8AA3B"));
+        assert!(!ptx.contains("philox_normal_f32"));
+    }
+
+    #[test]
+    fn log_normal_exp_f64_ptx_generation() {
+        let ptx = generate_log_normal_exp_ptx(PtxType::F64, SmVersion::Sm80)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(ptx.contains(".entry log_normal_exp_f64"));
+        assert!(ptx.contains("cvt.rn.f32.f64"));
+        assert!(ptx.contains("ex2.approx.f32"));
+        assert!(ptx.contains("cvt.f64.f32"));
+        assert!(!ptx.contains("philox_normal_f64"));
+    }
+
+    #[test]
+    fn poisson_postprocess_f32_ptx_generation() {
+        let ptx =
+            generate_poisson_postprocess_f32_ptx(SmVersion::Sm80).unwrap_or_else(|e| panic!("{e}"));
+        assert!(ptx.contains(".entry poisson_postprocess_f32"));
+        assert!(ptx.contains("cvt.rni.s32.f32"));
+        assert!(ptx.contains("max.s32"));
+        assert!(ptx.contains("cvt.rn.f32.s32"));
+        assert!(!ptx.contains("philox_normal_f32"));
+    }
+
+    #[test]
+    fn poisson_lambda_validation_rejects_invalid_values() {
+        let negative = validate_poisson_lambda(-1.0);
+        assert!(matches!(negative, Err(RandError::InvalidParameter(_))));
+
+        let nan = validate_poisson_lambda(f64::NAN);
+        assert!(matches!(nan, Err(RandError::InvalidParameter(_))));
+
+        let inf = validate_poisson_lambda(f64::INFINITY);
+        assert!(matches!(inf, Err(RandError::InvalidParameter(_))));
+    }
+
+    #[test]
+    fn poisson_lambda_validation_accepts_valid_values() {
+        let zero = validate_poisson_lambda(0.0);
+        assert!(matches!(zero, Ok(v) if v == 0.0));
+
+        let positive = validate_poisson_lambda(12.5);
+        assert!(matches!(positive, Ok(v) if v == 12.5_f32));
     }
 }

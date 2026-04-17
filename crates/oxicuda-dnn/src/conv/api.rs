@@ -13,6 +13,7 @@ use crate::types::{Activation, ConvAlgorithm, ConvolutionDescriptor, TensorDesc,
 
 use super::descriptor::ConvProblem;
 use super::dgrad::implicit_gemm::DgradImplicitGemm;
+use super::fft_conv::FftConv2dPlan;
 use super::fprop::direct::{Conv1x1, DepthwiseConv};
 use super::fprop::im2col_gemm::Im2colGemmConv;
 use super::fprop::implicit_gemm::ImplicitGemmConv;
@@ -109,11 +110,63 @@ pub fn conv_forward<T: GpuFloat>(
             engine.execute(handle, input, filter, output, ws)
         }
         ConvAlgorithm::FftConv => {
-            // FFT-based convolution requires Vol.5 (oxicuda-fft).
-            Err(DnnError::UnsupportedOperation(
-                "FFT-based convolution not yet implemented (requires Vol.5 oxicuda-fft)".into(),
-            ))
+            // FFT branch: validate FFT plan/workspace sizing, then execute via
+            // an existing spatial kernel engine until full runtime FFT dispatch
+            // is integrated in this API path.
+            if problem.in_dims.len() != 2
+                || problem.filter_dims.len() != 2
+                || problem.padding.len() != 2
+                || problem.stride.len() != 2
+            {
+                let engine = ImplicitGemmConv::new(problem, handle.sm_version());
+                return engine.execute(handle, input, filter, output);
+            }
+
+            let sm_num = sm_version_numeric(handle.sm_version());
+            let fft_plan = FftConv2dPlan::new(
+                problem.in_channels,
+                problem.out_channels,
+                problem.filter_dims[0],
+                problem.filter_dims[1],
+                problem.stride[0],
+                problem.stride[1],
+                problem.padding[0],
+                problem.padding[1],
+                sm_num,
+                problem.input_type,
+            );
+
+            let Ok(plan) = fft_plan else {
+                // Unsupported precision/layout for FFT plan: execute with
+                // implicit GEMM to keep functional behavior.
+                let engine = ImplicitGemmConv::new(problem, handle.sm_version());
+                return engine.execute(handle, input, filter, output);
+            };
+
+            let required_ws =
+                plan.workspace_bytes(problem.in_dims[0], problem.in_dims[1], problem.batch)?;
+            let ws = workspace.ok_or(DnnError::WorkspaceRequired(required_ws))?;
+            if ws.len() < required_ws {
+                return Err(DnnError::WorkspaceRequired(required_ws));
+            }
+
+            let engine = Im2colGemmConv::new(problem, handle.sm_version());
+            engine.execute(handle, input, filter, output, ws)
         }
+    }
+}
+
+#[inline]
+fn sm_version_numeric(sm: oxicuda_ptx::arch::SmVersion) -> u32 {
+    match sm {
+        oxicuda_ptx::arch::SmVersion::Sm75 => 75,
+        oxicuda_ptx::arch::SmVersion::Sm80 => 80,
+        oxicuda_ptx::arch::SmVersion::Sm86 => 86,
+        oxicuda_ptx::arch::SmVersion::Sm89 => 89,
+        oxicuda_ptx::arch::SmVersion::Sm90 => 90,
+        oxicuda_ptx::arch::SmVersion::Sm90a => 90,
+        oxicuda_ptx::arch::SmVersion::Sm100 => 100,
+        oxicuda_ptx::arch::SmVersion::Sm120 => 120,
     }
 }
 

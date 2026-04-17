@@ -71,6 +71,14 @@ use oxicuda_rand::prelude::*;
 | `f16`      | Half-precision (fp16) RNG support    |
 | `gpu-tests`| Enable GPU integration tests         |
 
+## Status
+
+| Metric | Value |
+|--------|-------|
+| Version | 0.1.3 |
+| Tests passing | 270 |
+| Release date | 2026-04-17 |
+
 ## License
 
 Apache-2.0 -- (C) 2026 COOLJAPAN OU (Team KitaSan)

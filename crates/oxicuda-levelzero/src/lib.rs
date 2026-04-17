@@ -12,9 +12,11 @@ pub mod backend;
 pub mod device;
 pub mod error;
 pub mod memory;
+pub mod multi_tile;
 pub mod spirv;
 pub mod spirv_nn;
 pub mod spirv_subgroup;
+pub mod spirv_xmx;
 
 pub use backend::LevelZeroBackend;
 pub use error::{LevelZeroError, LevelZeroResult};

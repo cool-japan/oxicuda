@@ -504,52 +504,130 @@ fn band_cholesky_host(
 }
 
 // ---------------------------------------------------------------------------
-// Device buffer helpers (structural)
+// Device buffer helpers
 // ---------------------------------------------------------------------------
 
 fn read_band_to_host<T: GpuFloat>(
-    _buf: &DeviceBuffer<T>,
+    buf: &DeviceBuffer<T>,
     host: &mut [f64],
     count: usize,
 ) -> SolverResult<()> {
-    for val in host.iter_mut().take(count) {
-        *val = 0.0;
+    if host.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "read_band_to_host: host buffer too small ({} < {count})",
+            host.len()
+        )));
+    }
+    if buf.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "read_band_to_host: device buffer too small ({} < {count})",
+            buf.len()
+        )));
+    }
+
+    let mut staged = vec![T::gpu_zero(); buf.len()];
+    buf.copy_to_host(&mut staged)?;
+    for (dst, src) in host.iter_mut().zip(staged.iter()).take(count) {
+        *dst = to_f64(*src);
     }
     Ok(())
 }
 
 fn write_host_to_band_f64<T: GpuFloat>(
-    _buf: &mut DeviceBuffer<T>,
-    _data: &[f64],
-    _count: usize,
+    buf: &mut DeviceBuffer<T>,
+    data: &[f64],
+    count: usize,
 ) -> SolverResult<()> {
+    if data.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_host_to_band_f64: source too small ({} < {count})",
+            data.len()
+        )));
+    }
+    if buf.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_host_to_band_f64: device buffer too small ({} < {count})",
+            buf.len()
+        )));
+    }
+
+    let mut staged = vec![T::gpu_zero(); buf.len()];
+    for (dst, src) in staged.iter_mut().zip(data.iter()).take(count) {
+        *dst = from_f64(*src);
+    }
+    buf.copy_from_host(&staged)?;
     Ok(())
 }
 
 fn write_host_to_band_t<T: GpuFloat>(
-    _buf: &mut DeviceBuffer<T>,
-    _data: &[T],
-    _count: usize,
+    buf: &mut DeviceBuffer<T>,
+    data: &[T],
+    count: usize,
 ) -> SolverResult<()> {
+    if data.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_host_to_band_t: source too small ({} < {count})",
+            data.len()
+        )));
+    }
+    if buf.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_host_to_band_t: device buffer too small ({} < {count})",
+            buf.len()
+        )));
+    }
+
+    let mut staged = vec![T::gpu_zero(); buf.len()];
+    staged[..count].copy_from_slice(&data[..count]);
+    buf.copy_from_host(&staged)?;
     Ok(())
 }
 
 fn write_pivots_to_device(
-    _buf: &mut DeviceBuffer<i32>,
-    _data: &[i32],
-    _count: usize,
+    buf: &mut DeviceBuffer<i32>,
+    data: &[i32],
+    count: usize,
 ) -> SolverResult<()> {
+    if data.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_pivots_to_device: source too small ({} < {count})",
+            data.len()
+        )));
+    }
+    if buf.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_pivots_to_device: device buffer too small ({} < {count})",
+            buf.len()
+        )));
+    }
+
+    let mut staged = vec![0_i32; buf.len()];
+    staged[..count].copy_from_slice(&data[..count]);
+    buf.copy_from_host(&staged)?;
     Ok(())
 }
 
 fn read_pivots_from_device(
-    _buf: &DeviceBuffer<i32>,
+    buf: &DeviceBuffer<i32>,
     host: &mut [i32],
     count: usize,
 ) -> SolverResult<()> {
-    for (i, val) in host.iter_mut().enumerate().take(count) {
-        *val = i as i32;
+    if host.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "read_pivots_from_device: host buffer too small ({} < {count})",
+            host.len()
+        )));
     }
+    if buf.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "read_pivots_from_device: device buffer too small ({} < {count})",
+            buf.len()
+        )));
+    }
+
+    let mut staged = vec![0_i32; buf.len()];
+    buf.copy_to_host(&mut staged)?;
+    host[..count].copy_from_slice(&staged[..count]);
     Ok(())
 }
 

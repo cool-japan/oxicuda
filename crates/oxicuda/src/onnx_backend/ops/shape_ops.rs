@@ -26,7 +26,8 @@ pub fn execute_reshape(
                 ));
             }
             neg_idx = Some(i);
-            new_shape.push(0); // placeholder
+            // Temporary slot resolved after we compute known-product.
+            new_shape.push(1);
         } else if s == 0 {
             // Copy from input shape
             let dim =
@@ -50,6 +51,11 @@ pub fn execute_reshape(
             return Err(OnnxError::ShapeMismatch(
                 "Reshape: zero in known dimensions".into(),
             ));
+        }
+        if elem_count % known_product != 0 {
+            return Err(OnnxError::ShapeMismatch(format!(
+                "Reshape: cannot infer -1 dimension for {elem_count} elements and known product {known_product}"
+            )));
         }
         new_shape[idx] = elem_count / known_product;
     }
@@ -609,6 +615,15 @@ mod tests {
         let shape = OnnxTensor::from_i64(&[-1, 2], vec![2]);
         let r = execute_reshape(&[Some(&data), Some(&shape)], &HashMap::new()).unwrap();
         assert_eq!(r[0].shape, vec![3, 2]);
+    }
+
+    #[test]
+    fn test_reshape_with_neg1_non_divisible_errors() {
+        let data = OnnxTensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0], vec![5]);
+        let shape = OnnxTensor::from_i64(&[-1, 2], vec![2]);
+        let err = execute_reshape(&[Some(&data), Some(&shape)], &HashMap::new())
+            .expect_err("expected non-divisible -1 reshape to fail");
+        assert!(matches!(err, OnnxError::ShapeMismatch(_)));
     }
 
     #[test]

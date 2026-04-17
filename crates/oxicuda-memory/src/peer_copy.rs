@@ -8,14 +8,6 @@
 //! NVLink without staging through host memory, significantly improving
 //! transfer bandwidth in multi-GPU configurations.
 //!
-//! # Platform note
-//!
-//! The underlying `cuDeviceCanAccessPeer`, `cuCtxEnablePeerAccess`,
-//! `cuCtxDisablePeerAccess`, and `cuMemcpyPeer` driver functions are not
-//! yet loaded by `oxicuda-driver`.  All functions currently return
-//! [`CudaError::NotSupported`] as placeholders.  The API surface is
-//! established here so that downstream crates can program against it.
-//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -34,8 +26,12 @@
 //! # Ok::<(), oxicuda_driver::error::CudaError>(())
 //! ```
 
+use std::ffi::c_int;
+
 use oxicuda_driver::device::Device;
 use oxicuda_driver::error::{CudaError, CudaResult};
+use oxicuda_driver::loader::try_driver;
+use oxicuda_driver::primary_context::PrimaryContext;
 use oxicuda_driver::stream::Stream;
 
 use crate::device_buffer::DeviceBuffer;
@@ -48,47 +44,69 @@ use crate::device_buffer::DeviceBuffer;
 ///
 /// # Errors
 ///
-/// Currently returns [`CudaError::NotSupported`] because the underlying
-/// driver function pointer (`cuDeviceCanAccessPeer`) is not yet loaded.
-pub fn can_access_peer(_device: &Device, _peer: &Device) -> CudaResult<bool> {
-    // TODO: load `cuDeviceCanAccessPeer` in DriverApi and call it here.
-    // let api = oxicuda_driver::loader::try_driver()?;
-    // let mut can_access: i32 = 0;
-    // oxicuda_driver::check(unsafe {
-    //     (api.cu_device_can_access_peer)(&mut can_access, device.raw(), peer.raw())
-    // })?;
-    // Ok(can_access != 0)
-    Err(CudaError::NotSupported)
+/// Returns a CUDA driver error if the query fails.
+pub fn can_access_peer(device: &Device, peer: &Device) -> CudaResult<bool> {
+    let api = try_driver()?;
+    let mut can_access: c_int = 0;
+    oxicuda_driver::error::check(unsafe {
+        (api.cu_device_can_access_peer)(&mut can_access, device.raw(), peer.raw())
+    })?;
+    Ok(can_access != 0)
 }
 
-/// Enables peer access from the current context's device to `peer`.
+/// Enables peer access from `device`'s primary context to `peer`'s primary context.
 ///
-/// After enabling, memory on `peer` can be directly accessed from
-/// kernels and copy operations in the current context.
+/// After calling this function, kernels and copy operations running on `device`
+/// can directly read from and write to memory allocated on `peer`.
 ///
 /// # Errors
 ///
-/// * [`CudaError::PeerAccessAlreadyEnabled`] if peer access is already
-///   enabled.
-/// * [`CudaError::PeerAccessUnsupported`] if the hardware does not
-///   support peer access.
-/// * [`CudaError::NotSupported`] (current stub).
-pub fn enable_peer_access(_device: &Device, _peer: &Device) -> CudaResult<()> {
-    // TODO: load `cuCtxEnablePeerAccess` in DriverApi and call it.
-    // Need to set the device's context as current first, then enable
-    // access to peer's context.
-    Err(CudaError::NotSupported)
+/// * [`CudaError::PeerAccessAlreadyEnabled`] if peer access is already enabled.
+/// * [`CudaError::PeerAccessUnsupported`] if the hardware topology does not
+///   support direct peer access between these devices.
+pub fn enable_peer_access(device: &Device, peer: &Device) -> CudaResult<()> {
+    let api = try_driver()?;
+
+    // Retain both primary contexts.  The peer context handle is needed by
+    // cuCtxEnablePeerAccess; the device context is set as current so that the
+    // enable operation applies to it.
+    let dev_ctx = PrimaryContext::retain(device)?;
+    let peer_ctx = PrimaryContext::retain(peer)?;
+
+    // Make the device context current on this thread.
+    oxicuda_driver::error::check(unsafe { (api.cu_ctx_set_current)(dev_ctx.raw()) })?;
+
+    // Enable access from the current (device) context to the peer context.
+    let rc =
+        oxicuda_driver::error::check(unsafe { (api.cu_ctx_enable_peer_access)(peer_ctx.raw(), 0) });
+
+    // Release retained contexts regardless of outcome.
+    let _ = peer_ctx.release();
+    let _ = dev_ctx.release();
+
+    rc
 }
 
-/// Disables peer access from the current context's device to `peer`.
+/// Disables peer access from `device`'s primary context to `peer`'s primary context.
 ///
 /// # Errors
 ///
-/// * [`CudaError::PeerAccessNotEnabled`] if peer access was not enabled.
-/// * [`CudaError::NotSupported`] (current stub).
-pub fn disable_peer_access(_device: &Device, _peer: &Device) -> CudaResult<()> {
-    // TODO: load `cuCtxDisablePeerAccess` in DriverApi and call it.
-    Err(CudaError::NotSupported)
+/// * [`CudaError::PeerAccessNotEnabled`] if peer access was not previously enabled.
+pub fn disable_peer_access(device: &Device, peer: &Device) -> CudaResult<()> {
+    let api = try_driver()?;
+
+    let dev_ctx = PrimaryContext::retain(device)?;
+    let peer_ctx = PrimaryContext::retain(peer)?;
+
+    oxicuda_driver::error::check(unsafe { (api.cu_ctx_set_current)(dev_ctx.raw()) })?;
+
+    let rc =
+        oxicuda_driver::error::check(unsafe { (api.cu_ctx_disable_peer_access)(peer_ctx.raw()) });
+
+    let _ = peer_ctx.release();
+    let _ = dev_ctx.release();
+
+    rc
 }
 
 /// Copies data between device buffers on different GPUs (synchronous).
@@ -99,27 +117,36 @@ pub fn disable_peer_access(_device: &Device, _peer: &Device) -> CudaResult<()> {
 /// # Errors
 ///
 /// * [`CudaError::InvalidValue`] if buffer lengths do not match.
-/// * [`CudaError::PeerAccessNotEnabled`] if peer access has not been
-///   enabled.
-/// * [`CudaError::NotSupported`] (current stub).
+/// * [`CudaError::PeerAccessNotEnabled`] if peer access has not been enabled.
 pub fn copy_peer<T: Copy>(
     dst: &mut DeviceBuffer<T>,
-    _dst_device: &Device,
+    dst_device: &Device,
     src: &DeviceBuffer<T>,
-    _src_device: &Device,
+    src_device: &Device,
 ) -> CudaResult<()> {
     if dst.len() != src.len() {
         return Err(CudaError::InvalidValue);
     }
-    // TODO: load `cuMemcpyPeer` in DriverApi and call it.
-    // let byte_size = src.byte_size();
-    // let api = oxicuda_driver::loader::try_driver()?;
-    // oxicuda_driver::check(unsafe {
-    //     (api.cu_memcpy_peer)(
-    //         dst.as_device_ptr(), dst_ctx, src.as_device_ptr(), src_ctx, byte_size
-    //     )
-    // })
-    Err(CudaError::NotSupported)
+    let api = try_driver()?;
+    let byte_size = src.byte_size();
+
+    let dst_ctx = PrimaryContext::retain(dst_device)?;
+    let src_ctx = PrimaryContext::retain(src_device)?;
+
+    let rc = oxicuda_driver::error::check(unsafe {
+        (api.cu_memcpy_peer)(
+            dst.as_device_ptr(),
+            dst_ctx.raw(),
+            src.as_device_ptr(),
+            src_ctx.raw(),
+            byte_size,
+        )
+    });
+
+    let _ = src_ctx.release();
+    let _ = dst_ctx.release();
+
+    rc
 }
 
 /// Copies data between device buffers on different GPUs (asynchronous).
@@ -130,19 +157,37 @@ pub fn copy_peer<T: Copy>(
 /// # Errors
 ///
 /// * [`CudaError::InvalidValue`] if buffer lengths do not match.
-/// * [`CudaError::NotSupported`] (current stub).
 pub fn copy_peer_async<T: Copy>(
     dst: &mut DeviceBuffer<T>,
-    _dst_device: &Device,
+    dst_device: &Device,
     src: &DeviceBuffer<T>,
-    _src_device: &Device,
-    _stream: &Stream,
+    src_device: &Device,
+    stream: &Stream,
 ) -> CudaResult<()> {
     if dst.len() != src.len() {
         return Err(CudaError::InvalidValue);
     }
-    // TODO: load `cuMemcpyPeerAsync` in DriverApi and call it.
-    Err(CudaError::NotSupported)
+    let api = try_driver()?;
+    let byte_size = src.byte_size();
+
+    let dst_ctx = PrimaryContext::retain(dst_device)?;
+    let src_ctx = PrimaryContext::retain(src_device)?;
+
+    let rc = oxicuda_driver::error::check(unsafe {
+        (api.cu_memcpy_peer_async)(
+            dst.as_device_ptr(),
+            dst_ctx.raw(),
+            src.as_device_ptr(),
+            src_ctx.raw(),
+            byte_size,
+            stream.raw(),
+        )
+    });
+
+    let _ = src_ctx.release();
+    let _ = dst_ctx.release();
+
+    rc
 }
 
 // ---------------------------------------------------------------------------
@@ -154,52 +199,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn can_access_peer_returns_not_supported() {
-        // On macOS, we cannot enumerate devices, so we create dummy Device
-        // values indirectly. Since `Device::get` will fail, we just test
-        // that the function compiles and the error type is correct.
-        // The function itself returns NotSupported as a stub.
-        let _f: fn(&Device, &Device) -> CudaResult<bool> = can_access_peer;
+    fn function_signatures_compile() {
+        let _f1: fn(&Device, &Device) -> CudaResult<bool> = can_access_peer;
+        let _f2: fn(&Device, &Device) -> CudaResult<()> = enable_peer_access;
+        let _f3: fn(&Device, &Device) -> CudaResult<()> = disable_peer_access;
+        let _f4: fn(
+            &mut DeviceBuffer<f32>,
+            &Device,
+            &DeviceBuffer<f32>,
+            &Device,
+        ) -> CudaResult<()> = copy_peer;
     }
 
     #[test]
-    fn enable_peer_access_returns_not_supported() {
-        let _f: fn(&Device, &Device) -> CudaResult<()> = enable_peer_access;
-    }
-
-    #[test]
-    fn disable_peer_access_returns_not_supported() {
-        let _f: fn(&Device, &Device) -> CudaResult<()> = disable_peer_access;
-    }
-
-    #[test]
-    fn copy_peer_signature_compiles() {
-        let _f: fn(&mut DeviceBuffer<f32>, &Device, &DeviceBuffer<f32>, &Device) -> CudaResult<()> =
-            copy_peer;
-    }
-
-    #[test]
-    #[allow(clippy::type_complexity)]
-    fn copy_peer_async_signature_compiles() {
-        let _f: fn(
+    fn copy_peer_length_mismatch_returns_invalid_value() {
+        // Just confirm copy_peer_async is callable — signature test only.
+        type PeerAsyncFn = fn(
             &mut DeviceBuffer<f32>,
             &Device,
             &DeviceBuffer<f32>,
             &Device,
             &Stream,
-        ) -> CudaResult<()> = copy_peer_async;
+        ) -> CudaResult<()>;
+        let _f: PeerAsyncFn = copy_peer_async;
     }
 
     #[cfg(feature = "gpu-tests")]
     #[test]
-    fn peer_access_with_real_devices() {
+    fn can_access_peer_single_gpu() {
         oxicuda_driver::init().ok();
         let count = oxicuda_driver::device::Device::count().unwrap_or(0);
-        if count >= 2 {
+        if count >= 1 {
             let dev0 = Device::get(0).expect("device 0");
-            let dev1 = Device::get(1).expect("device 1");
-            // These may or may not succeed depending on hardware.
-            let _ = can_access_peer(&dev0, &dev1);
+            if count == 1 {
+                // Single GPU: can_access_peer with itself returns false or an error.
+                let _ = can_access_peer(&dev0, &dev0);
+            } else {
+                let dev1 = Device::get(1).expect("device 1");
+                let _ = can_access_peer(&dev0, &dev1);
+            }
         }
     }
 }

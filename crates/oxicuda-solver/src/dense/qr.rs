@@ -192,6 +192,14 @@ pub fn qr_generate_q<T: GpuFloat>(
         ));
     }
 
+    let a_required = m as usize * n as usize;
+    if a.len() < a_required {
+        return Err(SolverError::DimensionMismatch(format!(
+            "qr_generate_q: A buffer too small ({} < {a_required})",
+            a.len()
+        )));
+    }
+
     // Initialize Q = I (identity matrix).
     // Then apply Householder reflections in reverse order:
     // Q = H(k-1) * ... * H(1) * H(0) * I
@@ -201,12 +209,139 @@ pub fn qr_generate_q<T: GpuFloat>(
     // in reverse, forming the compact WY representation for each block
     // and applying it to Q via GEMM.
 
-    // The actual kernel-based implementation would initialize Q as identity,
-    // then apply each block of Householder reflections. The structure
-    // delegates to the same blocked application used in qr_solve.
-    let _ = (handle, a, tau, q);
+    // Host fallback: reconstruct explicit Q from Householder vectors.
+    // This provides correctness until the fully blocked GPU ORGQR path lands.
+    let mut a_host = vec![T::gpu_zero(); a_required];
+    a.copy_to_host(&mut a_host)?;
+
+    let mut tau_host = vec![T::gpu_zero(); k as usize];
+    tau.copy_to_host(&mut tau_host)?;
+
+    let q_host = form_explicit_q_from_householder_host(&a_host, &tau_host, m, n, m)?;
+    q.copy_from_host(&q_host)?;
+
+    let _ = handle;
 
     Ok(())
+}
+
+fn form_explicit_q_from_householder_host<T: GpuFloat>(
+    a_host: &[T],
+    tau_host: &[T],
+    m: u32,
+    n: u32,
+    lda: u32,
+) -> SolverResult<Vec<T>> {
+    let m_usize = m as usize;
+    let n_usize = n as usize;
+    let lda_usize = lda as usize;
+    let k = m_usize.min(n_usize);
+
+    if a_host.len() < lda_usize * n_usize {
+        return Err(SolverError::DimensionMismatch(
+            "form_explicit_q: A host buffer too small".into(),
+        ));
+    }
+    if tau_host.len() < k {
+        return Err(SolverError::DimensionMismatch(
+            "form_explicit_q: tau host buffer too small".into(),
+        ));
+    }
+
+    if T::SIZE == 4 {
+        let a_f32: Vec<f32> = a_host
+            .iter()
+            .map(|&v| f32::from_bits(v.to_bits_u64() as u32))
+            .collect();
+        let tau_f32: Vec<f32> = tau_host
+            .iter()
+            .map(|&v| f32::from_bits(v.to_bits_u64() as u32))
+            .collect();
+
+        let mut q_f32 = vec![0.0_f32; m_usize * m_usize];
+        for col in 0..m_usize {
+            q_f32[col * m_usize + col] = 1.0;
+        }
+
+        // Q = H_0 H_1 ... H_{k-1}, apply each Householder from the left.
+        for i in 0..k {
+            let tau_i = tau_f32[i];
+            if tau_i == 0.0 {
+                continue;
+            }
+
+            for col in 0..m_usize {
+                let mut dot = q_f32[col * m_usize + i];
+                for row in (i + 1)..m_usize {
+                    let v_row = a_f32[i * lda_usize + row];
+                    dot += v_row * q_f32[col * m_usize + row];
+                }
+
+                let scale = tau_i * dot;
+                q_f32[col * m_usize + i] -= scale;
+                for row in (i + 1)..m_usize {
+                    let v_row = a_f32[i * lda_usize + row];
+                    q_f32[col * m_usize + row] -= scale * v_row;
+                }
+            }
+        }
+
+        let q_t: Vec<T> = q_f32
+            .into_iter()
+            .map(|x| T::from_bits_u64(u64::from(x.to_bits())))
+            .collect();
+        return Ok(q_t);
+    }
+
+    if T::SIZE == 8 {
+        let a_f64: Vec<f64> = a_host
+            .iter()
+            .map(|&v| f64::from_bits(v.to_bits_u64()))
+            .collect();
+        let tau_f64: Vec<f64> = tau_host
+            .iter()
+            .map(|&v| f64::from_bits(v.to_bits_u64()))
+            .collect();
+
+        let mut q_f64 = vec![0.0_f64; m_usize * m_usize];
+        for col in 0..m_usize {
+            q_f64[col * m_usize + col] = 1.0;
+        }
+
+        // Q = H_0 H_1 ... H_{k-1}, apply each Householder from the left.
+        for i in 0..k {
+            let tau_i = tau_f64[i];
+            if tau_i == 0.0 {
+                continue;
+            }
+
+            for col in 0..m_usize {
+                let mut dot = q_f64[col * m_usize + i];
+                for row in (i + 1)..m_usize {
+                    let v_row = a_f64[i * lda_usize + row];
+                    dot += v_row * q_f64[col * m_usize + row];
+                }
+
+                let scale = tau_i * dot;
+                q_f64[col * m_usize + i] -= scale;
+                for row in (i + 1)..m_usize {
+                    let v_row = a_f64[i * lda_usize + row];
+                    q_f64[col * m_usize + row] -= scale * v_row;
+                }
+            }
+        }
+
+        let q_t: Vec<T> = q_f64
+            .into_iter()
+            .map(|x| T::from_bits_u64(x.to_bits()))
+            .collect();
+        return Ok(q_t);
+    }
+
+    Err(SolverError::InternalError(format!(
+        "form_explicit_q: unsupported precision size {}",
+        T::SIZE
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -452,5 +587,31 @@ mod tests {
         assert!((det_a - 5.0).abs() < 1e-14, "det(A) must be 5, got {det_a}");
         // QR_BLOCK_SIZE must be 32 (panel factorization tuning requirement)
         assert_eq!(QR_BLOCK_SIZE, 32, "QR panel block size must be 32");
+    }
+
+    #[test]
+    fn form_explicit_q_identity_when_tau_zero() {
+        // Column-major A with lda=m, values unused when tau is zero.
+        let m = 3_u32;
+        let n = 2_u32;
+        let lda = m;
+        let a_host = vec![0.0_f64; (lda * n) as usize];
+        let tau_host = vec![0.0_f64; m.min(n) as usize];
+
+        let q = form_explicit_q_from_householder_host(&a_host, &tau_host, m, n, lda)
+            .expect("Q generation should succeed");
+
+        // Identity in column-major: idx = col*m + row
+        for col in 0..m as usize {
+            for row in 0..m as usize {
+                let expected = if row == col { 1.0 } else { 0.0 };
+                assert!(
+                    (q[col * m as usize + row] - expected).abs() < 1e-12,
+                    "Q({}, {}) mismatch",
+                    row,
+                    col
+                );
+            }
+        }
     }
 }

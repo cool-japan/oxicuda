@@ -64,6 +64,14 @@ let plan_2d = FftPlan::new_2d(256, 256, FftType::C2C).expect("2d plan");
 |---------|------------------------------------|
 | `f16`   | Half-precision (fp16) FFT support  |
 
+## Status
+
+| Metric | Value |
+|--------|-------|
+| Version | 0.1.3 |
+| Tests passing | 314 |
+| Release date | 2026-04-17 |
+
 ## License
 
 Apache-2.0 -- (C) 2026 COOLJAPAN OU (Team KitaSan)

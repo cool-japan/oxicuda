@@ -47,11 +47,13 @@
 //! used by the pipeline layer and can also be called directly for custom
 //! kernel compilation.
 
+pub mod ane;
 pub mod backend;
 pub mod device;
 pub mod error;
 pub mod fft;
 pub mod memory;
+pub mod mps;
 pub mod msl;
 pub mod pipeline;
 

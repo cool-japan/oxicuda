@@ -14,13 +14,9 @@
 //! The L and U factors overwrite the input matrix A in-place (LAPACK-style packed
 //! storage with unit diagonal for L implicitly assumed).
 
-use std::sync::Arc;
-
 use oxicuda_blas::types::{
     DiagType, FillMode, GpuFloat, Layout, MatrixDesc, MatrixDescMut, Side, Transpose,
 };
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
@@ -326,7 +322,7 @@ fn blocked_lu<T: GpuFloat>(
 ///
 /// Returns the panel-local info (0 if success, >0 if singular at panel-local column).
 fn panel_lu<T: GpuFloat>(
-    handle: &SolverHandle,
+    _handle: &SolverHandle,
     a: &mut DeviceBuffer<T>,
     n: u32,
     lda: u32,
@@ -334,35 +330,118 @@ fn panel_lu<T: GpuFloat>(
     jb: u32,
     pivots: &mut DeviceBuffer<i32>,
 ) -> SolverResult<i32> {
-    let sm = handle.sm_version();
-    let panel_rows = n - j;
+    // Keep PTX generation path exercised while host fallback is active.
+    let _ = emit_panel_lu::<T>(_handle.sm_version(), jb)?;
 
-    // Generate panel LU PTX kernel.
-    let ptx = emit_panel_lu::<T>(sm, jb)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &panel_lu_name::<T>(jb))?;
+    let n_usize = n as usize;
+    let lda_usize = lda as usize;
+    let j_usize = j as usize;
+    let jb_usize = jb as usize;
 
-    // The panel kernel processes one column at a time within a single CTA.
-    // Shared memory holds the panel for fast access.
-    let shared_bytes = panel_rows * jb * T::size_u32();
-    let params = LaunchParams::new(1u32, SOLVER_BLOCK_SIZE).with_shared_mem(shared_bytes);
+    let mut a_host = vec![T::gpu_zero(); a.len()];
+    a.copy_to_host(&mut a_host)?;
 
-    // Pointer to the start of the panel: A[j, j].
-    let panel_offset = (j as u64 + j as u64 * lda as u64) * T::SIZE as u64;
-    let panel_ptr = a.as_device_ptr() + panel_offset;
+    let mut piv_host = vec![0_i32; pivots.len()];
+    pivots.copy_to_host(&mut piv_host)?;
 
-    let args = (
-        panel_ptr,
-        pivots.as_device_ptr() + (j as u64 * 4), // pivots are i32 = 4 bytes
-        panel_rows,
-        jb,
-        lda,
-    );
-    kernel.launch(&params, handle.stream(), &args)?;
+    let mut info: i32 = 0;
+    let panel_end = (j_usize + jb_usize).min(n_usize);
 
-    // The info is stored in the pivot output; a zero pivot indicates singularity.
-    // For the structural implementation, return success.
-    Ok(0)
+    for kk in 0..jb_usize {
+        let col = j_usize + kk;
+        if col >= n_usize {
+            break;
+        }
+
+        // Pivot search in column `col` over rows col..n-1.
+        let mut pivot_row = col;
+        let mut max_abs = 0.0_f64;
+        for row in col..n_usize {
+            let bits = a_host[col * lda_usize + row].to_bits_u64();
+            let val = if T::SIZE == 8 {
+                f64::from_bits(bits)
+            } else {
+                f64::from(f32::from_bits(bits as u32))
+            };
+            let abs = val.abs();
+            if abs > max_abs {
+                max_abs = abs;
+                pivot_row = row;
+            }
+        }
+
+        piv_host[col] = pivot_row as i32;
+
+        // Swap within panel columns; trailing columns are swapped later.
+        if pivot_row != col {
+            for c in j_usize..panel_end {
+                a_host.swap(c * lda_usize + col, c * lda_usize + pivot_row);
+            }
+        }
+
+        // Detect singular pivot in the panel (1-based panel-local info).
+        let pivot_bits = a_host[col * lda_usize + col].to_bits_u64();
+        let pivot_val = if T::SIZE == 8 {
+            f64::from_bits(pivot_bits)
+        } else {
+            f64::from(f32::from_bits(pivot_bits as u32))
+        };
+        if info == 0 && pivot_val.abs() <= 1e-30 {
+            info = (kk + 1) as i32;
+            continue;
+        }
+
+        // Scale below-diagonal entries in this panel column.
+        for row in (col + 1)..n_usize {
+            let x_bits = a_host[col * lda_usize + row].to_bits_u64();
+            let x = if T::SIZE == 8 {
+                f64::from_bits(x_bits)
+            } else {
+                f64::from(f32::from_bits(x_bits as u32))
+            };
+            let scaled = x / pivot_val;
+            a_host[col * lda_usize + row] = if T::SIZE == 8 {
+                T::from_bits_u64(scaled.to_bits())
+            } else {
+                T::from_bits_u64(u64::from((scaled as f32).to_bits()))
+            };
+        }
+
+        // Update trailing panel columns.
+        for c in (col + 1)..panel_end {
+            let uk_bits = a_host[c * lda_usize + col].to_bits_u64();
+            let u_kc = if T::SIZE == 8 {
+                f64::from_bits(uk_bits)
+            } else {
+                f64::from(f32::from_bits(uk_bits as u32))
+            };
+            for row in (col + 1)..n_usize {
+                let l_bits = a_host[col * lda_usize + row].to_bits_u64();
+                let l_rc = if T::SIZE == 8 {
+                    f64::from_bits(l_bits)
+                } else {
+                    f64::from(f32::from_bits(l_bits as u32))
+                };
+                let a_bits = a_host[c * lda_usize + row].to_bits_u64();
+                let a_rc = if T::SIZE == 8 {
+                    f64::from_bits(a_bits)
+                } else {
+                    f64::from(f32::from_bits(a_bits as u32))
+                };
+                let updated = a_rc - l_rc * u_kc;
+                a_host[c * lda_usize + row] = if T::SIZE == 8 {
+                    T::from_bits_u64(updated.to_bits())
+                } else {
+                    T::from_bits_u64(u64::from((updated as f32).to_bits()))
+                };
+            }
+        }
+    }
+
+    a.copy_from_host(&a_host)?;
+    pivots.copy_from_host(&piv_host)?;
+
+    Ok(info)
 }
 
 /// Applies pivot swaps from panel factorization to columns outside the panel.
@@ -371,7 +450,7 @@ fn panel_lu<T: GpuFloat>(
 /// `[col_start..col_start+col_count]`.
 #[allow(clippy::too_many_arguments)]
 fn apply_panel_pivots<T: GpuFloat>(
-    handle: &SolverHandle,
+    _handle: &SolverHandle,
     a: &mut DeviceBuffer<T>,
     lda: u32,
     j: u32,
@@ -384,31 +463,47 @@ fn apply_panel_pivots<T: GpuFloat>(
         return Ok(());
     }
 
-    let sm = handle.sm_version();
-    let ptx = emit_pivot_swap::<T>(sm)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &pivot_swap_name::<T>())?;
+    // Keep PTX generation path exercised while host fallback is active.
+    let _ = emit_pivot_swap::<T>(_handle.sm_version())?;
 
-    let grid = grid_size_for(col_count, SOLVER_BLOCK_SIZE);
-    let params = LaunchParams::new(grid, SOLVER_BLOCK_SIZE);
+    let lda_usize = lda as usize;
+    let j_usize = j as usize;
+    let jb_usize = jb as usize;
+    let col_start_usize = col_start as usize;
+    let col_end = col_start_usize + col_count as usize;
 
-    let args = (
-        a.as_device_ptr(),
-        pivots.as_device_ptr(),
-        j,
-        jb,
-        col_start,
-        col_count,
-        lda,
-    );
-    kernel.launch(&params, handle.stream(), &args)?;
+    let mut a_host = vec![T::gpu_zero(); a.len()];
+    a.copy_to_host(&mut a_host)?;
+    let mut piv_host = vec![0_i32; pivots.len()];
+    pivots.copy_to_host(&mut piv_host)?;
+
+    for t in 0..jb_usize {
+        let row = j_usize + t;
+        if row >= piv_host.len() {
+            break;
+        }
+        let piv = piv_host[row].max(0) as usize;
+        if piv >= lda_usize {
+            return Err(SolverError::DimensionMismatch(format!(
+                "apply_panel_pivots: pivot index out of range ({piv} >= lda {lda_usize})"
+            )));
+        }
+        if piv == row {
+            continue;
+        }
+        for col in col_start_usize..col_end {
+            a_host.swap(col * lda_usize + row, col * lda_usize + piv);
+        }
+    }
+
+    a.copy_from_host(&a_host)?;
 
     Ok(())
 }
 
 /// Applies pivot permutations to the right-hand side B.
 fn apply_pivots_to_rhs<T: GpuFloat>(
-    handle: &SolverHandle,
+    _handle: &SolverHandle,
     b: &mut DeviceBuffer<T>,
     pivots: &DeviceBuffer<i32>,
     n: u32,
@@ -418,25 +513,37 @@ fn apply_pivots_to_rhs<T: GpuFloat>(
         return Ok(());
     }
 
-    let sm = handle.sm_version();
-    let ptx = emit_pivot_swap::<T>(sm)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &pivot_swap_name::<T>())?;
+    // Keep PTX generation path exercised while host fallback is active.
+    let _ = emit_pivot_swap::<T>(_handle.sm_version())?;
 
-    let grid = grid_size_for(nrhs, SOLVER_BLOCK_SIZE);
-    let params = LaunchParams::new(grid, SOLVER_BLOCK_SIZE);
+    let n_usize = n as usize;
+    let nrhs_usize = nrhs as usize;
 
-    // Apply all n pivots across all nrhs columns of B.
-    let args = (
-        b.as_device_ptr(),
-        pivots.as_device_ptr(),
-        0u32, // start
-        n,    // count
-        0u32, // col_start
-        nrhs, // col_count
-        n,    // lda = n for B
-    );
-    kernel.launch(&params, handle.stream(), &args)?;
+    let mut b_host = vec![T::gpu_zero(); b.len()];
+    b.copy_to_host(&mut b_host)?;
+    let mut piv_host = vec![0_i32; pivots.len()];
+    pivots.copy_to_host(&mut piv_host)?;
+
+    // Apply all pivots across all RHS columns (column-major, lda = n).
+    for row in 0..n_usize {
+        if row >= piv_host.len() {
+            break;
+        }
+        let piv = piv_host[row].max(0) as usize;
+        if piv >= n_usize {
+            return Err(SolverError::DimensionMismatch(format!(
+                "apply_pivots_to_rhs: pivot index out of range ({piv} >= n {n_usize})"
+            )));
+        }
+        if piv == row {
+            continue;
+        }
+        for col in 0..nrhs_usize {
+            b_host.swap(col * n_usize + row, col * n_usize + piv);
+        }
+    }
+
+    b.copy_from_host(&b_host)?;
 
     Ok(())
 }

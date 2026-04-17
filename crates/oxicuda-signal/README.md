@@ -8,7 +8,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 
 ## Features
 
-- **Spectral transforms** — DCT-II/III/IV, MDCT/IMDCT via the `dct` module; Haar, Daubechies db2–db10, Symlets, and multi-level DWT via the `dwt` module
+- **Spectral transforms** — DCT-II/III/IV, MDCT/IMDCT via the `dct` module; Haar, Daubechies db2–db10, Symlets, Biorthogonal, and Coiflet wavelets with multi-level DWT via the `dwt` module
 - **Audio processing** — STFT, mel filterbank, MFCC, chroma features, and spectrogram variants (magnitude, power, mel)
 - **Filtering** — FIR (windowed-sinc, raised-cosine), IIR (biquad SOS cascade), and Wiener filter
 - **Correlation** — Autocorrelation, cross-correlation, GCC-PHAT time-delay estimation, circular convolution, PACF, Ljung-Box Q
@@ -21,7 +21,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-signal = "0.1.2"
+oxicuda-signal = "0.1.3"
 ```
 
 ```rust
@@ -37,6 +37,10 @@ let signal = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 let decomp = multilevel_forward(&signal, WaveletFamily::Haar, 2).unwrap();
 let reconstructed = multilevel_inverse(&decomp, WaveletFamily::Haar).unwrap();
 ```
+
+## Status
+
+**v0.1.3** (2026-04-17) — 240 tests passing
 
 ## License
 

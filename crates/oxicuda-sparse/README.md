@@ -71,6 +71,14 @@ let csr = CsrMatrix::new(3, 2, row_ptr, col_idx, values);
 |---------|---------------------------------------|
 | `f16`   | Half-precision (fp16) sparse support  |
 
+## Status
+
+| Metric | Value |
+|--------|-------|
+| Version | 0.1.3 |
+| Tests passing | 322 |
+| Release date | 2026-04-17 |
+
 ## License
 
 Apache-2.0 -- (C) 2026 COOLJAPAN OU (Team KitaSan)

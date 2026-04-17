@@ -694,15 +694,79 @@ pub fn generate_pruned_butterfly_ptx(
                         (cos_r, sin_r)
                     }
                     PtxType::F64 => {
-                        // f64: no approx intrinsic; use raw_ptx placeholder
-                        // (real code would call a device-side libm or table).
+                        // f64: lightweight polynomial with angle reduction
+                        // x = angle - round(angle / 2pi) * 2pi, x in [-pi, pi]
+                        // sin(x) ~= x - x^3/6 + x^5/120
+                        // cos(x) ~= 1 - x^2/2 + x^4/24
+                        let two_pi = b.alloc_reg(PtxType::F64);
+                        let inv_two_pi = b.alloc_reg(PtxType::F64);
+                        let one = b.alloc_reg(PtxType::F64);
+                        let neg_half = b.alloc_reg(PtxType::F64);
+                        let one_over_24 = b.alloc_reg(PtxType::F64);
+                        let neg_one_over_6 = b.alloc_reg(PtxType::F64);
+                        let one_over_120 = b.alloc_reg(PtxType::F64);
+
+                        b.raw_ptx(&format!(
+                            "mov.b64 {two_pi}, 0D{:016X};",
+                            (2.0 * std::f64::consts::PI).to_bits()
+                        ));
+                        b.raw_ptx(&format!(
+                            "mov.b64 {inv_two_pi}, 0D{:016X};",
+                            (1.0 / (2.0 * std::f64::consts::PI)).to_bits()
+                        ));
+                        b.raw_ptx(&format!("mov.b64 {one}, 0D{:016X};", 1.0_f64.to_bits()));
+                        b.raw_ptx(&format!(
+                            "mov.b64 {neg_half}, 0D{:016X};",
+                            (-0.5_f64).to_bits()
+                        ));
+                        b.raw_ptx(&format!(
+                            "mov.b64 {one_over_24}, 0D{:016X};",
+                            (1.0_f64 / 24.0_f64).to_bits()
+                        ));
+                        b.raw_ptx(&format!(
+                            "mov.b64 {neg_one_over_6}, 0D{:016X};",
+                            (-(1.0_f64 / 6.0_f64)).to_bits()
+                        ));
+                        b.raw_ptx(&format!(
+                            "mov.b64 {one_over_120}, 0D{:016X};",
+                            (1.0_f64 / 120.0_f64).to_bits()
+                        ));
+
+                        let scaled = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("mul.rn.f64 {scaled}, {angle}, {inv_two_pi};"));
+                        let k_i64 = b.alloc_reg(PtxType::S64);
+                        b.raw_ptx(&format!("cvt.rni.s64.f64 {k_i64}, {scaled};"));
+                        let k_f64 = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("cvt.rn.f64.s64 {k_f64}, {k_i64};"));
+                        let k_two_pi = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("mul.rn.f64 {k_two_pi}, {k_f64}, {two_pi};"));
+                        let x = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("sub.rn.f64 {x}, {angle}, {k_two_pi};"));
+
+                        let x2 = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("mul.rn.f64 {x2}, {x}, {x};"));
+                        let x3 = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("mul.rn.f64 {x3}, {x2}, {x};"));
+                        let x4 = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("mul.rn.f64 {x4}, {x2}, {x2};"));
+                        let x5 = b.alloc_reg(PtxType::F64);
+                        b.raw_ptx(&format!("mul.rn.f64 {x5}, {x3}, {x2};"));
+
                         let cos_r = b.alloc_reg(PtxType::F64);
                         let sin_r = b.alloc_reg(PtxType::F64);
+
+                        // sin(x) = x + (-1/6)*x^3 + (1/120)*x^5
+                        let sin_t = b.fma_f64(neg_one_over_6, x3, x.clone());
                         b.raw_ptx(&format!(
-                            "// f64 twiddle: cos/sin placeholder\n\
-                             mov.b64 {cos_r}, 0D3FF0000000000000;\n\
-                             mov.b64 {sin_r}, 0D0000000000000000;"
+                            "fma.rn.f64 {sin_r}, {one_over_120}, {x5}, {sin_t};"
                         ));
+
+                        // cos(x) = 1 + (-1/2)*x^2 + (1/24)*x^4
+                        let cos_t = b.fma_f64(neg_half, x2, one);
+                        b.raw_ptx(&format!(
+                            "fma.rn.f64 {cos_r}, {one_over_24}, {x4}, {cos_t};"
+                        ));
+
                         (cos_r, sin_r)
                     }
                     _ => return,
@@ -1088,6 +1152,10 @@ mod tests {
         let ptx = result.unwrap_or_else(|e| panic!("{e}"));
         assert!(ptx.contains("pruned_butterfly_f64_n128_s0_"));
         assert!(ptx.contains(".target sm_90"));
+        assert!(!ptx.contains("cos/sin placeholder"));
+        assert!(ptx.contains("cvt.rni.s64.f64"));
+        assert!(ptx.contains("cvt.rn.f64.s64"));
+        assert!(ptx.contains("fma.rn.f64"));
     }
 
     // -- Edge case tests ----------------------------------------------------

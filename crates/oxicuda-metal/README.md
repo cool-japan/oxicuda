@@ -12,6 +12,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 - Shared-mode `MTLBuffer` pool via `MetalMemoryManager` for efficient host-visible GPU allocation
 - `MetalDevice` abstraction for device enumeration and command queue management
 - `msl` module with MSL source-string generators for GEMM, element-wise ops, and reductions — usable directly for custom kernel compilation
+- `mps` module with Metal Performance Shaders (MPS) interop for hardware-accelerated GEMM, image convolution, and normalization via `MPSMatrixMultiplication`
 - Metal compute `pipeline` module for shader compilation and dispatch
 - Conditional macOS compilation: the `metal` crate is only linked on `target_os = "macos"`
 
@@ -28,7 +29,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-metal = "0.1.2"
+oxicuda-metal = "0.1.3"
 ```
 
 ```rust
@@ -42,6 +43,11 @@ let ptr = backend.alloc(256)?;
 // ... copy data, launch Metal kernels ...
 backend.free(ptr)?;
 ```
+
+## Status
+
+- **Version**: 0.1.3 (2026-04-17)
+- **Tests**: 152 passing
 
 ## License
 

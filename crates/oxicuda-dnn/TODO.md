@@ -210,16 +210,16 @@ Fused MoE, Winograd convolution) are all present.
 | D8 | RoPE (Rotary Positional Embedding) — in-place Q/K application | P0 | [x] |
 | D9 | MoE routing — Top-K softmax selection | P0 | [x] |
 | D10 | Fused MoE kernel — token-parallel and expert-parallel strategies | P0 | [x] |
-| D11 | LayerNorm — per-row normalization with gamma/beta | P0 | [ ] Verify |
-| D12 | RMSNorm — LLaMA-style without mean centering | P0 | [ ] Verify |
-| D13 | BatchNorm forward — inference mode | P0 | [ ] Verify |
-| D14 | BatchNorm backward — training mode gradient | P1 | [ ] Verify |
-| D15 | GroupNorm | P2 | [ ] Verify |
-| D16 | MaxPool2D and AvgPool2D | P0 | [ ] Verify |
-| D17 | AdaptiveAvgPool2D — including global average pooling | P0 | [ ] Verify |
-| D18 | FP8 quantize / dequantize (Hopper+) | P1 | [ ] Verify |
-| D19 | Fused Conv + BatchNorm + ReLU | P0 | [ ] Verify |
-| D20 | Fused Add + RMSNorm (Transformer Add&Norm pattern) | P0 | [ ] Verify |
+| D11 | LayerNorm — per-row normalization with gamma/beta | P0 | [x] |
+| D12 | RMSNorm — LLaMA-style without mean centering | P0 | [x] |
+| D13 | BatchNorm forward — inference mode | P0 | [x] |
+| D14 | BatchNorm backward — training mode gradient | P1 | [x] |
+| D15 | GroupNorm | P2 | [x] |
+| D16 | MaxPool2D and AvgPool2D | P0 | [x] |
+| D17 | AdaptiveAvgPool2D — including global average pooling | P0 | [x] |
+| D18 | FP8 quantize / dequantize (Hopper+) | P1 | [x] |
+| D19 | Fused Conv + BatchNorm + ReLU | P0 | [x] |
+| D20 | Fused Add + RMSNorm (Transformer Add&Norm pattern) | P0 | [x] |
 
 ### Performance Requirements
 

@@ -195,6 +195,7 @@ pub fn dc_svd<T: GpuFloat>(
     let mut d = vec![0.0_f64; k];
     let mut e = vec![0.0_f64; k.saturating_sub(1)];
     bidiagonalize_extract(a, m, n, &mut d, &mut e)?;
+    apply_deflation_to_superdiag(&d, &mut e, config.deflation_tol);
 
     // Step 2: Apply divide-and-conquer to the bidiagonal matrix.
     let mut u_dc = if config.compute_u {
@@ -225,12 +226,19 @@ pub fn dc_svd<T: GpuFloat>(
     let sigma_host: Vec<T> = d.iter().map(|&val| from_f64(val.abs())).collect();
     write_to_device_buffer(sigma, &sigma_host, k)?;
 
-    // U and V^T reconstruction would multiply with bidiagonalization transforms.
-    // For the structural implementation, write identity-like placeholders.
+    // Map kxk DC vectors into the requested output shapes (m x k and k x n).
     if let Some(u_buf) = u {
         if config.compute_u {
             let u_host: Vec<T> = if let Some(ref u_mat) = u_dc {
-                u_mat.iter().map(|&v| from_f64(v)).collect()
+                let mut out = vec![T::gpu_zero(); m * k];
+                let rows = k.min(m);
+                for col in 0..k {
+                    for row in 0..rows {
+                        // Both are column-major; u_mat is k x k, out is m x k.
+                        out[col * m + row] = from_f64(u_mat[col * k + row]);
+                    }
+                }
+                out
             } else {
                 vec![T::gpu_zero(); m * k]
             };
@@ -240,7 +248,15 @@ pub fn dc_svd<T: GpuFloat>(
     if let Some(vt_buf) = vt {
         if config.compute_vt {
             let vt_host: Vec<T> = if let Some(ref vt_mat) = vt_dc {
-                vt_mat.iter().map(|&v| from_f64(v)).collect()
+                let mut out = vec![T::gpu_zero(); k * n];
+                let cols = k.min(n);
+                for row in 0..k {
+                    for col in 0..cols {
+                        // Both are row-major for V^T rows in this indexing.
+                        out[row * n + col] = from_f64(vt_mat[row * k + col]);
+                    }
+                }
+                out
             } else {
                 vec![T::gpu_zero(); k * n]
             };
@@ -257,24 +273,125 @@ pub fn dc_svd<T: GpuFloat>(
 
 /// Extracts bidiagonal representation from the matrix.
 ///
-/// In a full implementation, this would perform Householder bidiagonalization
-/// on the GPU and read back the diagonal/superdiagonal. For the structural
-/// implementation, we initialize from the matrix diagonal elements.
+/// Performs host-side Householder bidiagonalization after copying the matrix
+/// from device memory.  Outputs the diagonal `d` and superdiagonal `e` of an
+/// upper-bidiagonal form.
 fn bidiagonalize_extract<T: GpuFloat>(
-    _a: &DeviceBuffer<T>,
-    _m: usize,
-    _n: usize,
+    a: &DeviceBuffer<T>,
+    m: usize,
+    n: usize,
     d: &mut [f64],
     e: &mut [f64],
 ) -> SolverResult<()> {
-    // Structural: set diagonal to 1.0 and superdiagonal to 0.0
-    // (identity-like bidiagonal matrix).
-    for val in d.iter_mut() {
-        *val = 1.0;
+    if m == 0 || n == 0 {
+        d.fill(0.0);
+        e.fill(0.0);
+        return Ok(());
     }
-    for val in e.iter_mut() {
-        *val = 0.0;
+
+    let k = m.min(n);
+    if d.len() < k || e.len() < k.saturating_sub(1) {
+        return Err(SolverError::DimensionMismatch(
+            "bidiagonalize_extract: output buffers too small".into(),
+        ));
     }
+
+    // Read matrix from device (full allocation), then operate on the leading
+    // m*n region as a column-major matrix.
+    let mut full_host = vec![T::gpu_zero(); a.len()];
+    a.copy_to_host(&mut full_host)?;
+    let mut mat = vec![0.0_f64; m * n];
+    for col in 0..n {
+        for row in 0..m {
+            let idx = col * m + row;
+            mat[idx] = to_f64(full_host[idx]);
+        }
+    }
+
+    let sign = |x: f64| if x >= 0.0 { 1.0 } else { -1.0 };
+
+    // Golub-Kahan bidiagonalization (upper bidiagonal).
+    for i in 0..k {
+        // Left Householder: zero elements below diagonal in column i.
+        let mut col_norm2 = 0.0_f64;
+        for r in i..m {
+            let v = mat[i * m + r];
+            col_norm2 += v * v;
+        }
+        let col_norm = col_norm2.sqrt();
+        if col_norm > 0.0 {
+            let x0 = mat[i * m + i];
+            let alpha = -sign(x0) * col_norm;
+
+            let mut u = vec![0.0_f64; m - i];
+            for (r, ur) in u.iter_mut().enumerate() {
+                *ur = mat[i * m + (i + r)];
+            }
+            u[0] -= alpha;
+
+            let u_norm2 = u.iter().map(|x| x * x).sum::<f64>();
+            if u_norm2 > 0.0 {
+                let tau = 2.0 / u_norm2;
+                for col in i..n {
+                    let mut dot = 0.0_f64;
+                    for (r, &ur) in u.iter().enumerate() {
+                        dot += ur * mat[col * m + (i + r)];
+                    }
+                    dot *= tau;
+                    for (r, &ur) in u.iter().enumerate() {
+                        mat[col * m + (i + r)] -= dot * ur;
+                    }
+                }
+            }
+            mat[i * m + i] = alpha;
+        }
+
+        d[i] = mat[i * m + i];
+
+        // Right Householder: zero elements to the right of superdiagonal.
+        if i + 1 < n && i < k - 1 {
+            let mut row_norm2 = 0.0_f64;
+            for c in (i + 1)..n {
+                let v = mat[c * m + i];
+                row_norm2 += v * v;
+            }
+            let row_norm = row_norm2.sqrt();
+            if row_norm > 0.0 {
+                let x0 = mat[(i + 1) * m + i];
+                let alpha = -sign(x0) * row_norm;
+
+                let mut u = vec![0.0_f64; n - (i + 1)];
+                for (c, uc) in u.iter_mut().enumerate() {
+                    *uc = mat[(i + 1 + c) * m + i];
+                }
+                u[0] -= alpha;
+
+                let u_norm2 = u.iter().map(|x| x * x).sum::<f64>();
+                if u_norm2 > 0.0 {
+                    let tau = 2.0 / u_norm2;
+                    for r in i..m {
+                        let mut dot = 0.0_f64;
+                        for (c, &uc) in u.iter().enumerate() {
+                            dot += mat[(i + 1 + c) * m + r] * uc;
+                        }
+                        dot *= tau;
+                        for (c, &uc) in u.iter().enumerate() {
+                            mat[(i + 1 + c) * m + r] -= dot * uc;
+                        }
+                    }
+                }
+                mat[(i + 1) * m + i] = alpha;
+            }
+            e[i] = mat[(i + 1) * m + i];
+        }
+    }
+
+    if k > 1 {
+        for val in e.iter_mut().skip(k - 1) {
+            *val = 0.0;
+        }
+    }
+
     Ok(())
 }
 
@@ -394,8 +511,8 @@ fn merge_svd(
     alpha: f64,
     mid: usize,
     n: usize,
-    u: Option<&mut [f64]>,
-    vt: Option<&mut [f64]>,
+    mut u: Option<&mut [f64]>,
+    mut vt: Option<&mut [f64]>,
     u_left: Option<&[f64]>,
     vt_left: Option<&[f64]>,
     u_right: Option<&[f64]>,
@@ -404,37 +521,14 @@ fn merge_svd(
     if alpha.abs() < 1e-300 {
         // No coupling — the sub-SVDs are already the answer.
         // Just merge the U and V^T blocks.
-        merge_orthogonal_blocks(u, u_left, u_right, mid, n);
-        merge_orthogonal_blocks_transpose(vt, vt_left, vt_right, mid, n);
+        merge_orthogonal_blocks(u.as_deref_mut(), u_left, u_right, mid, n);
+        merge_orthogonal_blocks_transpose(vt.as_deref_mut(), vt_left, vt_right, mid, n);
         return Ok(());
     }
 
-    // Construct the z vector for the secular equation.
-    // z[i] encodes the coupling between the two halves.
-    let mut z = vec![0.0_f64; n];
-    // The last row of V_left^T contributes to the left part of z.
-    if let Some(vt_l) = vt_left {
-        for j in 0..mid {
-            let row = mid.saturating_sub(1);
-            z[j] = vt_l[row * mid + j] * alpha;
-        }
-    } else {
-        // Without V^T, use a simplified coupling vector.
-        if mid > 0 {
-            z[mid - 1] = alpha;
-        }
-    }
-    // The first row of V_right^T contributes to the right part of z.
-    if let Some(vt_r) = vt_right {
-        let right_size = n - mid;
-        for j in 0..right_size {
-            z[mid + j] = vt_r[j] * alpha; // first row of vt_right
-        }
-    } else {
-        if n > mid {
-            z[mid] = alpha;
-        }
-    }
+    // Construct the coupling vector for the secular equation.
+    // z[i] encodes rank-1 interaction between the two split blocks.
+    let z = build_secular_coupling_vector(vt_left, vt_right, alpha, mid, n);
 
     // Collect the current (sorted) singular values from both halves.
     let old_d: Vec<f64> = d[..n].to_vec();
@@ -445,12 +539,67 @@ fn merge_svd(
         *d_elem = sigma_new;
     }
 
-    // Update U and V^T using the deflation vectors from the secular equation.
-    // For the structural implementation, merge the block-diagonal structure.
-    merge_orthogonal_blocks(u, u_left, u_right, mid, n);
-    merge_orthogonal_blocks_transpose(vt, vt_left, vt_right, mid, n);
+    // Update U and V^T using a secular-vector mixing basis.
+    // This approximates the rank-1 coupling effect instead of leaving
+    // purely block-diagonal singular vectors.
+    merge_orthogonal_blocks(u.as_deref_mut(), u_left, u_right, mid, n);
+    merge_orthogonal_blocks_transpose(vt.as_deref_mut(), vt_left, vt_right, mid, n);
+
+    let q_mix = build_secular_mixing_matrix(&old_d, &z, d, n);
+    if let Some(u_mat) = u {
+        right_multiply_col_major_square(u_mat, &q_mix, n);
+    }
+    if let Some(vt_mat) = vt {
+        // V^T stores right singular vectors in rows.
+        // If V <- V * Q, then V^T <- Q^T * V^T.
+        left_multiply_row_major_square_by_qt(vt_mat, &q_mix, n);
+    }
 
     Ok(())
+}
+
+fn build_secular_coupling_vector(
+    vt_left: Option<&[f64]>,
+    vt_right: Option<&[f64]>,
+    alpha: f64,
+    mid: usize,
+    n: usize,
+) -> Vec<f64> {
+    let mut z = vec![0.0_f64; n];
+
+    if let Some(vt_l) = vt_left {
+        let row = mid.saturating_sub(1);
+        for j in 0..mid {
+            z[j] = vt_l[row * mid + j] * alpha;
+        }
+    }
+
+    if let Some(vt_r) = vt_right {
+        let right_size = n.saturating_sub(mid);
+        for j in 0..right_size {
+            z[mid + j] = vt_r[j] * alpha; // first row of V_right^T
+        }
+    }
+
+    // Fallback when one or both V^T blocks are unavailable:
+    // place coupling energy around the split boundary instead of a single spike.
+    if vt_left.is_none() && vt_right.is_none() {
+        if mid > 0 && mid < n {
+            let split = alpha * std::f64::consts::FRAC_1_SQRT_2;
+            z[mid - 1] = split;
+            z[mid] = split;
+        } else if n > 0 {
+            z[n - 1] = alpha;
+        }
+    } else if vt_left.is_none() {
+        if mid > 0 {
+            z[mid - 1] = alpha;
+        }
+    } else if vt_right.is_none() && mid < n {
+        z[mid] = alpha;
+    }
+
+    z
 }
 
 /// Solves the secular equation: `1 + sum_i z_i^2 / (d_i^2 - sigma^2) = 0`
@@ -471,11 +620,14 @@ fn solve_secular_equation(d: &[f64], z: &[f64], idx: usize, n: usize) -> SolverR
     } else {
         0.0
     };
-    let hi = if idx + 1 < sorted_d.len() {
+    let mut hi = if idx + 1 < sorted_d.len() {
         sorted_d[idx + 1].abs()
     } else {
         lo + z.iter().map(|zi| zi.abs()).sum::<f64>() + 1.0
     };
+    if hi <= lo {
+        hi = lo + 1e-9_f64.max(lo.abs() * 1e-6);
+    }
 
     // Newton iteration with bisection fallback.
     let mut sigma = (lo + hi) * 0.5;
@@ -486,7 +638,13 @@ fn solve_secular_equation(d: &[f64], z: &[f64], idx: usize, n: usize) -> SolverR
         let (f_val, f_deriv) = secular_function(d, z, sigma, n);
 
         if f_val.abs() < SECULAR_TOL {
-            return Ok(sigma);
+            if sigma.is_finite() {
+                return Ok(sigma);
+            }
+            return Err(SolverError::ConvergenceFailure {
+                iterations: SECULAR_MAX_ITER as u32,
+                residual: f_val.abs(),
+            });
         }
 
         // Newton step.
@@ -511,11 +669,32 @@ fn solve_secular_equation(d: &[f64], z: &[f64], idx: usize, n: usize) -> SolverR
         }
 
         if (hi_b - lo_b) < SECULAR_TOL * sigma.abs().max(1.0) {
-            return Ok(sigma);
+            if sigma.is_finite() {
+                return Ok(sigma);
+            }
+            return Err(SolverError::ConvergenceFailure {
+                iterations: SECULAR_MAX_ITER as u32,
+                residual: (hi_b - lo_b).abs(),
+            });
         }
     }
 
-    Ok(sigma)
+    Err(SolverError::ConvergenceFailure {
+        iterations: SECULAR_MAX_ITER as u32,
+        residual: (hi_b - lo_b).abs(),
+    })
+}
+
+fn apply_deflation_to_superdiag(d: &[f64], e: &mut [f64], tol: f64) {
+    if tol <= 0.0 {
+        return;
+    }
+    for i in 0..e.len() {
+        let scale = d[i].abs() + d[i + 1].abs();
+        if e[i].abs() <= tol * scale.max(1.0) {
+            e[i] = 0.0;
+        }
+    }
 }
 
 /// Evaluates the secular function and its derivative.
@@ -732,8 +911,134 @@ fn merge_orthogonal_blocks_transpose(
     mid: usize,
     n: usize,
 ) {
-    // For V^T the structure is the same as U (row-major blocks on the diagonal).
-    merge_orthogonal_blocks(vt, vt_left, vt_right, mid, n);
+    let Some(vt_mat) = vt else { return };
+    let right_size = n - mid;
+
+    // Row-major layout for V^T.
+    for val in vt_mat.iter_mut().take(n * n) {
+        *val = 0.0;
+    }
+
+    // Top-left block.
+    if let Some(vt_l) = vt_left {
+        for row in 0..mid {
+            for col in 0..mid {
+                vt_mat[row * n + col] = vt_l[row * mid + col];
+            }
+        }
+    } else {
+        for i in 0..mid {
+            vt_mat[i * n + i] = 1.0;
+        }
+    }
+
+    // Bottom-right block.
+    if let Some(vt_r) = vt_right {
+        for row in 0..right_size {
+            for col in 0..right_size {
+                vt_mat[(mid + row) * n + (mid + col)] = vt_r[row * right_size + col];
+            }
+        }
+    } else {
+        for i in 0..right_size {
+            vt_mat[(mid + i) * n + (mid + i)] = 1.0;
+        }
+    }
+}
+
+/// Builds a column-major mixing matrix from secular vectors and orthonormalizes it.
+fn build_secular_mixing_matrix(old_d: &[f64], z: &[f64], new_d: &[f64], n: usize) -> Vec<f64> {
+    let mut q = vec![0.0_f64; n * n];
+
+    for col in 0..n {
+        let sigma2 = new_d[col] * new_d[col];
+        let mut norm2 = 0.0_f64;
+
+        for row in 0..n {
+            let denom = old_d[row] * old_d[row] - sigma2;
+            let v = if denom.abs() > 1e-12 {
+                z[row] / denom
+            } else if row == col {
+                1.0
+            } else {
+                0.0
+            };
+            q[col * n + row] = v;
+            norm2 += v * v;
+        }
+
+        if norm2 > 1e-24 {
+            let inv = 1.0 / norm2.sqrt();
+            for row in 0..n {
+                q[col * n + row] *= inv;
+            }
+        } else {
+            for row in 0..n {
+                q[col * n + row] = if row == col { 1.0 } else { 0.0 };
+            }
+        }
+    }
+
+    // Modified Gram-Schmidt to stabilize orthonormality.
+    for col in 0..n {
+        for prev in 0..col {
+            let mut dot = 0.0_f64;
+            for row in 0..n {
+                dot += q[prev * n + row] * q[col * n + row];
+            }
+            for row in 0..n {
+                q[col * n + row] -= dot * q[prev * n + row];
+            }
+        }
+
+        let mut norm2 = 0.0_f64;
+        for row in 0..n {
+            norm2 += q[col * n + row] * q[col * n + row];
+        }
+        if norm2 > 1e-24 {
+            let inv = 1.0 / norm2.sqrt();
+            for row in 0..n {
+                q[col * n + row] *= inv;
+            }
+        } else {
+            for row in 0..n {
+                q[col * n + row] = if row == col { 1.0 } else { 0.0 };
+            }
+        }
+    }
+
+    q
+}
+
+/// In-place `A <- A * B` for square `n x n` matrices in column-major layout.
+fn right_multiply_col_major_square(a: &mut [f64], b: &[f64], n: usize) {
+    let mut out = vec![0.0_f64; n * n];
+    for col in 0..n {
+        for row in 0..n {
+            let mut sum = 0.0_f64;
+            for k in 0..n {
+                sum += a[k * n + row] * b[col * n + k];
+            }
+            out[col * n + row] = sum;
+        }
+    }
+    a.copy_from_slice(&out);
+}
+
+/// In-place `A <- Q^T * A` for row-major square `n x n` matrix `A`.
+fn left_multiply_row_major_square_by_qt(a: &mut [f64], q_col_major: &[f64], n: usize) {
+    let mut out = vec![0.0_f64; n * n];
+    for row in 0..n {
+        for col in 0..n {
+            let mut sum = 0.0_f64;
+            for k in 0..n {
+                // Q^T[row, k] = Q[k, row] in column-major indexing.
+                sum += q_col_major[k * n + row] * a[k * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+    a.copy_from_slice(&out);
 }
 
 // ---------------------------------------------------------------------------
@@ -789,14 +1094,30 @@ fn sort_singular_values_desc(
 // Device buffer write helper
 // ---------------------------------------------------------------------------
 
-/// Writes host data to a device buffer (structural — copies into the buffer).
+/// Writes host data to a device buffer.
 fn write_to_device_buffer<T: GpuFloat>(
-    _buf: &mut DeviceBuffer<T>,
-    _data: &[T],
-    _count: usize,
+    buf: &mut DeviceBuffer<T>,
+    data: &[T],
+    count: usize,
 ) -> SolverResult<()> {
-    // In the full implementation, this would use a host-to-device memcpy.
-    // For the structural implementation, this is a no-op.
+    if count > data.len() {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_to_device_buffer: host slice too small ({} < {count})",
+            data.len()
+        )));
+    }
+    if count > buf.len() {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_to_device_buffer: device buffer too small ({} < {count})",
+            buf.len()
+        )));
+    }
+
+    // DeviceBuffer currently provides whole-buffer copies, so stage through a
+    // full-size host vector and write the prefix.
+    let mut staged = vec![T::gpu_zero(); buf.len()];
+    staged[..count].copy_from_slice(&data[..count]);
+    buf.copy_from_host(&staged)?;
     Ok(())
 }
 
@@ -937,6 +1258,88 @@ mod tests {
         assert!((u[5] - 1.0).abs() < 1e-15); // (1,1) at col=1*4+1
         assert!((u[10] - 1.0).abs() < 1e-15); // (2,2)
         assert!((u[15] - 1.0).abs() < 1e-15); // (3,3)
+    }
+
+    #[test]
+    fn merge_orthogonal_blocks_transpose_row_major_layout() {
+        let mut vt = vec![0.0_f64; 16]; // 4x4 row-major
+        let vt_left = vec![1.0, 2.0, 3.0, 4.0]; // [[1,2],[3,4]]
+        let vt_right = vec![5.0, 6.0, 7.0, 8.0]; // [[5,6],[7,8]]
+
+        merge_orthogonal_blocks_transpose(Some(&mut vt), Some(&vt_left), Some(&vt_right), 2, 4);
+
+        // Top-left block in row-major positions.
+        assert!((vt[0] - 1.0).abs() < 1e-15);
+        assert!((vt[1] - 2.0).abs() < 1e-15);
+        assert!((vt[4] - 3.0).abs() < 1e-15);
+        assert!((vt[5] - 4.0).abs() < 1e-15);
+
+        // Bottom-right block in row-major positions.
+        assert!((vt[10] - 5.0).abs() < 1e-15);
+        assert!((vt[11] - 6.0).abs() < 1e-15);
+        assert!((vt[14] - 7.0).abs() < 1e-15);
+        assert!((vt[15] - 8.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn secular_mixing_matrix_columns_are_normalized() {
+        let old_d = vec![5.0, 3.0, 1.0];
+        let z = vec![0.3, -0.2, 0.1];
+        let new_d = vec![5.1, 2.9, 1.05];
+        let q = build_secular_mixing_matrix(&old_d, &z, &new_d, 3);
+
+        // q is column-major 3x3; each column should be unit norm.
+        for col in 0..3 {
+            let mut norm2 = 0.0_f64;
+            for row in 0..3 {
+                norm2 += q[col * 3 + row] * q[col * 3 + row];
+            }
+            assert!((norm2 - 1.0).abs() < 1e-8, "col {col} norm^2={norm2}");
+        }
+    }
+
+    #[test]
+    fn coupling_vector_fallback_spreads_at_split() {
+        let z = build_secular_coupling_vector(None, None, 2.0, 2, 4);
+        assert!(z[0].abs() < 1e-12);
+        assert!((z[1] - std::f64::consts::SQRT_2).abs() < 1e-12);
+        assert!((z[2] - std::f64::consts::SQRT_2).abs() < 1e-12);
+        assert!(z[3].abs() < 1e-12);
+    }
+
+    #[test]
+    fn deflation_zeros_tiny_superdiag_entries() {
+        let d = vec![10.0_f64, 9.0, 8.0];
+        let mut e = vec![1e-13_f64, 1e-3];
+        apply_deflation_to_superdiag(&d, &mut e, 1e-12);
+        assert_eq!(e[0], 0.0);
+        assert!(e[1] > 0.0);
+    }
+
+    #[test]
+    fn row_major_left_multiply_by_qt_identity_is_noop() {
+        let mut a = vec![
+            1.0_f64, 2.0, 3.0, // row 0
+            4.0, 5.0, 6.0, // row 1
+            7.0, 8.0, 9.0, // row 2
+        ];
+
+        // Identity Q in column-major.
+        let q = vec![
+            1.0_f64, 0.0, 0.0, // col 0
+            0.0, 1.0, 0.0, // col 1
+            0.0, 0.0, 1.0, // col 2
+        ];
+
+        left_multiply_row_major_square_by_qt(&mut a, &q, 3);
+        assert_eq!(
+            a,
+            vec![
+                1.0_f64, 2.0, 3.0, // row 0
+                4.0, 5.0, 6.0, // row 1
+                7.0, 8.0, 9.0, // row 2
+            ]
+        );
     }
 
     #[test]

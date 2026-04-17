@@ -1,0 +1,222 @@
+name: OxiCUDA CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["master", "main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Job 1: CPU-only tests (no GPU required) ───────────────────────────────
+  cpu-tests:
+    name: CPU Tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all features, deny warnings)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      - name: Build (all features)
+        run: cargo build --workspace --all-features
+
+      - name: Run tests (CPU-only path)
+        run: cargo test --workspace --all-features
+
+  # ── Job 2: GPU tests — Ampere (A100) ──────────────────────────────────────
+  # Requires a self-hosted runner tagged `gpu-ampere` with NVIDIA A100 + driver 525+
+  gpu-tests-ampere:
+    name: GPU Tests — Ampere (A100)
+    runs-on: [self-hosted, gpu-ampere]
+    needs: cpu-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-gpu-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gpu-cargo-
+
+      - name: Run GPU tests (Ampere)
+        run: cargo test --workspace --all-features --features gpu-tests
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+      - name: Install cargo-nextest (if not cached)
+        run: cargo install cargo-nextest --locked 2>/dev/null || true
+
+      - name: Run GPU tests with nextest
+        run: cargo nextest run --workspace --all-features --features gpu-tests
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+  # ── Job 3: GPU tests — Hopper (H100) ──────────────────────────────────────
+  # Requires a self-hosted runner tagged `gpu-hopper` with NVIDIA H100 + driver 535+
+  gpu-tests-hopper:
+    name: GPU Tests — Hopper (H100)
+    runs-on: [self-hosted, gpu-hopper]
+    needs: cpu-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-gpu-hopper-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gpu-hopper-cargo-
+
+      - name: Run GPU tests (Hopper / sm_90)
+        run: cargo test --workspace --all-features --features gpu-tests
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+  # ── Job 4: Autotuner (A100) ───────────────────────────────────────────────
+  autotune:
+    name: Autotune (A100)
+    runs-on: [self-hosted, gpu-ampere]
+    needs: gpu-tests-ampere
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-autotune-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-autotune-cargo-
+
+      - name: Run autotune CLI (all kernels)
+        run: cargo run -p oxicuda-autotune --bin autotune-cli --release --features gpu-tests -- all
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+      - name: Upload autotune results
+        uses: actions/upload-artifact@v4
+        with:
+          name: autotune-results-${{ github.sha }}
+          path: autotune_results/
+          if-no-files-found: warn
+
+  # ── Job 5: Memory safety (compute-sanitizer) ──────────────────────────────
+  memory-safety:
+    name: Memory Safety (compute-sanitizer)
+    runs-on: [self-hosted, gpu-ampere]
+    needs: gpu-tests-ampere
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-sanitizer-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-sanitizer-cargo-
+
+      - name: Build test binary (debug, GPU features)
+        run: |
+          cargo test -p oxicuda-driver --features gpu-tests --no-run
+          cargo test -p oxicuda-memory --features gpu-tests --no-run
+          cargo test -p oxicuda-launch --features gpu-tests --no-run
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+      - name: Run memcheck via compute-sanitizer (driver)
+        run: |
+          compute-sanitizer --tool memcheck --error-exitcode=99 \
+            cargo test -p oxicuda-driver --features gpu-tests -- \
+              --test-threads=1 --skip without_gpu
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+      - name: Run memcheck via compute-sanitizer (memory)
+        run: |
+          compute-sanitizer --tool memcheck --error-exitcode=99 \
+            cargo test -p oxicuda-memory --features gpu-tests -- \
+              --test-threads=1 --skip without_gpu
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+      - name: Run memcheck via compute-sanitizer (launch)
+        run: |
+          compute-sanitizer --tool memcheck --error-exitcode=99 \
+            cargo test -p oxicuda-launch --features gpu-tests -- \
+              --test-threads=1 --skip without_gpu
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+      - name: Run racecheck via compute-sanitizer (driver)
+        run: |
+          compute-sanitizer --tool racecheck --error-exitcode=99 \
+            cargo test -p oxicuda-driver --features gpu-tests -- \
+              --test-threads=1 --skip without_gpu
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+      - name: Run racecheck via compute-sanitizer (memory)
+        run: |
+          compute-sanitizer --tool racecheck --error-exitcode=99 \
+            cargo test -p oxicuda-memory --features gpu-tests -- \
+              --test-threads=1 --skip without_gpu
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+
+      - name: Run racecheck via compute-sanitizer (launch)
+        run: |
+          compute-sanitizer --tool racecheck --error-exitcode=99 \
+            cargo test -p oxicuda-launch --features gpu-tests -- \
+              --test-threads=1 --skip without_gpu
+        env:
+          CUDA_VISIBLE_DEVICES: "0"

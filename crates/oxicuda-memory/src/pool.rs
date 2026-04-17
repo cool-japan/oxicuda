@@ -8,14 +8,14 @@
 //! barriers that would otherwise be needed for conventional
 //! `cuMemAlloc` / `cuMemFree` calls.
 //!
-//! # Status
+//! # Implementation note
 //!
-//! This module is a **stub**.  The underlying `cuMemPoolCreate`,
-//! `cuMemAllocFromPoolAsync`, and related function pointers are not yet
-//! loaded by `oxicuda-driver`.  All methods currently return
-//! [`CudaError::NotSupported`] as a placeholder.
+//! This implementation provides a practical fallback pool that reuses freed
+//! allocations by size and uses `cuMemAlloc_v2` / `cuMemFree_v2` under the
+//! hood.  It keeps the same API surface as a stream-ordered pool, but does
+//! not yet expose native CUDA mempool handles.
 //!
-//! # Planned API
+//! # API
 //!
 //! ```rust,ignore
 //! let pool = MemoryPool::new(device)?;
@@ -26,11 +26,16 @@
 
 #![cfg(feature = "pool")]
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use oxicuda_driver::error::{CudaError, CudaResult};
 use oxicuda_driver::ffi::CUdeviceptr;
+use oxicuda_driver::loader::try_driver;
 use oxicuda_driver::stream::Stream;
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // MemoryPool
@@ -66,14 +71,114 @@ pub struct PoolStats {
     pub free_count: u64,
 }
 
+#[derive(Debug)]
+struct MemoryPoolInner {
+    handle: u64,
+    device_ordinal: i32,
+    threshold_bytes: AtomicUsize,
+    cached_bytes: AtomicUsize,
+    stats: Mutex<PoolStats>,
+    free_bins: Mutex<HashMap<usize, Vec<CUdeviceptr>>>,
+}
+
+impl MemoryPoolInner {
+    fn allocate_fresh(&self, bytes: usize) -> CudaResult<CUdeviceptr> {
+        let api = try_driver()?;
+        let mut ptr: CUdeviceptr = 0;
+        let rc = unsafe { (api.cu_mem_alloc_v2)(&mut ptr, bytes) };
+        oxicuda_driver::check(rc)?;
+        Ok(ptr)
+    }
+
+    fn free_ptr(&self, ptr: CUdeviceptr) -> CudaResult<()> {
+        let api = try_driver()?;
+        let rc = unsafe { (api.cu_mem_free_v2)(ptr) };
+        oxicuda_driver::check(rc)
+    }
+
+    fn try_pop_reuse(&self, bytes: usize) -> CudaResult<Option<CUdeviceptr>> {
+        let mut bins = self.free_bins.lock().map_err(|_| CudaError::Unknown(0))?;
+        let maybe_ptr = bins.get_mut(&bytes).and_then(Vec::pop);
+        if maybe_ptr.is_some() {
+            self.cached_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        Ok(maybe_ptr)
+    }
+
+    fn stash_freed(&self, ptr: CUdeviceptr, bytes: usize) -> CudaResult<()> {
+        let mut bins = self.free_bins.lock().map_err(|_| CudaError::Unknown(0))?;
+        bins.entry(bytes).or_default().push(ptr);
+        self.cached_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn release_cached_until(&self, keep_bytes: usize) -> CudaResult<()> {
+        loop {
+            let cached = self.cached_bytes.load(Ordering::Relaxed);
+            if cached <= keep_bytes {
+                return Ok(());
+            }
+
+            let popped = {
+                let mut bins = self.free_bins.lock().map_err(|_| CudaError::Unknown(0))?;
+                let mut candidate: Option<(usize, CUdeviceptr)> = None;
+                for (size, vec) in bins.iter_mut() {
+                    if let Some(ptr) = vec.pop() {
+                        candidate = Some((*size, ptr));
+                        break;
+                    }
+                }
+                candidate
+            };
+
+            let Some((size, ptr)) = popped else {
+                return Ok(());
+            };
+            self.free_ptr(ptr)?;
+            self.cached_bytes.fetch_sub(size, Ordering::Relaxed);
+        }
+    }
+
+    fn update_alloc_stats(&self, bytes: usize) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.allocated_bytes = stats.allocated_bytes.saturating_add(bytes);
+            stats.allocation_count = stats.allocation_count.saturating_add(1);
+            if stats.allocated_bytes > stats.peak_bytes {
+                stats.peak_bytes = stats.allocated_bytes;
+            }
+        }
+    }
+
+    fn update_free_stats(&self, bytes: usize) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.allocated_bytes = stats.allocated_bytes.saturating_sub(bytes);
+            stats.free_count = stats.free_count.saturating_add(1);
+        }
+    }
+}
+
+impl Drop for MemoryPoolInner {
+    fn drop(&mut self) {
+        let Ok(mut bins) = self.free_bins.lock() else {
+            return;
+        };
+        let mut to_free: Vec<CUdeviceptr> = Vec::new();
+        for vec in bins.values_mut() {
+            to_free.append(vec);
+        }
+        drop(bins);
+
+        for ptr in to_free {
+            if let Err(e) = self.free_ptr(ptr) {
+                warn!("failed to free pooled pointer {ptr:#x} during drop: {e}");
+            }
+        }
+    }
+}
+
 /// A stream-ordered memory pool (CUDA 11.2+).
 pub struct MemoryPool {
-    /// Placeholder for `CUmemoryPool` handle.
-    _handle: u64,
-    /// Statistics tracking.
-    stats: PoolStats,
-    /// Trim threshold in bytes.
-    threshold_bytes: usize,
+    inner: Arc<MemoryPoolInner>,
 }
 
 impl MemoryPool {
@@ -81,13 +186,21 @@ impl MemoryPool {
     ///
     /// # Errors
     ///
-    /// Currently always returns [`CudaError::NotSupported`] because the
-    /// pool driver function pointers are not yet loaded.
-    ///
-    /// TODO: Implement once `cu_mem_pool_create` is added to `DriverApi`.
-    pub fn new(_device_ordinal: i32) -> CudaResult<Self> {
-        // TODO: call (api.cu_mem_pool_create)(...) when available
-        Err(CudaError::NotSupported)
+    /// Creates an in-process pooling allocator for the given device.
+    pub fn new(device_ordinal: i32) -> CudaResult<Self> {
+        if device_ordinal < 0 {
+            return Err(CudaError::InvalidDevice);
+        }
+        Ok(Self {
+            inner: Arc::new(MemoryPoolInner {
+                handle: 0,
+                device_ordinal,
+                threshold_bytes: AtomicUsize::new(0),
+                cached_bytes: AtomicUsize::new(0),
+                stats: Mutex::new(PoolStats::default()),
+                free_bins: Mutex::new(HashMap::new()),
+            }),
+        })
     }
 
     /// Returns the raw pool handle.
@@ -97,7 +210,13 @@ impl MemoryPool {
     /// Returns `0` until the pool is properly initialised.
     #[inline]
     pub fn raw_handle(&self) -> u64 {
-        self._handle
+        self.inner.handle
+    }
+
+    /// Returns the device ordinal this pool targets.
+    #[inline]
+    pub fn device_ordinal(&self) -> i32 {
+        self.inner.device_ordinal
     }
 
     /// Returns current pool statistics.
@@ -105,7 +224,7 @@ impl MemoryPool {
     /// The statistics track allocation behaviour over the pool's lifetime.
     #[inline]
     pub fn stats(&self) -> PoolStats {
-        self.stats
+        self.inner.stats.lock().map(|s| *s).unwrap_or_default()
     }
 
     /// Trims the pool, releasing unused memory back to the OS.
@@ -115,13 +234,8 @@ impl MemoryPool {
     ///
     /// # Errors
     ///
-    /// Currently returns [`CudaError::NotSupported`] because the
-    /// pool driver function pointers are not yet loaded.
-    ///
-    /// TODO: Implement once `cu_mem_pool_trim_to` is added to `DriverApi`.
-    pub fn trim(&mut self, _min_bytes: usize) -> CudaResult<()> {
-        // TODO: call (api.cu_mem_pool_trim_to)(self._handle, min_bytes)
-        Err(CudaError::NotSupported)
+    pub fn trim(&mut self, min_bytes: usize) -> CudaResult<()> {
+        self.inner.release_cached_until(min_bytes)
     }
 
     /// Sets the threshold at which the pool will automatically release
@@ -132,21 +246,9 @@ impl MemoryPool {
     ///
     /// # Errors
     ///
-    /// Currently returns [`CudaError::NotSupported`] because the
-    /// pool driver function pointers are not yet loaded.
-    ///
-    /// TODO: Implement once `cu_mem_pool_set_attribute` is added to `DriverApi`.
     pub fn set_threshold(&mut self, bytes: usize) -> CudaResult<()> {
-        // TODO: call (api.cu_mem_pool_set_attribute)(...)
-        self.threshold_bytes = bytes;
-        Err(CudaError::NotSupported)
-    }
-}
-
-impl Drop for MemoryPool {
-    fn drop(&mut self) {
-        // TODO: call (api.cu_mem_pool_destroy)(self._handle) when available.
-        // For now, nothing to free since construction always fails.
+        self.inner.threshold_bytes.store(bytes, Ordering::Relaxed);
+        self.inner.release_cached_until(bytes)
     }
 }
 
@@ -163,16 +265,17 @@ impl Drop for MemoryPool {
 ///
 /// # Status
 ///
-/// This type is a placeholder.  All allocation methods currently return
-/// [`CudaError::NotSupported`].
-///
-/// TODO: Implement once `cu_mem_alloc_from_pool_async` and
-/// `cu_mem_free_async` are added to `DriverApi`.
+/// This type allocates from an in-process memory pool and returns buffers to
+/// that pool on drop.
 pub struct PooledBuffer<T: Copy> {
     /// Raw device pointer to the pooled allocation.
-    _ptr: CUdeviceptr,
+    ptr: CUdeviceptr,
     /// Number of `T` elements.
-    _len: usize,
+    len: usize,
+    /// Number of bytes in this allocation.
+    bytes: usize,
+    /// Owning pool.
+    pool: Arc<MemoryPoolInner>,
     /// Marker for the element type.
     _phantom: PhantomData<T>,
 }
@@ -184,42 +287,75 @@ impl<T: Copy> PooledBuffer<T> {
     ///
     /// # Errors
     ///
-    /// Currently always returns [`CudaError::NotSupported`].
-    ///
-    /// TODO: Implement once `cu_mem_alloc_from_pool_async` is available.
-    pub fn alloc_async(_pool: &MemoryPool, _n: usize, _stream: &Stream) -> CudaResult<Self> {
-        // TODO: call (api.cu_mem_alloc_from_pool_async)(...) when available
-        Err(CudaError::NotSupported)
+    pub fn alloc_async(pool: &MemoryPool, n: usize, _stream: &Stream) -> CudaResult<Self> {
+        if n == 0 {
+            return Err(CudaError::InvalidValue);
+        }
+        let bytes = n
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(CudaError::InvalidValue)?;
+        let ptr = if let Some(reused) = pool.inner.try_pop_reuse(bytes)? {
+            reused
+        } else {
+            pool.inner.allocate_fresh(bytes)?
+        };
+        pool.inner.update_alloc_stats(bytes);
+
+        Ok(Self {
+            ptr,
+            len: n,
+            bytes,
+            pool: Arc::clone(&pool.inner),
+            _phantom: PhantomData,
+        })
     }
 
     /// Returns the number of `T` elements in this buffer.
     #[inline]
     pub fn len(&self) -> usize {
-        self._len
+        self.len
     }
 
     /// Returns `true` if the buffer contains zero elements.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self._len == 0
+        self.len == 0
     }
 
     /// Returns the total size of the allocation in bytes.
     #[inline]
     pub fn byte_size(&self) -> usize {
-        self._len * std::mem::size_of::<T>()
+        self.bytes
     }
 
     /// Returns the raw [`CUdeviceptr`] handle.
     #[inline]
     pub fn as_device_ptr(&self) -> CUdeviceptr {
-        self._ptr
+        self.ptr
     }
 }
 
 impl<T: Copy> Drop for PooledBuffer<T> {
     fn drop(&mut self) {
-        // TODO: call (api.cu_mem_free_async)(self._ptr, stream) when available.
-        // For now, nothing to free since construction always fails.
+        if self.ptr == 0 {
+            return;
+        }
+
+        if let Err(e) = self.pool.stash_freed(self.ptr, self.bytes) {
+            warn!("failed to return pooled pointer to free list: {e}; freeing directly");
+            if let Err(free_err) = self.pool.free_ptr(self.ptr) {
+                warn!("direct free of pooled pointer failed: {free_err}");
+            }
+            self.pool.update_free_stats(self.bytes);
+            self.ptr = 0;
+            return;
+        }
+
+        self.pool.update_free_stats(self.bytes);
+        let threshold = self.pool.threshold_bytes.load(Ordering::Relaxed);
+        if let Err(e) = self.pool.release_cached_until(threshold) {
+            warn!("pool threshold trim failed: {e}");
+        }
+        self.ptr = 0;
     }
 }

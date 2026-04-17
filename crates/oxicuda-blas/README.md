@@ -116,6 +116,16 @@ The GEMM engine targets 95% of cuBLAS throughput on square matrices at
 representative sizes (M=N=K in 512..8192) across supported architectures.
 Batched and reduction kernels aim for comparable device occupancy.
 
+## Status
+
+| Item | Value |
+|------|-------|
+| Version | 0.1.3 |
+| Release date | 2026-04-17 |
+| Tests | 604 passing |
+| Warnings | 0 (clippy clean) |
+| `unwrap()` | 0 (production code) |
+
 ## License
 
 Apache-2.0 -- (C) 2026 COOLJAPAN OU (Team KitaSan)

@@ -102,27 +102,72 @@ pub fn inverse<T: GpuFloat>(
 /// order with dimensions n x n and leading dimension n.
 fn set_identity_diagonal<T: GpuFloat>(
     _handle: &SolverHandle,
-    _identity: &mut DeviceBuffer<T>,
-    _n: u32,
+    identity: &mut DeviceBuffer<T>,
+    n: u32,
 ) -> SolverResult<()> {
-    // Full implementation would launch a kernel:
-    //   if (tid < n) identity[tid * n + tid] = 1.0;
-    // For the structural implementation, the identity is set on the host
-    // and transferred, or set via a dedicated PTX kernel.
+    let n_usize = n as usize;
+    let required = n_usize * n_usize;
+    if identity.len() < required {
+        return Err(SolverError::DimensionMismatch(format!(
+            "set_identity_diagonal: buffer too small ({} < {required})",
+            identity.len()
+        )));
+    }
+
+    let mut host = vec![T::gpu_zero(); identity.len()];
+    for i in 0..n_usize {
+        host[i * n_usize + i] = T::gpu_one();
+    }
+    identity.copy_from_host(&host)?;
     Ok(())
 }
 
 /// Copies an n x n matrix from src to dst device buffers.
 fn copy_matrix<T: GpuFloat>(
     _handle: &SolverHandle,
-    _src: &DeviceBuffer<T>,
-    _dst: &mut DeviceBuffer<T>,
-    _n: u32,
-    _lda: u32,
+    src: &DeviceBuffer<T>,
+    dst: &mut DeviceBuffer<T>,
+    n: u32,
+    lda: u32,
 ) -> SolverResult<()> {
-    // Full implementation would use cuMemcpy or a copy kernel.
-    // For n x n contiguous buffers with matching layout, this is a
-    // single memcpy of n * n * sizeof(T) bytes.
+    let n_usize = n as usize;
+    let lda_usize = lda as usize;
+    if lda_usize < n_usize {
+        return Err(SolverError::DimensionMismatch(format!(
+            "copy_matrix: lda ({lda}) must be >= n ({n})"
+        )));
+    }
+
+    let src_required = n_usize * n_usize;
+    if src.len() < src_required {
+        return Err(SolverError::DimensionMismatch(format!(
+            "copy_matrix: src buffer too small ({} < {src_required})",
+            src.len()
+        )));
+    }
+
+    let dst_required = n_usize * lda_usize;
+    if dst.len() < dst_required {
+        return Err(SolverError::DimensionMismatch(format!(
+            "copy_matrix: dst buffer too small ({} < {dst_required})",
+            dst.len()
+        )));
+    }
+
+    let mut src_host = vec![T::gpu_zero(); src.len()];
+    src.copy_to_host(&mut src_host)?;
+
+    let mut dst_host = vec![T::gpu_zero(); dst.len()];
+    dst.copy_to_host(&mut dst_host)?;
+
+    // Column-major copy with destination leading dimension lda.
+    for col in 0..n_usize {
+        for row in 0..n_usize {
+            dst_host[col * lda_usize + row] = src_host[col * n_usize + row];
+        }
+    }
+
+    dst.copy_from_host(&dst_host)?;
     Ok(())
 }
 

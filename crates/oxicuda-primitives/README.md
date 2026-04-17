@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-primitives = "0.1.2"
+oxicuda-primitives = "0.1.3"
 ```
 
 ```rust
@@ -38,6 +38,11 @@ let (pass1_ptx, pass2_ptx) = DeviceReduceTemplate::new(cfg)
 // JIT-compile pass1_ptx and pass2_ptx via the CUDA driver API.
 assert!(pass1_ptx.contains("device_reduce_pass1_sum_f32"));
 ```
+
+## Status
+
+- **Version**: 0.1.3 (2026-04-17)
+- **Tests**: 142 passing
 
 ## License
 

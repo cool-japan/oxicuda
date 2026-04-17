@@ -177,32 +177,51 @@ fn validate_dimensions<T: GpuFloat>(a: &DeviceBuffer<T>, n: u32, lda: u32) -> So
 
 /// Copies `count` elements from `src` to `dst`.
 fn copy_buffer<T: GpuFloat>(
-    _src: &DeviceBuffer<T>,
-    _dst: &mut DeviceBuffer<T>,
-    _count: usize,
+    src: &DeviceBuffer<T>,
+    dst: &mut DeviceBuffer<T>,
+    count: usize,
 ) -> SolverResult<()> {
-    // Full implementation: cuMemcpy device-to-device.
+    dst.copy_from_device(src)
+        .map_err(|e| SolverError::InternalError(format!("copy_buffer: {e}")))?;
+    let _ = count;
     Ok(())
 }
 
 /// Reads the diagonal elements of the LU-factored matrix.
 ///
 /// Returns a Vec of the diagonal values `U[i,i]` for i = 0..n.
-fn read_lu_diagonal<T: GpuFloat>(_a: &DeviceBuffer<T>, n: u32, _lda: u32) -> SolverResult<Vec<T>> {
-    // Full implementation: read back n elements from positions (i, i)
-    // in device memory, either via a gather kernel or n individual reads.
-    // For structural implementation, return ones (det = 1).
-    Ok(vec![T::gpu_one(); n as usize])
+/// The matrix is stored column-major with leading dimension `lda`.
+fn read_lu_diagonal<T: GpuFloat>(a: &DeviceBuffer<T>, n: u32, lda: u32) -> SolverResult<Vec<T>> {
+    let n = n as usize;
+    let lda = lda as usize;
+    let total = n * lda;
+
+    // Read the full LU matrix to host.
+    let mut host = vec![T::gpu_zero(); total];
+    a.copy_to_host(&mut host)
+        .map_err(|e| SolverError::InternalError(format!("read_lu_diagonal: {e}")))?;
+
+    // Extract diagonal: column-major element (i, i) is at index i * lda + i.
+    Ok((0..n).map(|i| host[i * lda + i]).collect())
 }
 
-/// Counts the parity of row swaps in the pivot array.
+/// Counts the parity of row swaps in the pivot array (LAPACK 1-based convention).
 ///
 /// Returns +1.0 if the number of swaps is even, -1.0 if odd.
-fn count_pivot_sign(_pivots: &DeviceBuffer<i32>, _n: u32) -> SolverResult<f64> {
-    // Full implementation: read pivots from device, count how many
-    // pivots[i] != i (each such entry represents a row swap).
-    // For structural implementation, return +1 (even permutation).
-    Ok(1.0)
+fn count_pivot_sign(pivots: &DeviceBuffer<i32>, n: u32) -> SolverResult<f64> {
+    let n = n as usize;
+    let mut host = vec![0_i32; n];
+    pivots
+        .copy_to_host(&mut host)
+        .map_err(|e| SolverError::InternalError(format!("count_pivot_sign: {e}")))?;
+
+    // pivots[i] is 1-based; if pivots[i] != i+1, a swap occurred.
+    let swaps = host
+        .iter()
+        .enumerate()
+        .filter(|&(i, &p)| p != (i as i32 + 1))
+        .count();
+    Ok(if swaps % 2 == 0 { 1.0 } else { -1.0 })
 }
 
 // ---------------------------------------------------------------------------

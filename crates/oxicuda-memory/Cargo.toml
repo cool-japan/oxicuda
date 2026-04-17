@@ -20,5 +20,12 @@ default = []
 gpu-tests = ["oxicuda-driver/gpu-tests"]
 pool = []
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "bandwidth_copy"
+harness = false
+
 [lints]
 workspace = true

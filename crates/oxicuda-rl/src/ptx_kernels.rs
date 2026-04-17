@@ -41,7 +41,6 @@ pub fn f32_hex(v: f32) -> String {
 #[must_use]
 pub fn td_error_ptx(sm: u32) -> String {
     let hdr = ptx_header(sm);
-    let gamma_hex = f32_hex(0.99_f32);
     format!(
         r#"{hdr}
 // td_error: delta = r + γ * next_v * (1-done) - v
@@ -99,17 +98,7 @@ LOOP:
     add.u64 %eaddr, %v_addr,  %eaddr;
     ld.global.f32 %vv, [%eaddr];
 
-    // delta = r + γ * nv * (1 - done) - v
-    mov.f32       %tmp, {gamma_hex};   // 1.0 placeholder
-    sub.f32       %tmp, %tmp, %dn;    // 1 - done
-    mul.rn.f32    %tmp, %gam, %nv;
-    mul.rn.f32    %tmp, %tmp, %tmp;   // overwrite: γ*nv*(1-done)
-    // redo correctly:
-    sub.f32       %delta, {one}, %dn;
-    mul.rn.f32    %delta, %gam, %nv;
-    mul.rn.f32    %delta, %delta, %delta;
-
-    // correct implementation
+    // delta = r + gamma * nv * (1 - done) - v
     sub.f32       %tmp,   {one},  %dn;      // mask = 1 - done
     fma.rn.f32    %delta, %gam, %nv, {zero}; // delta = γ * nv
     mul.rn.f32    %delta, %delta, %tmp;      // delta *= mask
@@ -127,7 +116,6 @@ DONE:
 }}
 "#,
         hdr = hdr,
-        gamma_hex = gamma_hex,
         one = f32_hex(1.0),
         zero = f32_hex(0.0),
     )

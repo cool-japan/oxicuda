@@ -26,17 +26,34 @@ GPU resources on `Drop`.
 
 ## Modules
 
-| Module      | Description                                                  |
-|-------------|--------------------------------------------------------------|
-| `ffi`       | Raw C-compatible types (`CUdevice`, `CUcontext`, etc.)       |
-| `error`     | `CudaError` (~100 variants), `CudaResult`, `check()` helper |
-| `loader`    | Runtime library loading with `OnceLock` singleton            |
-| `device`    | Device enumeration, attribute queries, `best_device()`       |
-| `context`   | RAII CUDA context bound to a device                          |
-| `stream`    | Asynchronous command queue within a context                  |
-| `event`     | Timing and synchronisation markers on streams                |
-| `module`    | PTX/cubin loading, JIT compilation, function lookup          |
-| `occupancy` | Occupancy-based launch configuration queries                 |
+| Module                 | Description                                                          |
+|------------------------|----------------------------------------------------------------------|
+| `ffi`                  | Raw C-compatible types (`CUdevice`, `CUcontext`, etc.)               |
+| `ffi_constants`        | CUDA constant definitions and magic values                           |
+| `ffi_launch`           | Launch-related FFI structures (`CUlaunchConfig`, etc.)               |
+| `ffi_descriptors`      | Descriptor types (TMA, texture, surface)                             |
+| `error`                | `CudaError` (~100 variants), `CudaResult`, `check()` helper          |
+| `loader`               | Runtime library loading with `OnceLock` singleton                    |
+| `device`               | Device enumeration, attribute queries, `best_device()`               |
+| `context`              | RAII CUDA context bound to a device                                  |
+| `context_config`       | Context flags and device limit configuration                         |
+| `stream`               | Asynchronous command queue within a context                          |
+| `event`                | Timing and synchronisation markers on streams                        |
+| `module`               | PTX/cubin loading, JIT compilation, function lookup                  |
+| `occupancy`            | Occupancy-based launch configuration queries                         |
+| `occupancy_ext`        | Extended occupancy helpers (dynamic shared memory, cluster)          |
+| `primary_context`      | Primary context management (`cuDevicePrimaryCtxRetain`)              |
+| `cooperative_launch`   | Cooperative kernel launch (`cuLaunchCooperativeKernel`)              |
+| `graph`                | CUDA Graph API (`Graph`, `GraphNode`, `GraphExec`, `StreamCapture`)  |
+| `link`                 | Link-time optimization (`cuLinkCreate`, `cuLinkAddData`)             |
+| `multi_gpu`            | Multi-GPU device pool, round-robin scheduling                        |
+| `nvlink_topology`      | NVLink/NVSwitch topology detection and bandwidth queries             |
+| `memory_info`          | Device memory info queries (`cuMemGetInfo`)                          |
+| `stream_ordered_alloc` | Stream-ordered memory allocation (CUDA 11.2+)                        |
+| `profiler`             | Profiler control (`cuProfilerStart`/`cuProfilerStop`)                |
+| `debug`                | GPU debugging, memory leak detection, kernel launch tracing          |
+| `function_attr`        | CUDA function attribute queries                                      |
+| `tma`                  | Tensor Memory Access descriptor helpers (Hopper+)                    |
 
 ## Quick Start
 
@@ -77,6 +94,15 @@ let kernel = module.get_function("vector_add")?;
 | Linux    | Full support (NVIDIA driver 525+)          |
 | Windows  | Full support (NVIDIA driver 525+)          |
 | macOS    | Compile only (UnsupportedPlatform at runtime) |
+
+## Status
+
+| Item       | Value              |
+|------------|--------------------|
+| Version    | 0.1.3 (2026-04-17) |
+| Tests      | 333 passing        |
+| Warnings   | 0                  |
+| `unwrap()` | 0                  |
 
 ## License
 

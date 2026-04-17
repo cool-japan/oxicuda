@@ -6,6 +6,12 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 
 `oxicuda-rl` provides a comprehensive set of GPU-ready reinforcement learning building blocks, covering experience replay buffers, policy distributions, return/advantage estimators, RL algorithm loss functions, and environment abstractions. All components are designed for on-device operation to minimise host-device memory traffic, with PTX kernel sources for GPU-accelerated RL operations.
 
+## Status
+
+| Version | Tests | Date |
+|---------|-------|------|
+| 0.1.3 | 164 passing | 2026-04-17 |
+
 ## Features
 
 - **Replay Buffers** — Uniform replay (DQN, SAC, TD3), Prioritized Experience Replay with segment-tree PER and IS weight computation (PER-DQN, PER-SAC), and N-step return accumulation
@@ -21,7 +27,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-rl = "0.1.2"
+oxicuda-rl = "0.1.3"
 ```
 
 ```rust

@@ -31,6 +31,10 @@ pub enum RandError {
     #[error("invalid seed: {0}")]
     InvalidSeed(String),
 
+    /// One or more distribution parameters are invalid.
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
+
     /// The requested distribution is not supported for this engine or
     /// precision combination.
     #[error("unsupported distribution: {0}")]
@@ -58,6 +62,12 @@ mod tests {
     fn display_unsupported_distribution() {
         let err = RandError::UnsupportedDistribution("poisson f64".to_string());
         assert!(err.to_string().contains("poisson f64"));
+    }
+
+    #[test]
+    fn display_invalid_parameter() {
+        let err = RandError::InvalidParameter("lambda must be >= 0".to_string());
+        assert!(err.to_string().contains("lambda must be >= 0"));
     }
 
     #[test]

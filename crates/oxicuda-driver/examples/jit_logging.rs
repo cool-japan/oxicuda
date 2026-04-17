@@ -24,10 +24,10 @@
 //! Parsed 5 diagnostic(s):
 //!   [error] (my_kernel, line 10) Unknown instruction 'xyz.f32'
 //!   [warning] (my_kernel, line 15) Double-precision will be slow on this device
-//!   [info] (my_kernel) used 16 registers, 0 bytes smem, 0 bytes cmem[0]
 //!   [fatal] <no kernel> Unresolved extern function 'missing_symbol'
 //!   [error] <no kernel> syntax error near token ';'
-//! Errors:  2
+//!   [info] (my_kernel) used 16 registers, 0 bytes smem, 0 bytes cmem[0]
+//! Errors:  3
 //! Warnings: 1
 //!
 //! ── Part 2: Real JIT compilation (requires GPU) ───────────────────────────────
@@ -94,7 +94,7 @@ fn demo_parse_hardcoded_log() {
 
     // Verify expected structure.
     assert_eq!(diags.len(), 5, "expected 5 diagnostics");
-    assert_eq!(error_count, 2, "expected 2 errors (error + fatal)");
+    assert_eq!(error_count, 3, "expected 3 errors (2x error + 1x fatal)");
     assert_eq!(warn_count, 1, "expected 1 warning");
 
     let first = &diags[0];

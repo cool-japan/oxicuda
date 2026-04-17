@@ -99,10 +99,10 @@ Driver layer is latency-sensitive (microsecond-scale API calls). Key targets:
 
 | # | Deliverable | Status |
 |---|-------------|--------|
-| D1 | `README.md` with quickstart | [ ] |
+| D1 | `README.md` with quickstart | [x] |
 | D2 | `docs/architecture.md` with design rationale | [ ] |
 | D3 | `///` doc comments on all public APIs | [ ] |
-| D4 | At least 3 working examples in `examples/` | [ ] |
+| D4 | At least 3 working examples in `examples/` | [x] |
 
 ---
 
@@ -123,7 +123,7 @@ Driver layer is latency-sensitive (microsecond-scale API calls). Key targets:
 > Items marked `[x]` above represent API surface coverage. These represent the gap between current implementation depth and blueprint-grade production requirements.
 
 ### Verification Gaps
-- [ ] `compute-sanitizer --tool memcheck` integrated into CI for leak detection (NF4)
+- [x] `compute-sanitizer --tool memcheck` integrated into CI for leak detection (NF4)
 - [ ] Multi-GPU stress test on 2+ GPU environment to verify F2 fully
 - [x] Multi-threaded context migration test (concurrent context push/pop across threads) for F3
 - [x] Intentional error injection test suite covering all ~100 CUDA error codes (F9)

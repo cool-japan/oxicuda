@@ -146,8 +146,8 @@ pub fn syevd<T: GpuFloat>(
     sort_eigenvalues(&mut d, vectors.as_deref_mut(), n as usize);
 
     // Write eigenvalues back to device buffer.
-    // In the full implementation, this would copy d -> eigenvalues on device.
-    let _ = eigenvalues;
+    let eig_stage = stage_eigenvalues_to_device::<T>(eigenvalues.len(), &d);
+    eigenvalues.copy_from_host(&eig_stage)?;
 
     // Step 4: Back-transform eigenvectors if requested.
     if job == EigJob::ValuesAndVectors {
@@ -226,6 +226,14 @@ fn t_to_f64<T: GpuFloat>(val: T) -> f64 {
         f64::from_bits(val.to_bits_u64())
     } else {
         f64::from(f32::from_bits(val.to_bits_u64() as u32))
+    }
+}
+
+fn from_f64_to_t<T: GpuFloat>(val: f64) -> T {
+    if T::SIZE == 8 {
+        T::from_bits_u64(val.to_bits())
+    } else {
+        T::from_bits_u64(u64::from((val as f32).to_bits()))
     }
 }
 
@@ -410,17 +418,73 @@ fn sort_eigenvalues(d: &mut [f64], mut vectors: Option<&mut [f64]>, n: usize) {
 /// the Householder vectors stored in `a` and `tau`.
 fn back_transform_eigenvectors<T: GpuFloat>(
     _handle: &SolverHandle,
-    _a: &mut DeviceBuffer<T>,
-    _n: u32,
-    _lda: u32,
+    a: &mut DeviceBuffer<T>,
+    n: u32,
+    lda: u32,
     _tau: &DeviceBuffer<T>,
-    _vectors: Option<&[f64]>,
+    vectors: Option<&[f64]>,
 ) -> SolverResult<()> {
-    // Full implementation would:
-    // 1. Copy Q_tridiag into device buffer.
-    // 2. Apply Householder reflections in reverse order (like qr_generate_q).
-    // 3. Overwrite a with the result.
+    // Host fallback: write the accumulated tridiagonal QR eigenvectors into A.
+    let Some(vecs) = vectors else {
+        return Ok(());
+    };
+
+    let n_usize = n as usize;
+    let lda_usize = lda as usize;
+    let required = n_usize * lda_usize;
+    if a.len() < required {
+        return Err(SolverError::DimensionMismatch(format!(
+            "back_transform_eigenvectors: matrix buffer too small ({} < {required})",
+            a.len()
+        )));
+    }
+
+    let stage = stage_eigenvectors_col_major_to_lda::<T>(vecs, n_usize, lda_usize, a.len())?;
+    a.copy_from_host(&stage)?;
+
     Ok(())
+}
+
+fn stage_eigenvalues_to_device<T: GpuFloat>(dst_len: usize, d: &[f64]) -> Vec<T> {
+    let mut out = vec![T::gpu_zero(); dst_len];
+    for (idx, &val) in d.iter().enumerate() {
+        if idx >= dst_len {
+            break;
+        }
+        out[idx] = from_f64_to_t(val);
+    }
+    out
+}
+
+fn stage_eigenvectors_col_major_to_lda<T: GpuFloat>(
+    vectors: &[f64],
+    n: usize,
+    lda: usize,
+    dst_len: usize,
+) -> SolverResult<Vec<T>> {
+    if vectors.len() < n * n {
+        return Err(SolverError::DimensionMismatch(format!(
+            "stage_eigenvectors_col_major_to_lda: vectors too small ({} < {})",
+            vectors.len(),
+            n * n
+        )));
+    }
+    if dst_len < n * lda {
+        return Err(SolverError::DimensionMismatch(format!(
+            "stage_eigenvectors_col_major_to_lda: destination too small ({} < {})",
+            dst_len,
+            n * lda
+        )));
+    }
+
+    let mut out = vec![T::gpu_zero(); dst_len];
+    for col in 0..n {
+        for row in 0..n {
+            // vectors is n x n in column-major order.
+            out[col * lda + row] = from_f64_to_t(vectors[col * n + row]);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -543,5 +607,36 @@ mod tests {
     fn tridiag_step_name_f64() {
         let name = tridiag_step_name::<f64>();
         assert!(name.contains("f64"));
+    }
+
+    #[test]
+    fn stage_eigenvalues_prefix_copy() {
+        let d = vec![1.5_f64, 2.5, 3.5];
+        let out = stage_eigenvalues_to_device::<f64>(5, &d);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], 1.5);
+        assert_eq!(out[1], 2.5);
+        assert_eq!(out[2], 3.5);
+        assert_eq!(out[3], 0.0);
+        assert_eq!(out[4], 0.0);
+    }
+
+    #[test]
+    fn stage_eigenvectors_to_lda_maps_columns() {
+        // 2x2 column-major: col0=[1,2], col1=[3,4]
+        let vecs = vec![1.0_f64, 2.0, 3.0, 4.0];
+        let out = stage_eigenvectors_col_major_to_lda::<f64>(&vecs, 2, 3, 6);
+        assert!(out.is_ok());
+        let out = out.unwrap_or_default();
+        assert_eq!(out.len(), 6);
+        // col0 rows 0,1
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[1], 2.0);
+        // col1 rows 0,1 start at lda=3
+        assert_eq!(out[3], 3.0);
+        assert_eq!(out[4], 4.0);
+        // padded lda rows remain zero
+        assert_eq!(out[2], 0.0);
+        assert_eq!(out[5], 0.0);
     }
 }

@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-graph = "0.1.2"
+oxicuda-graph = "0.1.3"
 ```
 
 ```rust
@@ -43,6 +43,10 @@ let plan  = ExecutionPlan::build(&graph, 4).unwrap();
 let stats = SequentialExecutor::new(&plan).run().unwrap();
 println!("kernels launched: {}", stats.kernels_launched);
 ```
+
+## Status
+
+**v0.1.3** (2026-04-17) — 175 tests passing
 
 ## License
 

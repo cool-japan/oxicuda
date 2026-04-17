@@ -239,7 +239,12 @@ fn bunch_kaufman_factorize(
 ) -> SolverResult<()> {
     match uplo {
         FillMode::Lower => bunch_kaufman_lower(a, n, ipiv),
-        FillMode::Upper => bunch_kaufman_upper(a, n, ipiv),
+        FillMode::Upper => {
+            // Normalize to a lower-storage representation and reuse the same
+            // decomposition path to avoid divergent structural implementations.
+            mirror_upper_to_lower(a, n);
+            bunch_kaufman_lower(a, n, ipiv)
+        }
         FillMode::Full => Err(SolverError::DimensionMismatch(
             "ldlt: uplo must be Lower or Upper".into(),
         )),
@@ -491,7 +496,7 @@ fn bunch_kaufman_solve(
 ) -> SolverResult<()> {
     match uplo {
         FillMode::Lower => bunch_kaufman_solve_lower(a, ipiv, b, n, nrhs),
-        FillMode::Upper => bunch_kaufman_solve_upper(a, ipiv, b, n, nrhs),
+        FillMode::Upper => bunch_kaufman_solve_lower(a, ipiv, b, n, nrhs),
         FillMode::Full => Err(SolverError::DimensionMismatch(
             "ldlt_solve: uplo must be Lower or Upper".into(),
         )),
@@ -603,52 +608,12 @@ fn bunch_kaufman_solve_lower(
     Ok(())
 }
 
-/// Upper-triangular solve (symmetric to lower but iterating in reverse).
-fn bunch_kaufman_solve_upper(
-    a: &[f64],
-    ipiv: &[i32],
-    b: &mut [f64],
-    n: usize,
-    nrhs: usize,
-) -> SolverResult<()> {
-    // For the structural implementation, delegate to a simplified approach.
-    // The upper solve is the mirror of the lower solve.
-    for rhs in 0..nrhs {
-        let b_col = &mut b[rhs * n..(rhs + 1) * n];
-
-        // Forward substitution with U^T.
-        for k in (0..n).rev() {
-            if ipiv[k] > 0 {
-                let p = (ipiv[k] - 1) as usize;
-                if p != k {
-                    b_col.swap(k, p);
-                }
-            }
-        }
-
-        // Diagonal solve.
-        for k in 0..n {
-            if ipiv[k] > 0 {
-                let dkk = a[k * n + k];
-                if dkk.abs() < 1e-300 {
-                    return Err(SolverError::SingularMatrix);
-                }
-                b_col[k] /= dkk;
-            }
-        }
-
-        // Backward substitution with U.
-        for (k, &piv) in ipiv.iter().enumerate().take(n) {
-            if piv > 0 {
-                let p = (piv - 1) as usize;
-                if p != k {
-                    b_col.swap(k, p);
-                }
-            }
+fn mirror_upper_to_lower(a: &mut [f64], n: usize) {
+    for col in 0..n {
+        for row in 0..col {
+            a[col * n + row] = a[row * n + col];
         }
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -656,44 +621,70 @@ fn bunch_kaufman_solve_upper(
 // ---------------------------------------------------------------------------
 
 fn read_device_to_host<T: GpuFloat>(
-    _buf: &DeviceBuffer<T>,
+    buf: &DeviceBuffer<T>,
     host: &mut [f64],
     count: usize,
 ) -> SolverResult<()> {
-    // Structural: fill with identity-like values for testing.
-    let n_sqrt = (count as f64).sqrt() as usize;
-    for (i, h) in host.iter_mut().enumerate().take(count) {
-        let row = i % n_sqrt.max(1);
-        let col = i / n_sqrt.max(1);
-        *h = if row == col { 1.0 } else { 0.0 };
+    if host.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "read_device_to_host: host buffer too small ({} < {})",
+            host.len(),
+            count
+        )));
+    }
+    let mut staged = vec![T::gpu_zero(); count];
+    buf.copy_to_host(&mut staged)?;
+    for (dst, src) in host.iter_mut().zip(staged.iter()) {
+        *dst = to_f64(*src);
     }
     Ok(())
 }
 
 fn write_host_to_device<T: GpuFloat>(
-    _buf: &mut DeviceBuffer<T>,
-    _data: &[T],
-    _count: usize,
+    buf: &mut DeviceBuffer<T>,
+    data: &[T],
+    count: usize,
 ) -> SolverResult<()> {
+    if data.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_host_to_device: source buffer too small ({} < {})",
+            data.len(),
+            count
+        )));
+    }
+    buf.copy_from_host(&data[..count])?;
     Ok(())
 }
 
 fn read_device_to_host_i32(
-    _buf: &DeviceBuffer<i32>,
+    buf: &DeviceBuffer<i32>,
     host: &mut [i32],
     count: usize,
 ) -> SolverResult<()> {
-    for (i, val) in host.iter_mut().enumerate().take(count) {
-        *val = (i + 1) as i32; // 1-based identity permutation.
+    if host.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "read_device_to_host_i32: host buffer too small ({} < {})",
+            host.len(),
+            count
+        )));
     }
+    buf.copy_to_host(&mut host[..count])?;
     Ok(())
 }
 
 fn write_host_to_device_i32(
-    _buf: &mut DeviceBuffer<i32>,
-    _data: &[i32],
-    _count: usize,
+    buf: &mut DeviceBuffer<i32>,
+    data: &[i32],
+    count: usize,
 ) -> SolverResult<()> {
+    if data.len() < count {
+        return Err(SolverError::DimensionMismatch(format!(
+            "write_host_to_device_i32: source buffer too small ({} < {})",
+            data.len(),
+            count
+        )));
+    }
+    buf.copy_from_host(&data[..count])?;
     Ok(())
 }
 

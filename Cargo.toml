@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -12,33 +12,33 @@ authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
 
 [workspace.dependencies]
 # Internal crates
-oxicuda-backend = { path = "crates/oxicuda-backend", version = "0.1.2" }
-oxicuda-driver = { path = "crates/oxicuda-driver", version = "0.1.2" }
-oxicuda-memory = { path = "crates/oxicuda-memory", version = "0.1.2" }
-oxicuda-launch = { path = "crates/oxicuda-launch", version = "0.1.2" }
-oxicuda-ptx = { path = "crates/oxicuda-ptx", version = "0.1.2" }
-oxicuda-autotune = { path = "crates/oxicuda-autotune", version = "0.1.2" }
-oxicuda-blas = { path = "crates/oxicuda-blas", version = "0.1.2" }
-oxicuda-dnn = { path = "crates/oxicuda-dnn", version = "0.1.2" }
-oxicuda-fft = { path = "crates/oxicuda-fft", version = "0.1.2" }
-oxicuda-sparse = { path = "crates/oxicuda-sparse", version = "0.1.2" }
-oxicuda-solver = { path = "crates/oxicuda-solver", version = "0.1.2" }
-oxicuda-rand = { path = "crates/oxicuda-rand", version = "0.1.2" }
-oxicuda-webgpu = { path = "crates/oxicuda-webgpu", version = "0.1.2" }
-oxicuda-vulkan = { path = "crates/oxicuda-vulkan", version = "0.1.2" }
-oxicuda-metal = { path = "crates/oxicuda-metal", version = "0.1.2" }
-oxicuda-rocm = { path = "crates/oxicuda-rocm", version = "0.1.2" }
-oxicuda-levelzero = { path = "crates/oxicuda-levelzero", version = "0.1.2" }
-oxicuda-primitives = { path = "crates/oxicuda-primitives", version = "0.1.2" }
-oxicuda-signal = { path = "crates/oxicuda-signal", version = "0.1.2" }
-oxicuda-graph = { path = "crates/oxicuda-graph", version = "0.1.2" }
-oxicuda-train = { path = "crates/oxicuda-train", version = "0.1.2" }
-oxicuda-rl    = { path = "crates/oxicuda-rl",    version = "0.1.2" }
-oxicuda-quant = { path = "crates/oxicuda-quant", version = "0.1.2" }
-oxicuda-infer      = { path = "crates/oxicuda-infer",      version = "0.1.2" }
-oxicuda-dist-infer = { path = "crates/oxicuda-dist-infer", version = "0.1.2" }
-oxicuda-lm         = { path = "crates/oxicuda-lm",         version = "0.1.2" }
-oxicuda-runtime    = { path = "crates/oxicuda-runtime",    version = "0.1.2" }
+oxicuda-backend = { path = "crates/oxicuda-backend", version = "0.1.3" }
+oxicuda-driver = { path = "crates/oxicuda-driver", version = "0.1.3" }
+oxicuda-memory = { path = "crates/oxicuda-memory", version = "0.1.3" }
+oxicuda-launch = { path = "crates/oxicuda-launch", version = "0.1.3" }
+oxicuda-ptx = { path = "crates/oxicuda-ptx", version = "0.1.3" }
+oxicuda-autotune = { path = "crates/oxicuda-autotune", version = "0.1.3" }
+oxicuda-blas = { path = "crates/oxicuda-blas", version = "0.1.3" }
+oxicuda-dnn = { path = "crates/oxicuda-dnn", version = "0.1.3" }
+oxicuda-fft = { path = "crates/oxicuda-fft", version = "0.1.3" }
+oxicuda-sparse = { path = "crates/oxicuda-sparse", version = "0.1.3" }
+oxicuda-solver = { path = "crates/oxicuda-solver", version = "0.1.3" }
+oxicuda-rand = { path = "crates/oxicuda-rand", version = "0.1.3" }
+oxicuda-webgpu = { path = "crates/oxicuda-webgpu", version = "0.1.3" }
+oxicuda-vulkan = { path = "crates/oxicuda-vulkan", version = "0.1.3" }
+oxicuda-metal = { path = "crates/oxicuda-metal", version = "0.1.3" }
+oxicuda-rocm = { path = "crates/oxicuda-rocm", version = "0.1.3" }
+oxicuda-levelzero = { path = "crates/oxicuda-levelzero", version = "0.1.3" }
+oxicuda-primitives = { path = "crates/oxicuda-primitives", version = "0.1.3" }
+oxicuda-signal = { path = "crates/oxicuda-signal", version = "0.1.3" }
+oxicuda-graph = { path = "crates/oxicuda-graph", version = "0.1.3" }
+oxicuda-train = { path = "crates/oxicuda-train", version = "0.1.3" }
+oxicuda-rl    = { path = "crates/oxicuda-rl",    version = "0.1.3" }
+oxicuda-quant = { path = "crates/oxicuda-quant", version = "0.1.3" }
+oxicuda-infer      = { path = "crates/oxicuda-infer",      version = "0.1.3" }
+oxicuda-dist-infer = { path = "crates/oxicuda-dist-infer", version = "0.1.3" }
+oxicuda-lm         = { path = "crates/oxicuda-lm",         version = "0.1.3" }
+oxicuda-runtime    = { path = "crates/oxicuda-runtime",    version = "0.1.3" }
 
 # Vulkan bindings (runtime loader — no compile-time libvulkan dependency)
 ash = "0.38"
