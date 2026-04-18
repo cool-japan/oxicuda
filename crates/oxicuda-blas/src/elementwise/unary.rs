@@ -210,6 +210,282 @@ pub fn tanh_activation<T: GpuFloat>(
     launch_unary(handle, n, input, output, PtxOp::Tanh)
 }
 
+/// Negates every element: `output[i] = -input[i]`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn neg<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Neg)
+}
+
+/// Computes the absolute value element-wise: `output[i] = |input[i]|`.
+///
+/// Named `abs_val` to avoid conflict with inherent `abs` methods.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn abs_val<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Abs)
+}
+
+/// Computes the square root element-wise: `output[i] = sqrt(input[i])`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn sqrt<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Sqrt)
+}
+
+/// Computes the reciprocal square root element-wise: `output[i] = 1 / sqrt(input[i])`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn rsqrt<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Rsqrt)
+}
+
+/// Computes the exponential element-wise: `output[i] = exp(input[i])`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn exp<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Exp)
+}
+
+/// Computes the natural logarithm element-wise: `output[i] = ln(input[i])`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn log<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Log)
+}
+
+/// Computes the ceiling element-wise: `output[i] = ceil(input[i])`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn ceil<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Ceil)
+}
+
+/// Computes the floor element-wise: `output[i] = floor(input[i])`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn floor<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Floor)
+}
+
+/// Applies hard sigmoid element-wise: `output[i] = max(0, min(1, 0.2*input[i] + 0.5))`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn hard_sigmoid<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::HardSigmoid)
+}
+
+/// Applies hard swish element-wise: `output[i] = input[i] * max(0, min(6, input[i]+3)) / 6`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn hard_swish<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::HardSwish)
+}
+
+/// Applies softplus element-wise: `output[i] = ln(1 + exp(input[i]))`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn softplus<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::Softplus)
+}
+
+/// Applies leaky relu element-wise with alpha=0.01:
+/// `output[i] = input[i] >= 0 ? input[i] : 0.01 * input[i]`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn leaky_relu<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::LeakyRelu)
+}
+
+/// Applies one-minus element-wise: `output[i] = 1 - input[i]`.
+///
+/// # Arguments
+///
+/// * `handle` -- BLAS handle.
+/// * `n` -- number of elements.
+/// * `input` -- input device buffer.
+/// * `output` -- output device buffer.
+///
+/// # Errors
+///
+/// Returns [`BlasError`] on buffer validation or kernel launch failure.
+pub fn one_minus<T: GpuFloat>(
+    handle: &BlasHandle,
+    n: u32,
+    input: &DeviceBuffer<T>,
+    output: &mut DeviceBuffer<T>,
+) -> BlasResult<()> {
+    launch_unary(handle, n, input, output, PtxOp::OneMinus)
+}
+
 /// Scales every element by a scalar: `output[i] = alpha * input[i]`.
 ///
 /// The scalar `alpha` is passed by value from the host and embedded into
@@ -349,5 +625,186 @@ mod tests {
             .generate()
             .expect("tanh PTX generation should succeed");
         assert!(ptx.contains("elementwise_tanh_f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_neg_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Neg,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("neg PTX generation should succeed");
+        assert!(ptx.contains("elementwise_neg_f32"));
+        assert!(ptx.contains("neg.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_abs_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Abs,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("abs PTX generation should succeed");
+        assert!(ptx.contains("elementwise_abs_f32"));
+        assert!(ptx.contains("abs.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_sqrt_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Sqrt,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("sqrt PTX generation should succeed");
+        assert!(ptx.contains("elementwise_sqrt_f32"));
+        assert!(ptx.contains("sqrt.rn.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_rsqrt_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Rsqrt,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("rsqrt PTX generation should succeed");
+        assert!(ptx.contains("elementwise_rsqrt_f32"));
+        assert!(ptx.contains("rsqrt.approx.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_exp_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Exp,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("exp PTX generation should succeed");
+        assert!(ptx.contains("elementwise_exp_f32"));
+        assert!(ptx.contains("ex2.approx.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_log_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Log,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("log PTX generation should succeed");
+        assert!(ptx.contains("elementwise_log_f32"));
+        assert!(ptx.contains("lg2.approx.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_ceil_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Ceil,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("ceil PTX generation should succeed");
+        assert!(ptx.contains("elementwise_ceil_f32"));
+        assert!(ptx.contains("cvt.rpi.f32.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_floor_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Floor,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("floor PTX generation should succeed");
+        assert!(ptx.contains("elementwise_floor_f32"));
+        assert!(ptx.contains("cvt.rmi.f32.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_hard_sigmoid_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::HardSigmoid,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("hard_sigmoid PTX generation should succeed");
+        assert!(ptx.contains("elementwise_hard_sigmoid_f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_hard_swish_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::HardSwish,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("hard_swish PTX generation should succeed");
+        assert!(ptx.contains("elementwise_hard_swish_f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_softplus_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::Softplus,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("softplus PTX generation should succeed");
+        assert!(ptx.contains("elementwise_softplus_f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_leaky_relu_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::LeakyRelu,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("leaky_relu PTX generation should succeed");
+        assert!(ptx.contains("elementwise_leaky_relu_f32"));
+        assert!(ptx.contains("setp.ge.f32"));
+        assert!(ptx.contains("selp.f32"));
+    }
+
+    #[test]
+    fn ptx_template_generates_one_minus_f32() {
+        let template = ElementwiseTemplate::new(
+            PtxOp::OneMinus,
+            oxicuda_ptx::ir::PtxType::F32,
+            oxicuda_ptx::arch::SmVersion::Sm80,
+        );
+        let ptx = template
+            .generate()
+            .expect("one_minus PTX generation should succeed");
+        assert!(ptx.contains("elementwise_one_minus_f32"));
+        assert!(ptx.contains("sub.f32"));
+        assert!(ptx.contains("0f3F800000"));
     }
 }

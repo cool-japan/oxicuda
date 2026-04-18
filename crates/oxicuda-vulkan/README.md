@@ -28,7 +28,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-vulkan = "0.1.3"
+oxicuda-vulkan = "0.1.4"
 ```
 
 ```rust
@@ -44,7 +44,7 @@ match backend.init() {
 
 ## Status
 
-- **Version**: 0.1.3 (2026-04-17)
+- **Version**: 0.1.4 (2026-04-18)
 - **Tests**: 86 passing
 
 ## License

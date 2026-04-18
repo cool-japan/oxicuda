@@ -15,6 +15,7 @@
 
 pub mod attention;
 pub mod batch_norm;
+pub mod broadcast;
 pub mod convolution;
 pub mod elementwise;
 pub mod gemm;
@@ -23,3 +24,5 @@ pub mod reduction;
 pub mod scan;
 pub mod softmax;
 pub mod transpose;
+
+pub use broadcast::{BroadcastTemplate, MAX_BROADCAST_RANK};

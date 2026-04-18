@@ -87,10 +87,42 @@ pub enum ElementwiseOp {
     Softplus,
     /// Leaky relu: `b[i] = a[i] >= 0 ? a[i] : 0.01 * a[i]`.
     LeakyRelu,
+    /// One-minus: `b[i] = 1 - a[i]`.
+    OneMinus,
     /// Fused add-relu: `c[i] = relu(a[i] + b[i])`.
     FusedAddRelu,
     /// Fused scale-add: `c[i] = alpha * a[i] + beta * b[i]`.
     FusedScaleAdd,
+    /// Element-wise power: `c[i] = a[i]^b[i]` (lg2+mul+ex2 approximation).
+    Pow,
+    /// Element-wise minimum: `c[i] = min(a[i], b[i])`.
+    Min,
+    /// Element-wise maximum: `c[i] = max(a[i], b[i])`.
+    Max,
+    /// Comparison equal: `c[i] = (a[i] == b[i]) ? 1.0 : 0.0`.
+    CmpEq,
+    /// Comparison not-equal: `c[i] = (a[i] != b[i]) ? 1.0 : 0.0`.
+    CmpNe,
+    /// Comparison less-than: `c[i] = (a[i] < b[i]) ? 1.0 : 0.0`.
+    CmpLt,
+    /// Comparison greater-than: `c[i] = (a[i] > b[i]) ? 1.0 : 0.0`.
+    CmpGt,
+    /// Comparison less-or-equal: `c[i] = (a[i] <= b[i]) ? 1.0 : 0.0`.
+    CmpLe,
+    /// Comparison greater-or-equal: `c[i] = (a[i] >= b[i]) ? 1.0 : 0.0`.
+    CmpGe,
+    /// Fuzzy OR via max (same PTX as Max, distinct semantic label).
+    OrMax,
+    /// Probabilistic OR: `c[i] = a[i] + b[i] - a[i]*b[i]`.
+    OrProbSum,
+    /// Fuzzy NAND: `c[i] = 1 - a[i]*b[i]`.
+    Nand,
+    /// Fuzzy NOR: `c[i] = 1 - (a[i] + b[i] - a[i]*b[i])`.
+    Nor,
+    /// Fuzzy XOR: `c[i] = a[i] + b[i] - 2*a[i]*b[i]`.
+    Xor,
+    /// Fill: write a scalar to every element: `dst[i] = value`.
+    Fill,
 }
 
 impl ElementwiseOp {
@@ -119,10 +151,26 @@ impl ElementwiseOp {
             Self::HardSwish => "hard_swish",
             Self::Softplus => "softplus",
             Self::LeakyRelu => "leaky_relu",
+            Self::OneMinus => "one_minus",
+            Self::Pow => "pow",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::CmpEq => "cmp_eq",
+            Self::CmpNe => "cmp_ne",
+            Self::CmpLt => "cmp_lt",
+            Self::CmpGt => "cmp_gt",
+            Self::CmpLe => "cmp_le",
+            Self::CmpGe => "cmp_ge",
+            Self::OrMax => "or_max",
+            Self::OrProbSum => "or_prob_sum",
+            Self::Nand => "nand",
+            Self::Nor => "nor",
+            Self::Xor => "xor",
             Self::Scale => "scale",
             Self::AddScalar => "add_scalar",
             Self::FusedAddRelu => "fused_add_relu",
             Self::FusedScaleAdd => "fused_scale_add",
+            Self::Fill => "fill",
         }
     }
 
@@ -137,13 +185,30 @@ impl ElementwiseOp {
                 | Self::Div
                 | Self::FusedAddRelu
                 | Self::FusedScaleAdd
+                | Self::Pow
+                | Self::Min
+                | Self::Max
+                | Self::CmpEq
+                | Self::CmpNe
+                | Self::CmpLt
+                | Self::CmpGt
+                | Self::CmpLe
+                | Self::CmpGe
+                | Self::OrMax
+                | Self::OrProbSum
+                | Self::Nand
+                | Self::Nor
+                | Self::Xor
         )
     }
 
     /// Returns `true` if this operation requires scalar parameter(s).
     #[must_use]
     pub const fn needs_scalar(self) -> bool {
-        matches!(self, Self::Scale | Self::AddScalar | Self::FusedScaleAdd)
+        matches!(
+            self,
+            Self::Scale | Self::AddScalar | Self::FusedScaleAdd | Self::Fill
+        )
     }
 }
 
@@ -216,10 +281,25 @@ impl ElementwiseTemplate {
             ElementwiseOp::HardSwish => self.generate_hard_swish(),
             ElementwiseOp::Softplus => self.generate_softplus(),
             ElementwiseOp::LeakyRelu => self.generate_leaky_relu(),
+            ElementwiseOp::OneMinus => self.generate_one_minus(),
             ElementwiseOp::Scale => self.generate_scale(),
             ElementwiseOp::AddScalar => self.generate_add_scalar(),
             ElementwiseOp::FusedAddRelu => self.generate_fused_add_relu(),
             ElementwiseOp::FusedScaleAdd => self.generate_fused_scale_add(),
+            ElementwiseOp::Pow => self.generate_pow(),
+            ElementwiseOp::Min => self.generate_binary_minmax("min"),
+            ElementwiseOp::Max | ElementwiseOp::OrMax => self.generate_binary_minmax("max"),
+            ElementwiseOp::CmpEq => self.generate_binary_cmp("eq"),
+            ElementwiseOp::CmpNe => self.generate_binary_cmp("ne"),
+            ElementwiseOp::CmpLt => self.generate_binary_cmp("lt"),
+            ElementwiseOp::CmpGt => self.generate_binary_cmp("gt"),
+            ElementwiseOp::CmpLe => self.generate_binary_cmp("le"),
+            ElementwiseOp::CmpGe => self.generate_binary_cmp("ge"),
+            ElementwiseOp::OrProbSum => self.generate_or_prob_sum(),
+            ElementwiseOp::Nand => self.generate_nand(),
+            ElementwiseOp::Nor => self.generate_nor(),
+            ElementwiseOp::Xor => self.generate_xor(),
+            ElementwiseOp::Fill => self.generate_fill(),
         }
     }
 
@@ -1162,6 +1242,356 @@ impl ElementwiseTemplate {
             .build()
     }
 
+    /// Generates a one-minus kernel: `b[i] = 1 - a[i]`.
+    fn generate_one_minus(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let one_lit = float_one_literal(self.precision);
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;"
+                    ));
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_x, [%rd_a];\n    \
+                         sub{ty} %f_y, {one_lit}, %f_x;\n    \
+                         st.global{ty} [%rd_b], %f_y;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a power kernel: `c[i] = a[i]^b[i]` using lg2+mul+ex2 approximation.
+    fn generate_pow(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("c_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+                    let c_ptr = b.load_param_u64("c_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;\n    \
+                         add.u64 %rd_c, {c_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_a, [%rd_a];\n    \
+                         ld.global{ty} %f_b, [%rd_b];\n    \
+                         lg2.approx{ty} %f_t1, %f_a;\n    \
+                         mul{ty} %f_t2, %f_t1, %f_b;\n    \
+                         ex2.approx{ty} %f_c, %f_t2;\n    \
+                         st.global{ty} [%rd_c], %f_c;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a min or max kernel using native PTX min/max.
+    fn generate_binary_minmax(&self, min_or_max: &str) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let min_or_max = min_or_max.to_string();
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("c_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+                    let c_ptr = b.load_param_u64("c_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;\n    \
+                         add.u64 %rd_c, {c_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_a, [%rd_a];\n    \
+                         ld.global{ty} %f_b, [%rd_b];\n    \
+                         {min_or_max}{ty} %f_c, %f_a, %f_b;\n    \
+                         st.global{ty} [%rd_c], %f_c;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a comparison kernel: `c[i] = (a[i] {cond} b[i]) ? 1.0 : 0.0`.
+    fn generate_binary_cmp(&self, cond: &str) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let one_lit = float_one_literal(self.precision);
+        let zero_lit = float_zero_literal(self.precision);
+        let cond = cond.to_string();
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("c_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+                    let c_ptr = b.load_param_u64("c_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;\n    \
+                         add.u64 %rd_c, {c_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_a, [%rd_a];\n    \
+                         ld.global{ty} %f_b, [%rd_b];\n    \
+                         setp.{cond}{ty} %p_cmp, %f_a, %f_b;\n    \
+                         selp{ty} %f_c, {one_lit}, {zero_lit}, %p_cmp;\n    \
+                         st.global{ty} [%rd_c], %f_c;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a probabilistic OR kernel: `c[i] = a[i] + b[i] - a[i]*b[i]`.
+    fn generate_or_prob_sum(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("c_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+                    let c_ptr = b.load_param_u64("c_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;\n    \
+                         add.u64 %rd_c, {c_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_a, [%rd_a];\n    \
+                         ld.global{ty} %f_b, [%rd_b];\n    \
+                         mul{ty} %f_t, %f_a, %f_b;\n    \
+                         sub{ty} %f_s, %f_a, %f_t;\n    \
+                         add{ty} %f_c, %f_s, %f_b;\n    \
+                         st.global{ty} [%rd_c], %f_c;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a fuzzy NAND kernel: `c[i] = 1 - a[i]*b[i]`.
+    fn generate_nand(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let one_lit = float_one_literal(self.precision);
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("c_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+                    let c_ptr = b.load_param_u64("c_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;\n    \
+                         add.u64 %rd_c, {c_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_a, [%rd_a];\n    \
+                         ld.global{ty} %f_b, [%rd_b];\n    \
+                         mul{ty} %f_t, %f_a, %f_b;\n    \
+                         sub{ty} %f_c, {one_lit}, %f_t;\n    \
+                         st.global{ty} [%rd_c], %f_c;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a fuzzy NOR kernel: `c[i] = 1 - (a[i] + b[i] - a[i]*b[i])`.
+    fn generate_nor(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let one_lit = float_one_literal(self.precision);
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("c_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+                    let c_ptr = b.load_param_u64("c_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;\n    \
+                         add.u64 %rd_c, {c_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_a, [%rd_a];\n    \
+                         ld.global{ty} %f_b, [%rd_b];\n    \
+                         mul{ty} %f_t, %f_a, %f_b;\n    \
+                         sub{ty} %f_s, %f_a, %f_t;\n    \
+                         add{ty} %f_u, %f_s, %f_b;\n    \
+                         sub{ty} %f_c, {one_lit}, %f_u;\n    \
+                         st.global{ty} [%rd_c], %f_c;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
+    /// Generates a fuzzy XOR kernel: `c[i] = a[i] + b[i] - 2*a[i]*b[i]`.
+    fn generate_xor(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let two_lit = float_two_literal(self.precision);
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("a_ptr", PtxType::U64)
+            .param("b_ptr", PtxType::U64)
+            .param("c_ptr", PtxType::U64)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let a_ptr = b.load_param_u64("a_ptr");
+                    let b_ptr = b.load_param_u64("b_ptr");
+                    let c_ptr = b.load_param_u64("c_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_a, {a_ptr}, %rd_off;\n    \
+                         add.u64 %rd_b, {b_ptr}, %rd_off;\n    \
+                         add.u64 %rd_c, {c_ptr}, %rd_off;"
+                    ));
+
+                    b.raw_ptx(&format!(
+                        "ld.global{ty} %f_a, [%rd_a];\n    \
+                         ld.global{ty} %f_b, [%rd_b];\n    \
+                         add{ty} %f_s, %f_a, %f_b;\n    \
+                         mul{ty} %f_t, %f_a, %f_b;\n    \
+                         mul{ty} %f_t2, %f_t, {two_lit};\n    \
+                         sub{ty} %f_c, %f_s, %f_t2;\n    \
+                         st.global{ty} [%rd_c], %f_c;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+
     /// Generates a fused scale-add kernel: `c[i] = alpha * a[i] + beta * b[i]`.
     fn generate_fused_scale_add(&self) -> Result<String, PtxGenError> {
         let kernel_name = self.kernel_name();
@@ -1209,6 +1639,59 @@ impl ElementwiseTemplate {
                 b.ret();
             })
             .build()
+    }
+
+    /// Generates a fill kernel: `dst[i] = value` for all `i < n`.
+    ///
+    /// The scalar `value` is read from a kernel parameter (not from a source buffer),
+    /// which means every output element receives the same constant. This mirrors the
+    /// `generate_scale()` pattern for loading a scalar kernel parameter via `ld.param`.
+    fn generate_fill(&self) -> Result<String, PtxGenError> {
+        let kernel_name = self.kernel_name();
+        let ty = self.ty_str();
+        let byte_size = self.precision.size_bytes();
+        let scalar_ty = scalar_param_type(self.precision);
+
+        KernelBuilder::new(&kernel_name)
+            .target(self.target)
+            .param("dst_ptr", PtxType::U64)
+            .param("value", scalar_ty)
+            .param("n", PtxType::U32)
+            .max_threads_per_block(256)
+            .body(move |b| {
+                let tid = b.global_thread_id_x();
+                let tid_name = tid.to_string();
+                let n_reg = b.load_param_u32("n");
+                b.if_lt_u32(tid, n_reg, move |b| {
+                    let dst_ptr = b.load_param_u64("dst_ptr");
+
+                    b.raw_ptx(&format!(
+                        "cvt.u64.u32 %rd_off, {tid_name};\n    \
+                         mul.lo.u64 %rd_off, %rd_off, {byte_size};\n    \
+                         add.u64 %rd_dst, {dst_ptr}, %rd_off;\n    \
+                         ld.param{ty} %f_val, [%param_value];\n    \
+                         st.global{ty} [%rd_dst], %f_val;"
+                    ));
+                });
+                b.ret();
+            })
+            .build()
+    }
+}
+
+/// Returns the IEEE 754 hex literal for 1.0 in the given precision.
+const fn float_one_literal(ty: PtxType) -> &'static str {
+    match ty {
+        PtxType::F64 => "0d3FF0000000000000",
+        _ => "0f3F800000",
+    }
+}
+
+/// Returns the IEEE 754 hex literal for 2.0 in the given precision.
+const fn float_two_literal(ty: PtxType) -> &'static str {
+    match ty {
+        PtxType::F64 => "0d4000000000000000",
+        _ => "0f40000000",
     }
 }
 
@@ -1781,5 +2264,303 @@ mod tests {
             has_approx,
             "tanh PTX should use ex2.approx or tanh.approx, got:\n{ptx}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // New op PTX generation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generate_one_minus_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::OneMinus, PtxType::F32, SmVersion::Sm80);
+        let ptx = t
+            .generate()
+            .expect("one_minus PTX generation should succeed");
+        assert!(ptx.contains("sub.f32"), "one_minus must contain sub.f32");
+        assert!(
+            ptx.contains("0f3F800000"),
+            "one_minus must contain the 1.0 literal"
+        );
+        assert!(
+            ptx.contains(".entry elementwise_one_minus_f32"),
+            "one_minus must have correct kernel name"
+        );
+    }
+
+    #[test]
+    fn generate_pow_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::Pow, PtxType::F32, SmVersion::Sm80);
+        let ptx = t.generate().expect("pow PTX generation should succeed");
+        assert!(
+            ptx.contains("lg2.approx.f32"),
+            "pow must contain lg2.approx.f32"
+        );
+        assert!(
+            ptx.contains("ex2.approx.f32"),
+            "pow must contain ex2.approx.f32"
+        );
+        assert!(ptx.contains("mul.f32"), "pow must contain mul.f32");
+    }
+
+    #[test]
+    fn generate_min_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::Min, PtxType::F32, SmVersion::Sm80);
+        let ptx = t.generate().expect("min PTX generation should succeed");
+        assert!(ptx.contains("min.f32"), "min must contain min.f32");
+        assert!(
+            ptx.contains(".entry elementwise_min_f32"),
+            "min must have correct kernel name"
+        );
+    }
+
+    #[test]
+    fn generate_max_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::Max, PtxType::F32, SmVersion::Sm80);
+        let ptx = t.generate().expect("max PTX generation should succeed");
+        assert!(ptx.contains("max.f32"), "max must contain max.f32");
+        assert!(
+            ptx.contains(".entry elementwise_max_f32"),
+            "max must have correct kernel name"
+        );
+    }
+
+    #[test]
+    fn generate_cmp_eq_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::CmpEq, PtxType::F32, SmVersion::Sm80);
+        let ptx = t.generate().expect("cmp_eq PTX generation should succeed");
+        assert!(
+            ptx.contains("setp.eq.f32"),
+            "cmp_eq must contain setp.eq.f32"
+        );
+        assert!(ptx.contains("selp.f32"), "cmp_eq must contain selp.f32");
+        assert!(
+            ptx.contains("0f3F800000"),
+            "cmp_eq must contain the 1.0 literal for the true branch"
+        );
+    }
+
+    #[test]
+    fn generate_or_prob_sum_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::OrProbSum, PtxType::F32, SmVersion::Sm80);
+        let ptx = t
+            .generate()
+            .expect("or_prob_sum PTX generation should succeed");
+        assert!(ptx.contains("mul.f32"), "or_prob_sum must contain mul.f32");
+        assert!(ptx.contains("sub.f32"), "or_prob_sum must contain sub.f32");
+        assert!(ptx.contains("add.f32"), "or_prob_sum must contain add.f32");
+    }
+
+    #[test]
+    fn generate_nand_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::Nand, PtxType::F32, SmVersion::Sm80);
+        let ptx = t.generate().expect("nand PTX generation should succeed");
+        assert!(ptx.contains("mul.f32"), "nand must contain mul.f32");
+        assert!(ptx.contains("sub.f32"), "nand must contain sub.f32");
+        assert!(
+            ptx.contains("0f3F800000"),
+            "nand must contain the 1.0 literal"
+        );
+    }
+
+    #[test]
+    fn generate_nor_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::Nor, PtxType::F32, SmVersion::Sm80);
+        let ptx = t.generate().expect("nor PTX generation should succeed");
+        assert!(ptx.contains("mul.f32"), "nor must contain mul.f32");
+        assert!(ptx.contains("sub.f32"), "nor must contain sub.f32");
+        assert!(ptx.contains("add.f32"), "nor must contain add.f32");
+        assert!(
+            ptx.contains("0f3F800000"),
+            "nor must contain the 1.0 literal"
+        );
+    }
+
+    #[test]
+    fn generate_xor_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::Xor, PtxType::F32, SmVersion::Sm80);
+        let ptx = t.generate().expect("xor PTX generation should succeed");
+        assert!(ptx.contains("mul.f32"), "xor must contain mul.f32");
+        assert!(ptx.contains("sub.f32"), "xor must contain sub.f32");
+        assert!(ptx.contains("add.f32"), "xor must contain add.f32");
+        // 2.0 literal
+        assert!(
+            ptx.contains("0f40000000"),
+            "xor must contain the 2.0 literal"
+        );
+    }
+
+    #[test]
+    fn generate_or_max_f32() {
+        let t = ElementwiseTemplate::new(ElementwiseOp::OrMax, PtxType::F32, SmVersion::Sm80);
+        let ptx = t.generate().expect("or_max PTX generation should succeed");
+        assert!(ptx.contains("max.f32"), "or_max must use max.f32");
+        assert!(
+            ptx.contains(".entry elementwise_or_max_f32"),
+            "or_max must have correct kernel name"
+        );
+    }
+
+    #[test]
+    fn generate_cmp_ops_f32() {
+        // Verify all comparison ops generate PTX with correct condition codes
+        let cases = [
+            (ElementwiseOp::CmpNe, "setp.ne.f32"),
+            (ElementwiseOp::CmpLt, "setp.lt.f32"),
+            (ElementwiseOp::CmpGt, "setp.gt.f32"),
+            (ElementwiseOp::CmpLe, "setp.le.f32"),
+            (ElementwiseOp::CmpGe, "setp.ge.f32"),
+        ];
+        for (op, expected_instr) in cases {
+            let t = ElementwiseTemplate::new(op, PtxType::F32, SmVersion::Sm80);
+            let ptx = t
+                .generate()
+                .unwrap_or_else(|e| panic!("PTX gen failed for {op:?}: {e}"));
+            assert!(
+                ptx.contains(expected_instr),
+                "{op:?} PTX must contain {expected_instr}"
+            );
+            assert!(ptx.contains("selp.f32"), "{op:?} PTX must contain selp.f32");
+        }
+    }
+
+    #[test]
+    fn test_elementwise_ptx_has_valid_headers_extended() {
+        let ops_and_types = [
+            (ElementwiseOp::OneMinus, PtxType::F32),
+            (ElementwiseOp::Pow, PtxType::F32),
+            (ElementwiseOp::Min, PtxType::F32),
+            (ElementwiseOp::Max, PtxType::F32),
+            (ElementwiseOp::CmpEq, PtxType::F32),
+            (ElementwiseOp::OrProbSum, PtxType::F32),
+            (ElementwiseOp::Nand, PtxType::F32),
+            (ElementwiseOp::Nor, PtxType::F32),
+            (ElementwiseOp::Xor, PtxType::F32),
+            (ElementwiseOp::OrMax, PtxType::F32),
+        ];
+
+        for (op, ty) in ops_and_types {
+            let t = ElementwiseTemplate::new(op, ty, SmVersion::Sm80);
+            let ptx = t
+                .generate()
+                .unwrap_or_else(|e| panic!("PTX generation failed for {op:?}: {e}"));
+            assert!(
+                ptx.contains(".version"),
+                "PTX for {op:?} must have .version header"
+            );
+            assert!(
+                ptx.contains(".target"),
+                "PTX for {op:?} must have .target header"
+            );
+            assert!(
+                ptx.contains(".entry"),
+                "PTX for {op:?} must have .entry directive"
+            );
+        }
+    }
+
+    // CPU reference precision tests for new ops
+
+    fn cpu_one_minus_f32(x: f32) -> f32 {
+        1.0 - x
+    }
+
+    fn cpu_pow_f32(a: f32, b: f32) -> f32 {
+        a.powf(b)
+    }
+
+    #[allow(clippy::float_cmp)]
+    fn cpu_cmp_eq_f32(a: f32, b: f32) -> f32 {
+        if a == b { 1.0 } else { 0.0 }
+    }
+
+    fn cpu_or_prob_sum_f32(a: f32, b: f32) -> f32 {
+        a.mul_add(-b, a + b)
+    }
+
+    fn cpu_nand_f32(a: f32, b: f32) -> f32 {
+        a.mul_add(-b, 1.0)
+    }
+
+    fn cpu_nor_f32(a: f32, b: f32) -> f32 {
+        1.0 - a.mul_add(-b, a + b)
+    }
+
+    fn cpu_xor_f32(a: f32, b: f32) -> f32 {
+        (2.0_f32 * a).mul_add(-b, a + b)
+    }
+
+    #[test]
+    fn cpu_one_minus_f32_precision() {
+        assert!((cpu_one_minus_f32(0.0) - 1.0_f32).abs() < f32::EPSILON);
+        assert!((cpu_one_minus_f32(1.0) - 0.0_f32).abs() < f32::EPSILON);
+        assert!((cpu_one_minus_f32(0.5) - 0.5_f32).abs() < f32::EPSILON);
+        assert!((cpu_one_minus_f32(-1.0) - 2.0_f32).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cpu_pow_f32_precision() {
+        assert!((cpu_pow_f32(2.0, 3.0) - 8.0_f32).abs() < 1e-5_f32);
+        assert!((cpu_pow_f32(4.0, 0.5) - 2.0_f32).abs() < 1e-5_f32);
+        assert!((cpu_pow_f32(1.0, 100.0) - 1.0_f32).abs() < 1e-5_f32);
+    }
+
+    #[test]
+    fn cpu_cmp_eq_f32_precision() {
+        assert!((cpu_cmp_eq_f32(1.0, 1.0) - 1.0).abs() < f32::EPSILON);
+        assert!((cpu_cmp_eq_f32(1.0, 2.0) - 0.0).abs() < f32::EPSILON);
+        assert!((cpu_cmp_eq_f32(0.0, 0.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cpu_or_prob_sum_f32_precision() {
+        // For a=1, b=1: 1+1-1*1 = 1
+        assert!((cpu_or_prob_sum_f32(1.0, 1.0) - 1.0).abs() < f32::EPSILON);
+        // For a=0, b=0: 0
+        assert!(cpu_or_prob_sum_f32(0.0, 0.0).abs() < f32::EPSILON);
+        // For a=0.5, b=0.5: 0.5+0.5-0.25 = 0.75
+        assert!((cpu_or_prob_sum_f32(0.5, 0.5) - 0.75).abs() < 1e-6_f32);
+    }
+
+    #[test]
+    fn cpu_nand_f32_precision() {
+        // nand(1,1) = 1 - 1 = 0
+        assert!(cpu_nand_f32(1.0, 1.0).abs() < f32::EPSILON);
+        // nand(0,1) = 1 - 0 = 1
+        assert!((cpu_nand_f32(0.0, 1.0) - 1.0).abs() < f32::EPSILON);
+        // nand(0.5,0.5) = 1 - 0.25 = 0.75
+        assert!((cpu_nand_f32(0.5, 0.5) - 0.75).abs() < 1e-6_f32);
+    }
+
+    #[test]
+    fn cpu_nor_f32_precision() {
+        // nor(0,0) = 1 - 0 = 1
+        assert!((cpu_nor_f32(0.0, 0.0) - 1.0).abs() < f32::EPSILON);
+        // nor(1,0) = 1 - (1+0-0) = 0
+        assert!(cpu_nor_f32(1.0, 0.0).abs() < f32::EPSILON);
+        // nor(0.5,0.5) = 1 - 0.75 = 0.25
+        assert!((cpu_nor_f32(0.5, 0.5) - 0.25).abs() < 1e-6_f32);
+    }
+
+    #[test]
+    fn cpu_xor_f32_precision() {
+        // xor(0,0) = 0
+        assert!(cpu_xor_f32(0.0, 0.0).abs() < f32::EPSILON);
+        // xor(1,1) = 1+1-2 = 0
+        assert!(cpu_xor_f32(1.0, 1.0).abs() < f32::EPSILON);
+        // xor(1,0) = 1+0-0 = 1
+        assert!((cpu_xor_f32(1.0, 0.0) - 1.0).abs() < f32::EPSILON);
+        // xor(0.5,0.5) = 0.5+0.5-0.5 = 0.5
+        assert!((cpu_xor_f32(0.5, 0.5) - 0.5).abs() < 1e-6_f32);
+    }
+
+    #[test]
+    fn ptx_template_generates_fill_f32() {
+        let template = ElementwiseTemplate::new(ElementwiseOp::Fill, PtxType::F32, SmVersion::Sm80);
+        let ptx = template.generate().expect("fill PTX generation failed");
+        assert!(
+            ptx.contains("st.global.f32"),
+            "must contain store instruction"
+        );
+        assert!(ptx.contains("elementwise_fill_f32"), "wrong kernel name");
     }
 }

@@ -206,3 +206,18 @@ PTX generation is CPU-bound and should be fast enough for JIT scenarios:
 - [x] PTX cache hit rate verification test — 5 tests including cache-miss-avoids-regeneration
 - [x] Register pressure analysis warns when kernel exceeds 255 regs/thread — 4 tests including boundary
 - [x] Dead code elimination removes unreachable PTX blocks — 3 DCE tests including idempotency
+
+- [x] `oxicuda-unary-ptx-extensions` (planned 2026-04-17)
+  - **Goal:** Add `OneMinus` (= 1 − x) unary variant to `ElementwiseOp` in `src/templates/elementwise.rs` with a `generate_one_minus` method, `as_str` entry `"one_minus"`, and `is_binary => false`.
+  - **Files:** `src/templates/elementwise.rs`
+  - **Tests:** Assert PTX for `OneMinus` contains `sub.f32` and `0f3F800000`.
+
+- [x] `oxicuda-binary-ptx-extensions` (planned 2026-04-17)
+  - **Goal:** Add binary `ElementwiseOp` variants: `Pow, Min, Max, CmpEq, CmpNe, CmpLt, CmpGt, CmpLe, CmpGe, OrMax, OrProbSum, Nand, Nor, Xor`. Each gets a `generate_*` method, entry in `as_str`, and `is_binary => true`. Add helper const fns `float_one_literal` and `float_two_literal`.
+  - **Files:** `src/templates/elementwise.rs`
+  - **Tests:** PTX string content assertions for each new op (key instructions present).
+
+- [x] `oxicuda-per-axis-reduction-ptx` (planned 2026-04-17)
+  - **Goal:** Add `PerAxisReductionTemplate` struct to `src/templates/reduction.rs` and add `Mean` variant to `ReductionOp`. Kernel: one block per `(outer, inner)` output pair, 256 threads, loop over axis chunks, shared-memory tree reduce + warp shuffle final 32 elements. Kernel signature: `(input: u64, output: u64, axis_len: u32, inner: u32)` plus `inv_axis_len: f32` for Mean. Kernel name pattern: `reduce_axis_{op}_{type}`.
+  - **Files:** `src/templates/reduction.rs`
+  - **Tests:** PTX for Sum contains `.entry reduce_axis_sum_f32`, `shfl.sync.down`, `.shared`; for Mean also checks `mul.f32`.

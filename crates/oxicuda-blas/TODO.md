@@ -78,6 +78,23 @@ to cuBLAS. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda) (Vol.3).
 - [x] reduction/softmax.rs -- Softmax reduction
 - [x] reduction/ops.rs -- Reduction operation types
 
+### Pending
+
+- [x] `oxicuda-unary-wire-and-extend` (planned 2026-04-17)
+  - **Goal:** Wire unwired unary PTX ops into public API. Add variants to `elementwise/ops.rs`: `Neg, Abs, Sqrt, Rsqrt, Exp, Log, Ceil, Floor, HardSigmoid, HardSwish, Softplus, LeakyRelu, OneMinus`. Add public wrapper functions in `elementwise/unary.rs` following the `relu`/`gelu` one-liner pattern. Re-export from `elementwise/mod.rs`.
+  - **Files:** `src/elementwise/ops.rs`, `src/elementwise/unary.rs`, `src/elementwise/mod.rs`
+  - **Tests:** PTX generation tests (string content checks) for each new function.
+
+- [x] `oxicuda-binary-extensions` (planned 2026-04-17)
+  - **Goal:** Wire and extend binary ops. Add variants to `elementwise/ops.rs`: `Sub, Div, Pow, Min, Max, CmpEq, CmpNe, CmpLt, CmpGt, CmpLe, CmpGe, OrMax, OrProbSum, Nand, Nor, Xor`. Add public functions in `elementwise/binary.rs`. Re-export from `elementwise/mod.rs`.
+  - **Files:** `src/elementwise/ops.rs`, `src/elementwise/binary.rs`, `src/elementwise/mod.rs`
+  - **Tests:** PTX generation + content checks.
+
+- [x] `oxicuda-axis-reduction` (planned 2026-04-17)
+  - **Goal:** Add `Mean` variant to `reduction/ops.rs` + create `reduction/axis.rs` with `pub fn reduce_axis<T: GpuFloat>(handle, op, outer, axis_len, inner, input, output) -> BlasResult<()>`. Declare `pub mod axis; pub use axis::reduce_axis;` in `reduction/mod.rs`.
+  - **Files:** `src/reduction/ops.rs`, `src/reduction/axis.rs` (NEW), `src/reduction/mod.rs`
+  - **Tests:** PTX generation tests; CUDA-gated tests for correctness.
+
 ### Future Enhancements
 
 #### P0 -- Critical (Performance-Sensitive Paths)

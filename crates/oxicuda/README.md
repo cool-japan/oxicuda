@@ -6,7 +6,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) project.
 
 ## Overview
 
-**Version:** 0.1.3 — 2026-04-17 — 496 tests passing
+**Version:** 0.1.4 — 2026-04-18 — 496 tests passing
 
 `oxicuda` is the umbrella crate that re-exports all OxiCUDA sub-crates behind
 feature flags. It provides a single dependency entry point for applications that

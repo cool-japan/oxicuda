@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-quant = "0.1.3"
+oxicuda-quant = "0.1.4"
 ```
 
 ```rust
@@ -37,7 +37,7 @@ let deq    = q.dequantize(&codes, &params);
 
 ## Status
 
-**v0.1.3** (2026-04-17) — 150 tests passing
+**v0.1.4** (2026-04-18) — 150 tests passing
 
 ## License
 

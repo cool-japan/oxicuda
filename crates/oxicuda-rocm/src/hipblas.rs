@@ -128,7 +128,8 @@ impl HipBlas {
             // Use a raw dlopen probe rather than importing libloading here to
             // avoid pulling in an extra dependency at the crate level.
             // The actual symbol resolution is deferred to call sites.
-            let c_path = std::ffi::CString::new(*candidate).unwrap();
+            let c_path = std::ffi::CString::new(*candidate)
+                .expect("infallible: string literal contains no null bytes");
             // SAFETY: dlopen with RTLD_NOW | RTLD_LOCAL is safe for probing
             // whether a library exists. We immediately dlclose if found.
             let handle = unsafe {

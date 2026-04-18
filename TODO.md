@@ -3,12 +3,12 @@
 Pure Rust CUDA replacement for the COOLJAPAN ecosystem.
 (C) 2026 COOLJAPAN OU (Team KitaSan)
 
-## Project Status (v0.1.3 — 2026-04-17)
+## Project Status (v0.1.4 — 2026-04-18)
 
 - **Crates**: 28 workspace members (27 library crates + 1 umbrella)
-- **Files**: 765 Rust source files
-- **Code**: 260,119 SLoC (Rust, `tokei` verified)
-- **Tests**: 7,411 passing, 2 skipped (GPU-only on macOS)
+- **Files**: 769 Rust source files
+- **Code**: 262,824 SLoC (Rust, `tokei` verified)
+- **Tests**: 7,488 passing, 2 skipped (GPU-only on macOS)
 - **Warnings**: 0 (clippy + rustc, `-D warnings`)
 - **unwrap() calls**: 0 (no-unwrap policy in library code)
 - **Status**: All 10 volumes complete — Vol.1 Foundation, Vol.2 PTX/Autotune, Vol.3 BLAS, Vol.4 DNN, Vol.5 Scientific Computing, Vol.6 Signal Processing, Vol.7 Computation Graph, Vol.8 GPU Training, Vol.9 Inference Engine, Vol.10 Reinforcement Learning, plus 7 backend crates (Metal/Vulkan/WebGPU/ROCm/LevelZero/primitives/backend) with full compute operations wired
@@ -439,7 +439,7 @@ All kernels are generated as PTX source strings at runtime and JIT-compiled via 
 
 ### oxicuda (umbrella crate) (44 files, 18,764 SLoC)
 - [x] Re-exports all sub-crates under unified namespace
-- [x] ComputeBackend trait (backend.rs) -- ComputeBackend trait, CudaBackend implementation, feature-gated for SciRS2 integration
+- [x] ComputeBackend trait (backend.rs) -- ComputeBackend trait, CudaBackend implementation, feature-gated for SciRS2 integration; alloc/free/copy_htod/copy_dtoh/synchronize/init now use real oxicuda_driver calls (PrimaryContext + cuMemAlloc_v2/cuMemcpyHtoD_v2/cuMemcpyDtoH_v2/cuCtxSynchronize); reduce/unary/binary pending PTX pipeline wiring
   - [x] Global initialization (global_init.rs) -- OxiCudaRuntime singleton with device auto-selection
   - [x] OxiONNX GPU inference backend (onnx_backend/) -- IR graph, op implementations, executor, planner, fusion, shape inference
   - [x] ToRSh GPU backend (tensor_backend/) -- tensor, dtype, autograd, ops, optimizer, mixed precision
@@ -844,9 +844,9 @@ and GPU kernel PTX string generators.
 | Clippy warnings | 0 | 0 |
 | unwrap() in library code | 0 | 0 |
 | C/Fortran build deps | 0 | 0 |
-| Test count | >500 | 7,263 |
+| Test count | >500 | 7,488 |
 | Test pass rate | 100% | 100% |
-| Code lines (SLoC) | >30K | 253,125 |
+| Code lines (SLoC) | >30K | 262,824 |
 | Crate count | 12 | 28 |
 | GPU arch coverage | SM 7.5--10.0 | SM 7.5--10.0 |
 | Pure Rust | 100% default features | 100% |

@@ -200,6 +200,7 @@ pub use emit::validator::{
 };
 
 // Templates
+pub use templates::broadcast::{BroadcastTemplate, MAX_BROADCAST_RANK};
 pub use templates::elementwise::{ElementwiseOp, ElementwiseTemplate};
 pub use templates::gemm::{EpilogueKind, GemmTemplate};
 pub use templates::reduction::{ReductionOp, ReductionTemplate};

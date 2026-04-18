@@ -1,6 +1,13 @@
 //! Abstract compute backend for GPU-accelerated operations.
 //! Re-exports the [`ComputeBackend`](crate::backend::ComputeBackend) trait and supporting types from `oxicuda-backend`.
 
+use std::sync::Mutex;
+
+use oxicuda_driver::device::Device;
+use oxicuda_driver::ffi::CUdeviceptr;
+use oxicuda_driver::loader::try_driver;
+use oxicuda_driver::primary_context::PrimaryContext;
+
 pub use oxicuda_backend::{
     BackendError, BackendResult, BackendTranspose, BinaryOp, ComputeBackend, ReduceOp, UnaryOp,
 };
@@ -12,6 +19,11 @@ pub use oxicuda_backend::{
 /// Delegates to `oxicuda-driver`, `oxicuda-blas`, and `oxicuda-dnn` for
 /// actual GPU computation. When those sub-crate features are not enabled,
 /// the corresponding operations return [`BackendError::Unsupported`].
+///
+/// On systems without a CUDA GPU, [`init`](ComputeBackend::init) succeeds
+/// (so the type is always usable) but GPU operations such as
+/// [`alloc`](ComputeBackend::alloc) and [`copy_htod`](ComputeBackend::copy_htod)
+/// return [`BackendError::DeviceError`].
 ///
 /// # Example
 ///
@@ -27,13 +39,18 @@ pub use oxicuda_backend::{
 #[derive(Debug)]
 pub struct CudaBackend {
     initialized: bool,
+    /// Retained primary CUDA context, set when a GPU is available.
+    context: Mutex<Option<PrimaryContext>>,
 }
 
 impl CudaBackend {
     /// Create a new, uninitialized CUDA backend.
     #[must_use]
     pub fn new() -> Self {
-        Self { initialized: false }
+        Self {
+            initialized: false,
+            context: Mutex::new(None),
+        }
     }
 
     /// Check that the backend is initialized, returning an error if not.
@@ -43,6 +60,12 @@ impl CudaBackend {
         } else {
             Err(BackendError::NotInitialized)
         }
+    }
+
+    /// Returns `true` if a live GPU context was successfully retained during
+    /// [`init`](ComputeBackend::init).
+    fn has_gpu_context(&self) -> bool {
+        self.context.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 }
 
@@ -61,10 +84,33 @@ impl ComputeBackend for CudaBackend {
         if self.initialized {
             return Ok(());
         }
-        // In a full implementation this would call oxicuda_driver::init()
-        // and select device 0, create a context, etc.  For now we simply
-        // mark ourselves as ready — actual GPU dispatch is wired up when
-        // the driver crate is integrated.
+
+        // Attempt real CUDA initialisation.  On systems without a GPU the
+        // driver library will not be present and we fall back gracefully:
+        // the backend is marked as initialised so callers can branch on
+        // `is_initialized()`, but GPU operations will return a DeviceError.
+        if let Ok(()) = oxicuda_driver::init() {
+            if let Ok(dev) = Device::get(0) {
+                if let Ok(ctx) = PrimaryContext::retain(&dev) {
+                    // Make the primary context current on this thread so that
+                    // subsequent driver calls (cuMemAlloc, cuMemcpy, …) use it.
+                    if let Ok(api) = try_driver() {
+                        let raw = ctx.raw();
+                        // Ignore the error from cuCtxSetCurrent: the context
+                        // may already be current, or it may be a non-fatal
+                        // warning.  The important thing is that allocation
+                        // attempts will produce a proper error if the context
+                        // is wrong rather than silently succeeding.
+                        let _ =
+                            oxicuda_driver::error::check(unsafe { (api.cu_ctx_set_current)(raw) });
+                    }
+                    if let Ok(mut guard) = self.context.lock() {
+                        *guard = Some(ctx);
+                    }
+                }
+            }
+        }
+
         self.initialized = true;
         Ok(())
     }
@@ -273,8 +319,14 @@ impl ComputeBackend for CudaBackend {
 
     fn synchronize(&self) -> BackendResult<()> {
         self.check_init()?;
-        // In a full implementation: oxicuda_driver::Stream::synchronize()
-        Ok(())
+        // If no GPU context is available (e.g. no CUDA hardware), there is
+        // nothing to synchronise — return Ok as a no-op.
+        if !self.has_gpu_context() {
+            return Ok(());
+        }
+        let api = try_driver().map_err(|e| BackendError::DeviceError(e.to_string()))?;
+        oxicuda_driver::error::check(unsafe { (api.cu_ctx_synchronize)() })
+            .map_err(|e| BackendError::DeviceError(e.to_string()))
     }
 
     fn alloc(&self, bytes: usize) -> BackendResult<u64> {
@@ -286,43 +338,50 @@ impl ComputeBackend for CudaBackend {
             ));
         }
 
-        // In a full implementation: oxicuda_memory::DeviceBuffer::alloc(bytes)
-        // For now, return a sentinel value.
-        Err(BackendError::Unsupported(
-            "alloc not yet connected to driver".into(),
-        ))
+        let api = try_driver().map_err(|e| BackendError::DeviceError(e.to_string()))?;
+        let mut ptr: CUdeviceptr = 0;
+        oxicuda_driver::error::check(unsafe { (api.cu_mem_alloc_v2)(&mut ptr, bytes) }).map_err(
+            |e| match e {
+                oxicuda_driver::CudaError::OutOfMemory => BackendError::OutOfMemory,
+                other => BackendError::DeviceError(other.to_string()),
+            },
+        )?;
+        Ok(ptr)
     }
 
-    fn free(&self, _ptr: u64) -> BackendResult<()> {
+    fn free(&self, ptr: u64) -> BackendResult<()> {
         self.check_init()?;
-        // In a full implementation: oxicuda_memory::DeviceBuffer::free(ptr)
-        Err(BackendError::Unsupported(
-            "free not yet connected to driver".into(),
-        ))
+        let api = try_driver().map_err(|e| BackendError::DeviceError(e.to_string()))?;
+        oxicuda_driver::error::check(unsafe { (api.cu_mem_free_v2)(ptr) })
+            .map_err(|e| BackendError::DeviceError(e.to_string()))
     }
 
-    fn copy_htod(&self, _dst: u64, src: &[u8]) -> BackendResult<()> {
+    fn copy_htod(&self, dst: u64, src: &[u8]) -> BackendResult<()> {
         self.check_init()?;
 
         if src.is_empty() {
-            return Ok(()); // no-op
+            return Ok(());
         }
 
-        Err(BackendError::Unsupported(
-            "copy_htod not yet connected to driver".into(),
-        ))
+        let api = try_driver().map_err(|e| BackendError::DeviceError(e.to_string()))?;
+        oxicuda_driver::error::check(unsafe {
+            (api.cu_memcpy_htod_v2)(dst, src.as_ptr().cast(), src.len())
+        })
+        .map_err(|e| BackendError::DeviceError(e.to_string()))
     }
 
-    fn copy_dtoh(&self, dst: &mut [u8], _src: u64) -> BackendResult<()> {
+    fn copy_dtoh(&self, dst: &mut [u8], src: u64) -> BackendResult<()> {
         self.check_init()?;
 
         if dst.is_empty() {
-            return Ok(()); // no-op
+            return Ok(());
         }
 
-        Err(BackendError::Unsupported(
-            "copy_dtoh not yet connected to driver".into(),
-        ))
+        let api = try_driver().map_err(|e| BackendError::DeviceError(e.to_string()))?;
+        oxicuda_driver::error::check(unsafe {
+            (api.cu_memcpy_dtoh_v2)(dst.as_mut_ptr().cast(), src, dst.len())
+        })
+        .map_err(|e| BackendError::DeviceError(e.to_string()))
     }
 }
 

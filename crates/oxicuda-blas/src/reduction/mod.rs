@@ -6,6 +6,7 @@
 //! reduction when needed, and writes the scalar (or vector) result to device
 //! memory.
 
+pub mod axis;
 mod max;
 mod mean;
 mod min;
@@ -14,6 +15,7 @@ mod softmax;
 mod sum;
 mod variance;
 
+pub use axis::reduce_axis;
 pub use max::max;
 pub use mean::mean;
 pub use min::min;

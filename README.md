@@ -212,28 +212,28 @@ fn main() -> Result<(), oxicuda::Error> {
 | Crate | CUDA Equivalent | Description | SLoC | Tests |
 |-------|-----------------|-------------|------|-------|
 | **Vol.1 -- Foundation** | | | | |
-| `oxicuda-driver` | Driver API | FFI, device/context/stream/event/module | 11,601 | 333 |
+| `oxicuda-driver` | Driver API | FFI, device/context/stream/event/module | 11,601 | 279 |
 | `oxicuda-memory` | cuMemAlloc | DeviceBuffer, PinnedBuffer, unified, pool | 4,178 | 201 |
 | `oxicuda-launch` | cuLaunchKernel | Dim3, LaunchParams, `launch!` macro | 4,728 | 207 |
-| `oxicuda-runtime` | CUDA Runtime | High-level cudaRT API layer | 2,518 | 46 |
+| `oxicuda-runtime` | CUDA Runtime | High-level cudaRT API layer | 2,518 | 47 |
 | **Vol.2 -- PTX Codegen & Autotuner** | | | | |
-| `oxicuda-ptx` | nvcc / CUTLASS | PTX IR, codegen DSL, Tensor Core gen | 29,438 | 880 |
+| `oxicuda-ptx` | nvcc / CUTLASS | PTX IR, codegen DSL, Tensor Core gen | 29,438 | 916 |
 | `oxicuda-autotune` | -- | Search space, benchmark, tuning DB | 13,916 | 408 |
 | **Vol.3 -- Linear Algebra** | | | | |
-| `oxicuda-blas` | cuBLAS | BLAS L1/L2/L3, GEMM, batched, elementwise | 21,845 | 604 |
+| `oxicuda-blas` | cuBLAS | BLAS L1/L2/L3, GEMM, batched, elementwise | 21,845 | 645 |
 | **Vol.4 -- Deep Learning** | | | | |
 | `oxicuda-dnn` | cuDNN | Conv, attention, MoE, norm, pool, quantize | 34,711 | 960 |
 | **Vol.5 -- Scientific Computing** | | | | |
 | `oxicuda-fft` | cuFFT | Stockham, radix-2/4/8, Bluestein, 1D/2D/3D | 9,745 | 314 |
 | `oxicuda-sparse` | cuSPARSE | CSR/CSC/COO/BSR/ELL, SpMV, SpMM, SpGEMM | 12,278 | 322 |
 | `oxicuda-solver` | cuSOLVER | LU, QR, SVD, Cholesky, eig, CG, GMRES | 15,804 | 387 |
-| `oxicuda-rand` | cuRAND | Philox, MRG32k3a, Sobol, distributions | 10,115 | 270 |
+| `oxicuda-rand` | cuRAND | Philox, MRG32k3a, Sobol, distributions | 10,115 | 293 |
 | **Vol.6 -- Signal Processing** | | | | |
 | `oxicuda-signal` | -- | Audio/image DSP, DCT, DWT, IIR/FIR filters | 6,061 | 240 |
 | **Vol.7 -- Computation Graph** | | | | |
 | `oxicuda-graph` | CUDA Graphs | Graph capture, dep-sorted exec, events | 4,802 | 175 |
 | **Vol.8 -- GPU Training** | | | | |
-| `oxicuda-train` | -- | AMP, grad accum/clip, LR schedulers, optimizers | 5,929 | 165 |
+| `oxicuda-train` | -- | AMP, grad accum/clip, LR schedulers, optimizers | 5,929 | 167 |
 | `oxicuda-quant` | -- | INT8/INT4/FP8 quantization, block-scaled | 4,318 | 150 |
 | **Vol.9 -- Inference Engine** | | | | |
 | `oxicuda-infer` | -- | KV-cache, paged attention, speculative decode | 4,256 | 139 |
@@ -244,14 +244,14 @@ fn main() -> Result<(), oxicuda::Error> {
 | **Backends** | | | | |
 | `oxicuda-backend` | -- | Backend trait abstraction | 271 | 10 |
 | `oxicuda-primitives` | CUB | GPU scan, reduce, sort, histogram | 4,446 | 142 |
-| `oxicuda-metal` | -- | Metal compute backend (macOS) | 3,328 | 152 |
+| `oxicuda-metal` | -- | Metal compute backend (macOS) | 3,328 | 157 |
 | `oxicuda-vulkan` | -- | Vulkan Compute backend | 3,377 | 86 |
 | `oxicuda-webgpu` | -- | WebGPU backend | 2,334 | 91 |
-| `oxicuda-rocm` | -- | AMD ROCm backend | 1,995 | 104 |
-| `oxicuda-levelzero` | -- | Intel oneAPI / LevelZero backend | 3,914 | 103 |
+| `oxicuda-rocm` | -- | AMD ROCm backend | 1,995 | 105 |
+| `oxicuda-levelzero` | -- | Intel oneAPI / LevelZero backend | 3,914 | 104 |
 | **Umbrella** | | | | |
 | `oxicuda` | -- | Umbrella re-export crate | 19,614 | 496 |
-| | | **Total** | **260,119** | **7,411** |
+| | | **Total** | **262,824** | **7,488** |
 
 ## Feature Flags
 
@@ -342,7 +342,7 @@ cargo nextest run --all-features
 
 ## Roadmap
 
-**Released (v0.1.3) -- 2026-04-17**
+**Released (v0.1.4) -- 2026-04-18**
 - Vol.1: Driver, Memory, Launch, Runtime -- foundation layer (4 crates, 23,025 SLoC)
 - Vol.2: PTX codegen DSL, autotuner engine (2 crates, 43,354 SLoC)
 - Vol.3: Full BLAS L1/L2/L3 with Tensor Core GEMM (21,845 SLoC)

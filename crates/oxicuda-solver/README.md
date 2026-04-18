@@ -78,9 +78,9 @@ use oxicuda_solver::prelude::*;
 
 | Metric | Value |
 |--------|-------|
-| Version | 0.1.3 |
+| Version | 0.1.4 |
 | Tests passing | 387 |
-| Release date | 2026-04-17 |
+| Release date | 2026-04-18 |
 
 ## License
 

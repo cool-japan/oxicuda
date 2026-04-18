@@ -10,7 +10,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 
 | Version | Tests | Date |
 |---------|-------|------|
-| 0.1.3 | 182 passing | 2026-04-17 |
+| 0.1.4 | 182 passing | 2026-04-18 |
 
 ## Features
 
@@ -27,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-lm = "0.1.3"
+oxicuda-lm = "0.1.4"
 ```
 
 ```rust

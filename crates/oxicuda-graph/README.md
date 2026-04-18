@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-graph = "0.1.3"
+oxicuda-graph = "0.1.4"
 ```
 
 ```rust
@@ -46,7 +46,7 @@ println!("kernels launched: {}", stats.kernels_launched);
 
 ## Status
 
-**v0.1.3** (2026-04-17) — 175 tests passing
+**v0.1.4** (2026-04-18) — 175 tests passing
 
 ## License
 
