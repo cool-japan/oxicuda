@@ -1586,10 +1586,7 @@ fn emit_vote_all_and_ballot() {
         negate_src: true,
         membership_mask: 0xFFFF_FFFF,
     };
-    assert_eq!(
-        ballot.emit(),
-        "vote.sync.ballot.b32 %r0, !%p1, 0xffffffff;"
-    );
+    assert_eq!(ballot.emit(), "vote.sync.ballot.b32 %r0, !%p1, 0xffffffff;");
 }
 
 #[test]

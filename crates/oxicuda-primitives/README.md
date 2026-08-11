@@ -15,6 +15,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 - **PTX helpers** (`ptx_helpers`): shared utilities for PTX code generation, type mapping, and operation encoding
 - Configurable via `DeviceReduceConfig`, `ScanConfig`, `SortConfig`, etc. — choose data type, operation, and tuning parameters at runtime
 - Supports SM75 through SM120 (Turing, Ampere, Hopper, Blackwell)
+- On-device `gpu-tests` also validate `oxicuda-ptx`'s `WarpVec`/`WarpMask` warp-vector layer — relu-dot, reductions with the `redux.sync` fast path, scans, votes/ballot/count, and every shuffle mode — against independent CPU oracles on real hardware (RTX A4000, sm_86)
 
 ## Usage
 
@@ -22,7 +23,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-primitives = "0.4.1"
+oxicuda-primitives = "0.5.4"
 ```
 
 ```rust
@@ -41,8 +42,8 @@ assert!(pass1_ptx.contains("device_reduce_pass1_sum_f32"));
 
 ## Status
 
-- **Version**: 0.3.0 (2026-06-25)
-- **Tests**: 260 passing
+- **Version**: 0.5.4 (2026-08-11)
+- **Tests**: 271 passing
 
 ## License
 

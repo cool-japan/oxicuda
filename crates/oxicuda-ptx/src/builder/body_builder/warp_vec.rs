@@ -86,7 +86,7 @@
 
 use crate::error::PtxGenError;
 use crate::ir::{
-    CmpOp, ImmValue, Instruction, MulMode, Operand, PtxType, Register, ReduxOp, RoundingMode,
+    CmpOp, ImmValue, Instruction, MulMode, Operand, PtxType, ReduxOp, Register, RoundingMode,
     ShflMode,
 };
 
@@ -1328,7 +1328,11 @@ fn combine(
         },
         WarpReduceOp::Prod => Instruction::Mul {
             ty,
-            mode: if is_float(ty) { MulMode::Rn } else { MulMode::Lo },
+            mode: if is_float(ty) {
+                MulMode::Rn
+            } else {
+                MulMode::Lo
+            },
             dst: dst.clone(),
             a,
             b: p,

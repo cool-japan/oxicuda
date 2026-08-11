@@ -60,12 +60,18 @@ pub const fn shfl_c_value(mode: ShflMode, width: u32) -> u32 {
 /// Returns `true` for element types that ride the `shfl.sync.b32` datapath
 /// directly (any 32-bit register class).
 const fn is_shfl_32bit(ty: PtxType) -> bool {
-    matches!(ty, PtxType::F32 | PtxType::U32 | PtxType::S32 | PtxType::B32)
+    matches!(
+        ty,
+        PtxType::F32 | PtxType::U32 | PtxType::S32 | PtxType::B32
+    )
 }
 
 /// Returns `true` for element types shuffled as two 32-bit halves.
 const fn is_shfl_64bit(ty: PtxType) -> bool {
-    matches!(ty, PtxType::F64 | PtxType::U64 | PtxType::S64 | PtxType::B64)
+    matches!(
+        ty,
+        PtxType::F64 | PtxType::U64 | PtxType::S64 | PtxType::B64
+    )
 }
 
 impl BodyBuilder<'_> {

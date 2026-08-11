@@ -237,7 +237,10 @@ fn warp_vec_reduce_sum_f64_composite() {
     let expected: f64 = input.iter().sum();
 
     let ptx = reduce_kernel(fx.sm, PtxType::F64, 32);
-    assert!(ptx.contains("mov.b64 {"), "composite unpack expected:\n{ptx}");
+    assert!(
+        ptx.contains("mov.b64 {"),
+        "composite unpack expected:\n{ptx}"
+    );
     let kernel = load_kernel(&ptx, "warp_vec_reduce");
     let stream = fx.stream();
     let d_in = DeviceBuffer::<f64>::from_host(&input).expect("d_in");
@@ -360,11 +363,15 @@ fn warp_vec_reduce_min_max_f32() {
     d_min.copy_to_host(&mut got_min).expect("copy min");
     d_max.copy_to_host(&mut got_max).expect("copy max");
     assert!(
-        got_min.iter().all(|&v| (v - expected_min).abs() < f32::EPSILON),
+        got_min
+            .iter()
+            .all(|&v| (v - expected_min).abs() < f32::EPSILON),
         "min: expected {expected_min}, got {got_min:?}"
     );
     assert!(
-        got_max.iter().all(|&v| (v - expected_max).abs() < f32::EPSILON),
+        got_max
+            .iter()
+            .all(|&v| (v - expected_max).abs() < f32::EPSILON),
         "max: expected {expected_max}, got {got_max:?}"
     );
 }

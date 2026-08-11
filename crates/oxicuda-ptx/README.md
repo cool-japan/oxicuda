@@ -89,10 +89,18 @@ All functionality is available by default -- no optional feature flags.
 The crate is 100% pure Rust with zero external tool requirements for PTX
 text generation.
 
+A SIMD-flavored warp-vector expression layer (`WarpVec`/`WarpMask`, in
+`builder::warp_vec`, re-exported from the prelude) treats a CUDA warp's
+32 lanes as a first-class vector value -- elementwise arithmetic,
+comparisons, reductions, scans, and the full shuffle family, generated
+as PTX `shfl.sync`/`vote.sync`/`redux.sync` instructions. See the
+crate's rustdoc for `WarpVec` for a worked example.
+
 ## Status
 
 | Version | Date       | Tests        |
 |---------|------------|--------------|
+| 0.5.4   | 2026-08-11 | 1061 passing |
 | 0.5.2   | 2026-07-27 | 1035 passing |
 | 0.3.0   | 2026-06-25 | 1006 passing |
 | 0.2.0   | 2026-06-16 | 934 passing  |

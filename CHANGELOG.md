@@ -5,7 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.4] - Unreleased
+## [0.5.4] - 2026-08-11
+
+This release adds a SIMD-flavored warp-vector expression layer to `oxicuda-ptx`'s builder DSL —
+treating a CUDA warp as a first-class 32-lane vector unit, in the spirit of the SIMT/SIMD duality
+explored by VectorWare's "Rust SIMD on the GPU" work — plus the low-level warp shuffle/vote
+instructions it's built on, and a new foreign-compiler PTX interop test path proving the
+driver/launch stack correctly hosts `rustc`-generated PTX modules, not just `oxicuda-ptx`'s own.
+
+### Added
+
+- `oxicuda-ptx`: `WarpVec`/`WarpMask` (exported from `oxicuda_ptx::prelude` alongside
+  `WarpReduceOp`, `WarpScanMode`, `FULL_WARP_MASK`, `WARP_SIZE`) — a `Simd`/`Mask`-style value type
+  over a CUDA warp's 32 lanes, built entirely on stable Rust via runtime PTX codegen. `WarpVec`
+  supports elementwise arithmetic (`add`/`sub`/`mul`/`fma`/`min`/`max`/`neg`/`abs`/`sqrt`/`relu`,
+  with float multiplies correctly emitting `mul.rn.f32`/`.f64` rather than the integer `.lo` form),
+  type-aware comparisons (`gt`/`ge`/`lt`/`le`/`eq`/`ne`, returning `WarpMask`), `select`, butterfly
+  all-reduce reductions (`reduce`/`reduce_sum`/`reduce_prod`/`reduce_min`/`reduce_max`, with a
+  `redux.sync` fast path on sm_80+), a -0.0-preserving Hillis-Steele `scan_sum`, and the full
+  shuffle family (`broadcast`, `shuffle_up`/`shuffle_down`, `butterfly`, `reverse`, dynamic
+  `shuffle_idx`). `WarpMask` adds `and`/`or`/`xor`/`not` logic, `any`/`all`/`ballot`/`count`
+  (segmented via ballot plus a segment mask), and mask-driven `select`. Both types carry a logical
+  segment width (2..=32, checked on every binary op) so sub-warp-segmented operations compose
+  safely.
+- `oxicuda-ptx`: new IR instructions backing the warp-vector layer — `Shfl` (`shfl.sync`, all four
+  source-lane modes via the new `ShflMode` enum, with an optional in-range predicate destination),
+  `Vote` (`vote.sync`, all/any/uni/ballot via the new `VoteMode` enum), `Mov` (typed register/immediate
+  moves, with hex-exact float immediates), `PackB64x2`/`UnpackB64x2` (the `mov.b64 {lo, hi}, src`
+  pair form used to route 64-bit values through the 32-bit-only shuffle datapath), and `Not` (incl.
+  `not.pred`); plus `MulMode::Rn` for explicit `mul.rn.f32`/`.f64`. All six are fully wired into the
+  validator's def/use analysis, dead-code elimination, register-pressure tracking, instruction
+  scheduling, arch-legality checks (sm_70 floor), and the interactive TUI explorer's
+  category/latency model.
+- `oxicuda-ptx`: `builder::warp_ops` — the low-level emission layer under `WarpVec`/`WarpMask`:
+  `lane_id`, `warp_index_x`, `mov_typed`, `shfl_sync`/`shfl_sync_with_valid` (CUDA-exact segmented
+  `c`-operand encoding via `shfl_c_value`), `vote_{all,any,uni,ballot}`, and `not_pred`; new
+  `FULL_WARP_MASK`/`WARP_SIZE` constants and an `is_valid_warp_width` helper.
+- `oxicuda-primitives`: 11 on-device `gpu-tests` (validated on an RTX A4000, sm_86) exercising
+  `WarpVec`/`WarpMask` against independent CPU oracles — relu-dot, the `redux.sync` fast path,
+  s32/f64/segmented reductions, min/max, both scan directions, votes/ballot/count/segmented-any,
+  and every shuffle mode.
+- `oxicuda-launch`: `rustc_ptx_interop` (`#[cfg(all(test, feature = "gpu-tests"))]`) — JIT-compiles
+  and launches PTX fixtures produced by upstream nightly `rustc`'s NVPTX backend
+  (`nvptx64-nvidia-cuda`), not `oxicuda-ptx`'s own generator, directly through the driver stack: a
+  scalar SIMT `saxpy` and a `core::simd` (portable-SIMD) relu-dot kernel, both checked for exact
+  numerical agreement against a CPU oracle. The portable-SIMD fixture documents empirically that
+  upstream `rustc` scalarizes `Simd` within one thread (no `shfl.sync` is emitted) — the
+  lane-to-warp mapping `WarpVec` provides above is downstream compiler work that doesn't exist yet
+  upstream.
+
+### Fixed
+
+- `oxicuda-ptx`: `Instruction::Redux`'s bitwise reduction ops (`redux.sync.and`/`.or`/`.xor`) were
+  emitted as `.u32`, but the PTX ISA requires the untyped `.b32` form for these — `ptxas` rejected
+  every bitwise warp reduction while the arithmetic ops (`add`/`min`/`max`, legitimately `.u32`)
+  worked. Fixed by emitting `.b32` for `And`/`Or`/`Xor` and keeping `.u32` for the arithmetic ops;
+  caught by the new `WarpVec` `ptxas` assembler battery and covered by a regression test.
+- Six clippy 1.97.1 warnings surfaced by toolchain lint drift in previously-untouched crates:
+  `values()`/`values_mut()` over map iteration (`oxicuda`'s `kv_cache`, `oxicuda-pde`'s `dg_2d`), a
+  `match` rewritten to `?` (`oxicuda-ot`'s `free_support_adaptive`), an inline format argument over
+  a redundant reference (`oxicuda-anomaly`'s `cof`), and a redundant explicit field before `..`
+  (`oxicuda-driver`'s `jit_diagnostics` test). Workspace `cargo clippy --all-features --all-targets
+  -- -D warnings` is back to zero warnings.
+
+### Changed
+
+- Bumped 0.5.3 → 0.5.4 (workspace version plus all 49 internal path-dependency version pins in the
+  root `Cargo.toml`).
 
 ## [0.5.3] - 2026-07-27
 

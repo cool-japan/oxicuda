@@ -830,9 +830,9 @@ fn defs(inst: &Instruction) -> Vec<&Register> {
         | Instruction::Not { dst, .. }
         | Instruction::PackB64x2 { dst, .. } => vec![dst],
         // `shfl.sync` optionally defines the in-range predicate as well.
-        Instruction::Shfl { dst, dst_pred, .. } => {
-            dst_pred.as_ref().map_or_else(|| vec![dst], |p| vec![dst, p])
-        }
+        Instruction::Shfl { dst, dst_pred, .. } => dst_pred
+            .as_ref()
+            .map_or_else(|| vec![dst], |p| vec![dst, p]),
         // `mov.b64 {lo, hi}, src` defines both 32-bit halves.
         Instruction::UnpackB64x2 { lo, hi, .. } => vec![lo, hi],
         // `tex.*.v4` defines four texel destination registers.

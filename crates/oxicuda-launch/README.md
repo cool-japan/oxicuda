@@ -87,6 +87,13 @@ stream.synchronize()?;
 |-------------|-------------------------------------------|
 | `gpu-tests` | Enable tests that require a physical GPU  |
 
+When built with `gpu-tests`, the suite also runs `rustc_ptx_interop`:
+kernels compiled directly by upstream nightly `rustc`'s own NVPTX
+backend (`nvptx64-nvidia-cuda`), including a `core::simd` portable-SIMD
+kernel, launched through this crate's driver/launch stack -- confirming
+it hosts PTX from a foreign compiler, not just `oxicuda-ptx`'s own
+generator.
+
 ## Platform Support
 
 | Platform | Status                                        |
@@ -99,8 +106,8 @@ stream.synchronize()?;
 
 | Item       | Value              |
 |------------|--------------------|
-| Version    | 0.3.0 (2026-06-25) |
-| Tests      | 214 passing        |
+| Version    | 0.5.4 (2026-08-11) |
+| Tests      | 233 passing        |
 | Warnings   | 0                  |
 | `unwrap()` | 0                  |
 

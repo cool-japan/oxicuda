@@ -90,11 +90,20 @@ fn reduce_sum_f32_uses_butterfly_allreduce() {
         5,
         "expected 5 butterfly rounds:\n{ptx}"
     );
-    assert!(ptx.contains(", 31, 0xffffffff;"), "full-warp c operand:\n{ptx}");
+    assert!(
+        ptx.contains(", 31, 0xffffffff;"),
+        "full-warp c operand:\n{ptx}"
+    );
     // Floats never take the integer redux path.
-    assert!(!ptx.contains("redux.sync"), "f32 must not use redux:\n{ptx}");
+    assert!(
+        !ptx.contains("redux.sync"),
+        "f32 must not use redux:\n{ptx}"
+    );
     // Butterfly all-reduce needs no trailing broadcast.
-    assert!(!ptx.contains("shfl.sync.idx"), "no broadcast expected:\n{ptx}");
+    assert!(
+        !ptx.contains("shfl.sync.idx"),
+        "no broadcast expected:\n{ptx}"
+    );
 }
 
 #[test]
@@ -115,7 +124,10 @@ fn reduce_sum_u32_uses_redux_on_sm80_plus() {
         ptx.contains("redux.sync.add.u32"),
         "u32 sum on sm_86 must lower to redux:\n{ptx}"
     );
-    assert!(!ptx.contains("shfl.sync.bfly"), "no butterfly expected:\n{ptx}");
+    assert!(
+        !ptx.contains("shfl.sync.bfly"),
+        "no butterfly expected:\n{ptx}"
+    );
 }
 
 #[test]
@@ -150,8 +162,14 @@ fn reduce_prod_never_uses_redux() {
         })
         .build()
         .expect("kernel build");
-    assert!(!ptx.contains("redux.sync"), "prod has no redux form:\n{ptx}");
-    assert!(ptx.contains("mul.lo.u32"), "integer product combine:\n{ptx}");
+    assert!(
+        !ptx.contains("redux.sync"),
+        "prod has no redux form:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("mul.lo.u32"),
+        "integer product combine:\n{ptx}"
+    );
 }
 
 #[test]
@@ -180,7 +198,11 @@ fn reduce_f64_routes_through_pack_unpack() {
         10,
         "two 32-bit shuffles per round:\n{ptx}"
     );
-    assert_eq!(ptx.matches("mov.b64 {").count(), 5, "one unpack per round:\n{ptx}");
+    assert_eq!(
+        ptx.matches("mov.b64 {").count(),
+        5,
+        "one unpack per round:\n{ptx}"
+    );
     assert!(ptx.contains("add.f64"), "f64 combine:\n{ptx}");
 }
 
@@ -229,8 +251,16 @@ fn scan_sum_inclusive_uses_guarded_up_shuffles() {
     // Hillis-Steele: 5 up-shuffle rounds, each writing the in-range predicate
     // (`dst|pred`) and selecting via selp.
     assert_eq!(ptx.matches("shfl.sync.up.b32").count(), 5, "{ptx}");
-    assert_eq!(ptx.matches("|%p").count(), 5, "guard predicate per round:\n{ptx}");
-    assert_eq!(ptx.matches("selp.u32").count(), 5, "guarded select per round:\n{ptx}");
+    assert_eq!(
+        ptx.matches("|%p").count(),
+        5,
+        "guard predicate per round:\n{ptx}"
+    );
+    assert_eq!(
+        ptx.matches("selp.u32").count(),
+        5,
+        "guarded select per round:\n{ptx}"
+    );
     // Up-shuffles clamp to 0 at full width.
     assert!(ptx.contains(", 0, 0xffffffff;"), "up-shuffle clamp:\n{ptx}");
 }
@@ -330,13 +360,22 @@ fn shuffles_lower_to_expected_modes() {
     });
     assert!(ptx.contains("shfl.sync.idx.b32"), "{ptx}");
     // broadcast(7): lane operand 7; reverse: bfly 31.
-    assert!(ptx.contains(", 7, 31, 0xffffffff;"), "broadcast lane 7:\n{ptx}");
+    assert!(
+        ptx.contains(", 7, 31, 0xffffffff;"),
+        "broadcast lane 7:\n{ptx}"
+    );
     assert!(ptx.contains("shfl.sync.bfly.b32"), "{ptx}");
-    assert!(ptx.contains(", 31, 31, 0xffffffff;"), "reverse = bfly 31:\n{ptx}");
+    assert!(
+        ptx.contains(", 31, 31, 0xffffffff;"),
+        "reverse = bfly 31:\n{ptx}"
+    );
     assert!(ptx.contains("shfl.sync.up.b32"), "{ptx}");
     assert!(ptx.contains(", 3, 0, 0xffffffff;"), "shuffle_up 3:\n{ptx}");
     assert!(ptx.contains("shfl.sync.down.b32"), "{ptx}");
-    assert!(ptx.contains(", 2, 31, 0xffffffff;"), "shuffle_down 2:\n{ptx}");
+    assert!(
+        ptx.contains(", 2, 31, 0xffffffff;"),
+        "shuffle_down 2:\n{ptx}"
+    );
 }
 
 #[test]
@@ -424,7 +463,10 @@ fn constructors_reject_bad_inputs() {
         name: "%p0".into(),
         ty: PtxType::Pred,
     };
-    assert!(WarpVec::from_register(pred.clone()).is_err(), "pred elements");
+    assert!(
+        WarpVec::from_register(pred.clone()).is_err(),
+        "pred elements"
+    );
     let f32_reg = Register {
         name: "%f0".into(),
         ty: PtxType::F32,
@@ -438,7 +480,10 @@ fn constructors_reject_bad_inputs() {
         "width 64"
     );
     assert!(WarpMask::from_predicate(f32_reg).is_err(), "non-pred mask");
-    assert!(WarpMask::from_predicate_segmented(pred, 5).is_err(), "width 5");
+    assert!(
+        WarpMask::from_predicate_segmented(pred, 5).is_err(),
+        "width 5"
+    );
 }
 
 #[test]
@@ -458,7 +503,10 @@ fn operations_reject_type_and_width_mismatches() {
             assert!(u.sqrt(b).is_err(), "sqrt on integers");
             assert!(u.neg(b).is_err(), "neg on unsigned");
             assert!(u.relu(b).is_err(), "relu on unsigned");
-            assert!(f.reduce(b, WarpReduceOp::BitAnd).is_err(), "bitand on float");
+            assert!(
+                f.reduce(b, WarpReduceOp::BitAnd).is_err(),
+                "bitand on float"
+            );
             assert!(f.broadcast(b, 32).is_err(), "lane out of range");
             assert!(f.butterfly(b, 32).is_err(), "xor mask out of range");
             assert!(f.shuffle_idx(b, &f).is_err(), "float index vector");
@@ -499,7 +547,10 @@ fn find_ptxas() -> Option<std::path::PathBuf> {
 /// diagnostics and PTX text on rejection.
 fn assert_assembles(ptxas: &std::path::Path, label: &str, ptx: &str) {
     let mut ptx_path = std::env::temp_dir();
-    ptx_path.push(format!("oxicuda_warpvec_{label}_{}.ptx", std::process::id()));
+    ptx_path.push(format!(
+        "oxicuda_warpvec_{label}_{}.ptx",
+        std::process::id()
+    ));
     std::fs::write(&ptx_path, ptx).expect("write PTX to temp file");
     let cubin = ptx_path.with_extension("cubin");
     let output = std::process::Command::new(ptxas)
@@ -594,7 +645,9 @@ fn warp_vec_kernels_assemble_for_sm86() {
             let incl = lanes.scan_sum(b, WarpScanMode::Inclusive).expect("incl");
             let seg = lanes.with_width(8).expect("seg");
             let seg_incl = seg.scan_sum(b, WarpScanMode::Inclusive).expect("seg incl");
-            let sum = incl.add(b, &seg_incl.with_width(32).expect("w")).expect("add");
+            let sum = incl
+                .add(b, &seg_incl.with_width(32).expect("w"))
+                .expect("add");
 
             let fvec = WarpVec::splat_f32(b, 1.5);
             let fexcl = fvec.scan_sum(b, WarpScanMode::Exclusive).expect("excl");
@@ -633,7 +686,9 @@ fn warp_vec_kernels_assemble_for_sm86() {
         let seg_pick = seg_any.select(b, &x8, &y8).expect("select");
         let seg_pick2 = seg_all.select(b, &seg_pick, &y8).expect("select");
 
-        let final_pick = logic.select(b, &x, &seg_pick2.with_width(32).expect("w")).expect("select");
+        let final_pick = logic
+            .select(b, &x, &seg_pick2.with_width(32).expect("w"))
+            .expect("select");
         final_pick.into_register()
     });
     assert_assembles(&ptxas, "masks", &masks);

@@ -152,17 +152,12 @@ fn rustc_portable_simd_kernel_launches_and_matches_oracle() {
     let x: Vec<f32> = (0..N).map(|i| ((i % 13) as f32) - 6.0).collect();
     let y: Vec<f32> = (0..N).map(|i| ((i % 7) as f32) - 3.0).collect();
     let expected: Vec<f32> = (0..CHUNKS)
-        .map(|c| {
-            (0..4)
-                .map(|j| (x[c * 4 + j] * y[c * 4 + j]).max(0.0))
-                .sum()
-        })
+        .map(|c| (0..4).map(|j| (x[c * 4 + j] * y[c * 4 + j]).max(0.0)).sum())
         .collect();
 
     let module = Module::from_ptx(RUSTC_SIMD_RELU_DOT_PTX)
         .unwrap_or_else(|e| panic!("driver JIT rejected rustc portable-SIMD PTX: {e}"));
-    let kernel =
-        Kernel::from_module(Arc::new(module), "rust_simd_relu_dot").expect("entry symbol");
+    let kernel = Kernel::from_module(Arc::new(module), "rust_simd_relu_dot").expect("entry symbol");
     let stream = Stream::new(&ctx).expect("stream");
 
     let d_x = DeviceBuffer::<f32>::from_host(&x).expect("d_x");
