@@ -579,11 +579,11 @@ impl PagedKvCache {
         match victim {
             Some(block_id) => {
                 // Remove from any sequence that owns it
-                for (_, blocks) in self.block_table.iter_mut() {
+                for blocks in self.block_table.values_mut() {
                     blocks.retain(|&b| b != block_id);
                 }
                 // Remove from prefix table
-                for (_, blocks) in self.prefix_table.iter_mut() {
+                for blocks in self.prefix_table.values_mut() {
                     blocks.retain(|&b| b != block_id);
                 }
                 self.block_meta.remove(&block_id);

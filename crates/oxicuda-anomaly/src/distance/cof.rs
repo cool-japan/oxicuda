@@ -474,8 +474,7 @@ mod tests {
         for w in dists.windows(2) {
             assert!(
                 w[0] <= w[1] + 1e-6,
-                "knn_dists should be sorted: {:?}",
-                &dists
+                "knn_dists should be sorted: {dists:?}"
             );
         }
     }

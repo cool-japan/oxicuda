@@ -201,7 +201,7 @@ impl Dg2dSpace {
         // Track which (elem,local) have been consumed by an interior pairing.
         let mut consumed: HashMap<(usize, usize), bool> = HashMap::new();
 
-        for (_key, incident) in map.iter() {
+        for incident in map.values() {
             if incident.len() == 2 {
                 let (e0, l0) = incident[0];
                 let (e1, l1) = incident[1];
@@ -235,7 +235,7 @@ impl Dg2dSpace {
 
         // Boundary edges (single incidence): handle per BC.
         let mut boundary: Vec<(usize, usize)> = Vec::new();
-        for (_key, incident) in map.iter() {
+        for incident in map.values() {
             if incident.len() == 1 {
                 boundary.push(incident[0]);
             }

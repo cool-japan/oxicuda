@@ -482,12 +482,8 @@ pub fn free_support_cost(
         let cost_mat = build_cost_matrix(&bary.support, xs, n_k, n_s, d);
         let a_src = vec![1.0_f32 / n_s as f32; n_s];
 
-        match sinkhorn(&cost_mat, &b_bary, &a_src, n_k, n_s, &inner_cfg) {
-            Ok(result) => {
-                total_cost += lambdas[s] * result.cost as f64;
-            }
-            Err(e) => return Err(e),
-        }
+        let result = sinkhorn(&cost_mat, &b_bary, &a_src, n_k, n_s, &inner_cfg)?;
+        total_cost += lambdas[s] * result.cost as f64;
     }
 
     Ok(total_cost)
