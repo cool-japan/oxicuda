@@ -233,6 +233,10 @@ pub mod prelude {
     // Builder API (primary entry point for most users)
     pub use crate::builder::{BodyBuilder, KernelBuilder};
 
+    // Warp-vector expression layer and warp-op constants
+    pub use crate::builder::warp_ops::{FULL_WARP_MASK, WARP_SIZE};
+    pub use crate::builder::warp_vec::{WarpMask, WarpReduceOp, WarpScanMode, WarpVec};
+
     // Core IR types frequently used in builder closures
     pub use crate::ir::{
         AtomOp, BasicBlock, CacheQualifier, CmpOp, FenceScope, ImmValue, Instruction, MemorySpace,

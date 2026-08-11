@@ -390,22 +390,28 @@ impl RoundingMode {
 /// Multiplication mode controlling which portion of the product is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MulMode {
-    /// Low bits of the product (default for same-width result).
+    /// Low bits of the product (default for same-width integer result).
     Lo,
     /// High bits of the product.
     Hi,
     /// Wide multiplication (result is twice the input width).
     Wide,
+    /// IEEE round-to-nearest-even product — the floating-point multiply form
+    /// (`mul.rn.f32` / `mul.rn.f64`). Integer modes (`.lo`/`.hi`/`.wide`) are
+    /// invalid on float types, and a modeless `mul.f32` defaults to `.rn`
+    /// anyway; emitting `.rn` explicitly keeps the rounding intent visible.
+    Rn,
 }
 
 impl MulMode {
-    /// Returns the PTX modifier string (e.g., `".lo"`, `".hi"`, `".wide"`).
+    /// Returns the PTX modifier string (e.g., `".lo"`, `".hi"`, `".rn"`).
     #[must_use]
     pub const fn as_ptx_str(&self) -> &'static str {
         match self {
             Self::Lo => ".lo",
             Self::Hi => ".hi",
             Self::Wide => ".wide",
+            Self::Rn => ".rn",
         }
     }
 }

@@ -255,6 +255,7 @@ const fn categorize_instruction(inst: &Instruction) -> InstructionCategory {
         | Instruction::And { .. }
         | Instruction::Or { .. }
         | Instruction::Xor { .. }
+        | Instruction::Not { .. }
         | Instruction::Rcp { .. }
         | Instruction::Rsqrt { .. }
         | Instruction::Sqrt { .. }
@@ -304,6 +305,8 @@ const fn categorize_instruction(inst: &Instruction) -> InstructionCategory {
         | Instruction::ElectSync { .. }
         | Instruction::Griddepcontrol { .. }
         | Instruction::Redux { .. }
+        | Instruction::Shfl { .. }
+        | Instruction::Vote { .. }
         | Instruction::BarrierCluster
         | Instruction::FenceCluster => InstructionCategory::Synchronization,
 
@@ -319,6 +322,9 @@ const fn categorize_instruction(inst: &Instruction) -> InstructionCategory {
         // Special
         Instruction::MovSpecial { .. }
         | Instruction::LoadParam { .. }
+        | Instruction::Mov { .. }
+        | Instruction::PackB64x2 { .. }
+        | Instruction::UnpackB64x2 { .. }
         | Instruction::Comment(_)
         | Instruction::Raw(_)
         | Instruction::Pragma(_)
@@ -340,6 +346,7 @@ const fn estimate_latency(inst: &Instruction) -> u32 {
         | Instruction::And { .. }
         | Instruction::Or { .. }
         | Instruction::Xor { .. }
+        | Instruction::Not { .. }
         | Instruction::Shl { .. }
         | Instruction::Shr { .. }
         | Instruction::SetP { .. } => 4,
@@ -401,6 +408,8 @@ const fn estimate_latency(inst: &Instruction) -> u32 {
         | Instruction::ElectSync { .. }
         | Instruction::Griddepcontrol { .. }
         | Instruction::Redux { .. }
+        | Instruction::Shfl { .. }
+        | Instruction::Vote { .. }
         | Instruction::BarrierCluster
         | Instruction::FenceCluster => 16,
 
@@ -415,6 +424,9 @@ const fn estimate_latency(inst: &Instruction) -> u32 {
 
         // Special / meta
         Instruction::MovSpecial { .. } | Instruction::LoadParam { .. } => 4,
+        Instruction::Mov { .. }
+        | Instruction::PackB64x2 { .. }
+        | Instruction::UnpackB64x2 { .. } => 4,
         Instruction::Comment(_) | Instruction::Raw(_) | Instruction::Pragma(_) => 0,
         Instruction::Setmaxnreg { .. } => 0,
     }
@@ -550,7 +562,21 @@ fn registers_written(inst: &Instruction) -> Vec<String> {
         | Instruction::Dp2a { dst, .. }
         | Instruction::SurfLoad { dst, .. }
         | Instruction::Redux { dst, .. }
-        | Instruction::ElectSync { dst, .. } => vec![dst.name.clone()],
+        | Instruction::ElectSync { dst, .. }
+        | Instruction::Vote { dst, .. }
+        | Instruction::Mov { dst, .. }
+        | Instruction::Not { dst, .. }
+        | Instruction::PackB64x2 { dst, .. } => vec![dst.name.clone()],
+        Instruction::Shfl { dst, dst_pred, .. } => {
+            let mut names = vec![dst.name.clone()];
+            if let Some(p) = dst_pred {
+                names.push(p.name.clone());
+            }
+            names
+        }
+        Instruction::UnpackB64x2 { lo, hi, .. } => {
+            vec![lo.name.clone(), hi.name.clone()]
+        }
         // `tex.*.v4` defines four texel destination registers.
         Instruction::Tex1d { dst, .. }
         | Instruction::Tex2d { dst, .. }

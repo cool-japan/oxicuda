@@ -16,4 +16,6 @@ mod kernel_builder;
 mod quality_gates;
 
 pub use body_builder::BodyBuilder;
+// Warp shuffle/vote emission helpers and the SIMD-flavored warp-vector layer.
+pub use body_builder::{warp_ops, warp_vec};
 pub use kernel_builder::KernelBuilder;

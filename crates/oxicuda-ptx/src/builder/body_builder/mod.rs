@@ -1788,6 +1788,12 @@ pub(super) mod tensor_core_ops;
 // f64 math primitives + synthesized transcendentals (exp/log/erf/tanh).
 pub(super) mod math_f64;
 
+// Warp shuffle / vote / lane-query emission (`shfl.sync`, `vote.sync`).
+pub mod warp_ops;
+
+// SIMD-flavored warp-vector expression layer (`WarpVec` / `WarpMask`).
+pub mod warp_vec;
+
 #[cfg(test)]
 #[path = "body_builder_tests.rs"]
 mod tests;

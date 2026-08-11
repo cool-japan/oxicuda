@@ -201,6 +201,78 @@ impl ReduxOp {
     }
 }
 
+/// Source-lane selection mode for `shfl.sync` warp shuffles.
+///
+/// A warp shuffle moves a 32-bit value between the registers of the 32
+/// threads in a warp without touching memory. The mode selects how each
+/// thread computes its *source lane* from the `lane` operand `b`:
+///
+/// | Mode   | Source lane for thread `i`  | Typical use                    |
+/// |--------|-----------------------------|--------------------------------|
+/// | `Idx`  | `b` (absolute index)        | broadcast, arbitrary swizzle   |
+/// | `Up`   | `i - b`                     | inclusive scan (Hillis-Steele) |
+/// | `Down` | `i + b`                     | shift-style neighbor exchange  |
+/// | `Bfly` | `i ^ b` (butterfly / XOR)   | all-lanes reduction, reversal  |
+///
+/// Available on every architecture this crate targets (PTX ISA 6.0+,
+/// `sm_70`+; the crate's minimum target is `sm_75`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShflMode {
+    /// Absolute source lane: `src_lane = b`.
+    Idx,
+    /// Relative up-shuffle: `src_lane = laneid - b` (toward lane 0).
+    Up,
+    /// Relative down-shuffle: `src_lane = laneid + b` (toward lane 31).
+    Down,
+    /// Butterfly (XOR) shuffle: `src_lane = laneid ^ b`.
+    Bfly,
+}
+
+impl ShflMode {
+    /// Returns the PTX mode suffix (e.g., `".bfly"`).
+    #[must_use]
+    pub(crate) const fn as_ptx_str(self) -> &'static str {
+        match self {
+            Self::Idx => ".idx",
+            Self::Up => ".up",
+            Self::Down => ".down",
+            Self::Bfly => ".bfly",
+        }
+    }
+}
+
+/// Aggregation mode for `vote.sync` warp votes.
+///
+/// A warp vote combines a per-lane predicate across all participating lanes
+/// into a warp-uniform result: a single predicate (`All` / `Any` / `Uni`)
+/// or a 32-bit bitmask with one bit per lane (`Ballot`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VoteMode {
+    /// True iff the source predicate is true in **all** participating lanes.
+    All,
+    /// True iff the source predicate is true in **any** participating lane.
+    Any,
+    /// True iff the source predicate has the **same** value in all
+    /// participating lanes (warp-uniformity test).
+    Uni,
+    /// 32-bit mask with bit *i* set iff lane *i*'s predicate is true
+    /// (destination is a `.b32` register, not a predicate).
+    Ballot,
+}
+
+impl VoteMode {
+    /// Returns the PTX mode suffix (e.g., `".ballot"`).
+    #[must_use]
+    pub(crate) const fn as_ptx_str(self) -> &'static str {
+        match self {
+            Self::All => ".all",
+            Self::Any => ".any",
+            Self::Uni => ".uni",
+            Self::Ballot => ".ballot",
+        }
+    }
+}
+
 /// Stmatrix shape for store-matrix-to-shared-memory instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StmatrixShape {
@@ -282,8 +354,9 @@ impl GridDepAction {
 /// - **Type conversion**: `Cvt`
 /// - **Control flow**: `Branch`, `Label`, `Return`
 /// - **Synchronization**: `BarSync`, `BarArrive`, `FenceAcqRel`
+/// - **Warp-level**: `Shfl`, `Vote`, `Redux`, `ElectSync`
 /// - **Tensor Core**: `Wmma`, `Mma`, `Wgmma`, `TmaLoad`
-/// - **Special**: `MovSpecial`, `LoadParam`, `Comment`, `Raw`
+/// - **Special**: `Mov`, `MovSpecial`, `LoadParam`, `Comment`, `Raw`
 #[derive(Debug, Clone)]
 pub enum Instruction {
     // -- Arithmetic ---------------------------------------------------------
@@ -1176,7 +1249,10 @@ pub enum Instruction {
     },
 
     // -- PTX 8.x Instructions (SM >= 80/90) ---------------------------------
-    /// Redux warp-level reduction: `redux.sync.op.u32 dst, src, membermask;`
+    /// Redux warp-level reduction: `redux.sync.op.{u32|b32} dst, src, membermask;`
+    ///
+    /// Arithmetic ops (`add`/`min`/`max`) emit `.u32`; the bitwise ops
+    /// (`and`/`or`/`xor`) must emit the untyped `.b32` per the PTX ISA.
     ///
     /// Performs a warp-level reduction across participating threads (SM >= 80).
     Redux {
@@ -1336,6 +1412,111 @@ pub enum Instruction {
         dst_regs: Vec<Register>,
         /// Source address in shared memory.
         src_addr: Operand,
+    },
+
+    // -- Warp shuffle & vote (PTX ISA 6.0+, all supported targets) ----------
+    /// Warp shuffle: `shfl.sync{.mode}.b32 dst[|dst_pred], src, lane, c, membermask;`
+    ///
+    /// Register-to-register data exchange between the 32 lanes of a warp.
+    /// The `c` operand packs the clamp value in bits `[4:0]` and the segment
+    /// mask in bits `[12:8]` (CUDA's `__shfl_*_sync(..., width)` encodes
+    /// `((32 - width) << 8) | clamp` with `clamp = 0x1f` for `idx`/`down`/
+    /// `bfly` and `clamp = 0` for `up`).
+    ///
+    /// The optional `dst_pred` receives `true` iff the computed source lane
+    /// was in range; out-of-range shuffles return the thread's own `src`.
+    /// Only 32-bit payloads are shuffled — 64-bit values must be split with
+    /// [`UnpackB64x2`](Self::UnpackB64x2), shuffled per half, and recombined
+    /// with [`PackB64x2`](Self::PackB64x2).
+    Shfl {
+        /// Source-lane selection mode.
+        mode: ShflMode,
+        /// Destination register (32-bit class).
+        dst: Register,
+        /// Optional predicate destination receiving the in-range flag.
+        dst_pred: Option<Register>,
+        /// Source operand (each lane's contributed 32-bit value).
+        src: Operand,
+        /// Lane selector operand `b` (meaning depends on `mode`).
+        lane: Operand,
+        /// Packed clamp / segment-mask operand `c`.
+        c: Operand,
+        /// Membership mask (which lanes participate; usually `0xFFFF_FFFF`).
+        membership_mask: u32,
+    },
+
+    /// Warp vote: `vote.sync{.mode}.pred|.b32 dst, [!]src, membermask;`
+    ///
+    /// Combines a per-lane predicate across the warp. For [`VoteMode::Ballot`]
+    /// the destination is a `.b32` bitmask register; for all other modes it is
+    /// a predicate register.
+    Vote {
+        /// Aggregation mode.
+        mode: VoteMode,
+        /// Destination register (`Pred` for all/any/uni, `B32` for ballot).
+        dst: Register,
+        /// Source predicate register.
+        src: Register,
+        /// If `true`, the source predicate is negated (`!src`).
+        negate_src: bool,
+        /// Membership mask (which lanes participate; usually `0xFFFF_FFFF`).
+        membership_mask: u32,
+    },
+
+    // -- Register data movement & logic -------------------------------------
+    /// Register move / immediate materialization: `mov.type dst, src;`
+    ///
+    /// Moves a register or immediate into a register. Float immediates are
+    /// emitted in PTX hex-literal form (`0f…` / `0d…`) by [`ImmValue`]'s
+    /// `Display` impl, so any bit pattern (±0.0, NaN, Inf) round-trips.
+    ///
+    /// [`ImmValue`]: super::operand::ImmValue
+    Mov {
+        /// The data type.
+        ty: PtxType,
+        /// Destination register.
+        dst: Register,
+        /// Source operand (register or immediate).
+        src: Operand,
+    },
+
+    /// Pack two 32-bit halves into a 64-bit register: `mov.b64 dst, {lo, hi};`
+    ///
+    /// The inverse of [`UnpackB64x2`](Self::UnpackB64x2). Used to recombine
+    /// a 64-bit value after per-half warp shuffles.
+    PackB64x2 {
+        /// Destination 64-bit register.
+        dst: Register,
+        /// Low 32 bits.
+        lo: Register,
+        /// High 32 bits.
+        hi: Register,
+    },
+
+    /// Split a 64-bit register into two 32-bit halves: `mov.b64 {lo, hi}, src;`
+    ///
+    /// Defines both `lo` and `hi`. Used to route 64-bit values through the
+    /// 32-bit-only `shfl.sync` datapath.
+    UnpackB64x2 {
+        /// Destination register receiving the low 32 bits.
+        lo: Register,
+        /// Destination register receiving the high 32 bits.
+        hi: Register,
+        /// Source 64-bit register.
+        src: Register,
+    },
+
+    /// Bitwise / logical NOT: `not.type dst, src;`
+    ///
+    /// Valid for the bit types (`B16`/`B32`/`B64`) and predicates (`Pred`,
+    /// giving logical negation).
+    Not {
+        /// The bit or predicate type.
+        ty: PtxType,
+        /// Destination register.
+        dst: Register,
+        /// Source operand.
+        src: Operand,
     },
 }
 
