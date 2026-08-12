@@ -159,21 +159,36 @@ integer-overflow / out-of-bounds-write bugs in generated shaders.
   `backend_tests_gemm_f16.rs` — dedicated regression coverage for the conv2d/attention GPU dispatch
   grid, the new pipeline/bind-group cache (including the queue-timeline-ordering test above), and FP16
   GEMM numerics; plus `tests/gpu_presence.rs` and the same four Criterion benchmarks as `oxicuda-metal`.
-- `oxicuda-backend`: `registry` module — `BackendRegistry`/`BackendEntry`/`SelectionRequest`, a
-  side-effect-free capability-based backend selector (`select`, `select_for_workload`,
-  `fallback_chain`, `route` by `OpClass`) that ranks registered backends by priority and capability
-  match, ending at the CPU reference backend. Powers `oxicuda::compute::default_backend()` and friends.
+- `oxicuda-backend`: the existing `registry` module (`BackendRegistry`/`BackendEntry`/
+  `SelectionRequest`, a side-effect-free capability-based backend selector already offering `select`,
+  `fallback_chain`, and `route` by `OpClass`) gains workload-size-aware routing —
+  `SelectionRequest::for_workload`/`BackendRegistry::select_for_workload` pin small workloads to the
+  CPU reference backend at *selection* time (before any GPU allocation happens), since below some byte
+  count a host-device round trip costs more than the kernel itself. An explicit `require_gpu` or `pin`
+  is never overridden by this narrowing.
 - `oxicuda`: new `compute` module (`default_backend`, `gpu_backend`, `backend_for_workload`,
   `select_backend`, `compiled_in_kinds`, `default_registry`) — probes every backend compiled into the
-  build, ranks them through `oxicuda-backend`'s new registry, and returns the best one already
+  build, ranks them through `oxicuda-backend`'s registry, and returns the best one already
   initialised, so callers no longer need to know which GPU stack a given machine has.
 
 ### Known issues
 
-- `oxicuda-webgpu`: the newly-added `tests/gpu_presence.rs::webgpu_backend_init_must_succeed` fails —
-  the test dispatches a unary op with the same handle as both input and output, which
-  `WebGpuBackend::unary` correctly rejects (wgpu forbids binding one buffer as both `read` and
-  `read_write` in one dispatch). The backend is right and the test is wrong; see `TODO.md` follow-ups.
+- `ComputeBackend::unary`'s contract is silent on whether `input_ptr == output_ptr` is permitted, and
+  the backends diverge: `MetalBackend` accepts the aliasing, `WebGpuBackend` rejects it with
+  `InvalidArgument` (wgpu forbids binding one buffer as both `read` and `read_write` in a single
+  dispatch). Portable callers must pass distinct buffers until the trait doc pins this down; both
+  crates' `tests/gpu_presence.rs` now do so deliberately. See `TODO.md` follow-ups.
+- `oxicuda-webgpu`: `gemm`/`reduce`/`conv2d_forward`/`attention` never synchronise per operation by
+  design. Issuing many such dispatches with no interleaved `synchronize()` can abort the *whole
+  process* — a panic inside `wgpu-core` (`queue.rs`, "timed out waiting on last submission"), not a
+  recoverable `Err`. No test covers this: nextest isolates each test in its own process, so per-process
+  submission counts stay too low to trigger it. It was reproduced from benchmark-shaped submission
+  loops, and the in-tree Criterion benches work around it by synchronising every iteration. Callers
+  driving sustained WebGPU workloads should do the same.
+- Reduction over a zero-length dimension is a three-way divergence, not a defined contract:
+  `CpuBackend` returns the op's identity, `MetalBackend` returns `InvalidArgument`, and
+  `WebGpuBackend` returns `Ok` while leaving the output untouched. All three are covered by
+  per-backend tests asserting the *observed* behaviour, so the divergence cannot regress silently.
 
 ## [0.5.4] - 2026-08-11
 

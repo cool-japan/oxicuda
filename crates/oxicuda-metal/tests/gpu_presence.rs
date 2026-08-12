@@ -86,19 +86,31 @@ fn metal_backend_init_must_succeed() {
     // A trivial real dispatch, not just device enumeration: alloc, upload,
     // run a unary op, download, free. If this silently no-ops the earlier
     // assertions would not have caught it.
-    let ptr = backend.alloc(4 * 4).expect("alloc 4 f32s");
+    //
+    // Separate input/output buffers deliberately, even though `MetalBackend`
+    // happens to permit `input_ptr == output_ptr`: `WebGpuBackend::unary`
+    // rejects that same aliasing (see the sibling test in
+    // `oxicuda-webgpu/tests/gpu_presence.rs`), and `ComputeBackend::unary`'s
+    // trait doc makes no promise either way. A presence test's only job is
+    // proving a device exists; it must not also be the one place that
+    // depends on Metal's more permissive, undocumented aliasing behavior.
+    let input = backend.alloc(4 * 4).expect("alloc 4 f32s (input)");
+    let output = backend.alloc(4 * 4).expect("alloc 4 f32s (output)");
     let data = [1.0f32, -2.0, 3.0, -4.0];
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    backend.copy_htod(ptr, &bytes).expect("copy_htod");
+    backend.copy_htod(input, &bytes).expect("copy_htod");
     backend
-        .unary(oxicuda_backend::UnaryOp::Relu, ptr, ptr, 4)
+        .unary(oxicuda_backend::UnaryOp::Relu, input, output, 4)
         .expect("unary relu dispatch");
     let mut out_bytes = vec![0u8; 16];
-    backend.copy_dtoh(&mut out_bytes, ptr).expect("copy_dtoh");
+    backend
+        .copy_dtoh(&mut out_bytes, output)
+        .expect("copy_dtoh");
     let out: Vec<f32> = out_bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     assert_eq!(out, vec![1.0, 0.0, 3.0, 0.0], "ReLU must actually execute");
-    backend.free(ptr).expect("free");
+    backend.free(input).expect("free input");
+    backend.free(output).expect("free output");
 }

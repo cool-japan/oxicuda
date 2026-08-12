@@ -85,7 +85,7 @@ Most users should reach this crate through the `oxicuda` facade's `metal` featur
 ## Status
 
 - **Version**: 0.5.5 (2026-08-12)
-- **Tests**: 386 passing, clippy-clean (measured 2026-08-12, `--all-features`, real Apple M3 hardware; concurrent work in this crate means this count moves quickly — re-run `cargo nextest run -p oxicuda-metal --all-features` for the current figure)
+- **Tests**: 401 passing, clippy-clean (measured 2026-08-12, `--all-features`, real Apple M3 hardware; concurrent work in this crate means this count moves quickly — re-run `cargo nextest run -p oxicuda-metal --all-features` for the current figure)
 
 ## License
 

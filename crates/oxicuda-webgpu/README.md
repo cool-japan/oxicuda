@@ -92,7 +92,7 @@ Most users should reach this crate through the `oxicuda` facade's `webgpu` featu
 ## Status
 
 - **Version**: 0.5.5 (2026-08-12)
-- **Tests**: 277 of 278 passing, clippy-clean (measured 2026-08-12, `--all-features`, real Apple M3 hardware running the Metal-backed `wgpu` path). The one failure is in the newly-added `tests/gpu_presence.rs::webgpu_backend_init_must_succeed` — the test aliases a single buffer as both input and output for a unary dispatch, which `WebGpuBackend` correctly rejects (`wgpu` forbids binding one buffer as both `read` and `read_write` in one dispatch); the backend is right and the test is wrong, see `TODO.md` follow-ups. Concurrent work in this crate means this count moves quickly — re-run `cargo nextest run -p oxicuda-webgpu --all-features` for the current figure.
+- **Tests**: 293 of 293 passing, clippy-clean (measured 2026-08-12, `--all-features`, real Apple M3 hardware running the Metal-backed `wgpu` path). Concurrent work in this crate means this count moves quickly — re-run `cargo nextest run -p oxicuda-webgpu --all-features` for the current figure.
 
 ## License
 
