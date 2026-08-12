@@ -5,7 +5,9 @@
 //! child module of `instruction` so that `super::*` resolves all of the
 //! types defined there.
 
-use super::{Instruction, MmaShape, Operand, Register, WmmaLayout, WmmaOp, WmmaShape};
+use super::{
+    Instruction, MmaShape, Operand, ReduxOp, Register, VoteMode, WmmaLayout, WmmaOp, WmmaShape,
+};
 use crate::ir::types::{MemorySpace, PtxType};
 
 /// Returns the legal `fence.proxy.async` space qualifier for a memory space.
@@ -553,8 +555,15 @@ impl Instruction {
                 src,
                 membership_mask,
             } => {
+                // Per the PTX ISA, the arithmetic redux ops take `.u32`/`.s32`
+                // while the bitwise ops require the untyped `.b32` — `ptxas`
+                // rejects `redux.sync.and.u32`.
+                let ty = match op {
+                    ReduxOp::And | ReduxOp::Or | ReduxOp::Xor => ".b32",
+                    ReduxOp::Add | ReduxOp::Min | ReduxOp::Max => ".u32",
+                };
                 format!(
-                    "redux.sync{}.u32 {dst}, {src}, 0x{membership_mask:08x};",
+                    "redux.sync{}{ty} {dst}, {src}, 0x{membership_mask:08x};",
                     op.as_ptx_str()
                 )
             }
@@ -729,6 +738,56 @@ impl Instruction {
                 format!(
                     "ldmatrix.sync.aligned.m8n8{x_str}{trans_str}.shared.b16 {{{dst_list}}}, [{src_addr}];"
                 )
+            }
+
+            // -- Warp shuffle & vote ----------------------------------------
+            Self::Shfl {
+                mode,
+                dst,
+                dst_pred,
+                src,
+                lane,
+                c,
+                membership_mask,
+            } => {
+                let pred_str = dst_pred
+                    .as_ref()
+                    .map_or_else(String::new, |p| format!("|{p}"));
+                format!(
+                    "shfl.sync{}.b32 {dst}{pred_str}, {src}, {lane}, {c}, 0x{membership_mask:08x};",
+                    mode.as_ptx_str()
+                )
+            }
+            Self::Vote {
+                mode,
+                dst,
+                src,
+                negate_src,
+                membership_mask,
+            } => {
+                let neg = if *negate_src { "!" } else { "" };
+                let dst_ty = match mode {
+                    VoteMode::Ballot => ".b32",
+                    VoteMode::All | VoteMode::Any | VoteMode::Uni => ".pred",
+                };
+                format!(
+                    "vote.sync{}{dst_ty} {dst}, {neg}{src}, 0x{membership_mask:08x};",
+                    mode.as_ptx_str()
+                )
+            }
+
+            // -- Register data movement & logic -----------------------------
+            Self::Mov { ty, dst, src } => {
+                format!("mov{} {dst}, {src};", ty.as_ptx_str())
+            }
+            Self::PackB64x2 { dst, lo, hi } => {
+                format!("mov.b64 {dst}, {{{lo}, {hi}}};")
+            }
+            Self::UnpackB64x2 { lo, hi, src } => {
+                format!("mov.b64 {{{lo}, {hi}}}, {src};")
+            }
+            Self::Not { ty, dst, src } => {
+                format!("not{} {dst}, {src};", ty.as_ptx_str())
             }
         }
     }

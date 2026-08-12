@@ -88,6 +88,11 @@ pub mod params;
 pub mod telemetry;
 pub mod trace;
 
+// Foreign-compiler PTX interop tests: launching rustc-generated
+// (nvptx64-nvidia-cuda) kernel modules, including a `core::simd` kernel.
+#[cfg(all(test, feature = "gpu-tests"))]
+mod rustc_ptx_interop;
+
 // ---------------------------------------------------------------------------
 // Re-exports
 // ---------------------------------------------------------------------------

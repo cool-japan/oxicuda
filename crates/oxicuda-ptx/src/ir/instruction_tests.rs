@@ -1529,3 +1529,112 @@ fn emit_atom_global_add_float_f64() {
     };
     assert_eq!(inst.emit(), "atom.global.add.f64 %fd0, [%rd1], %fd1;");
 }
+
+// ---------------------------------------------------------------------------
+// Warp shuffle / vote / register data movement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emit_shfl_bfly_full_warp() {
+    let inst = Instruction::Shfl {
+        mode: ShflMode::Bfly,
+        dst: make_reg("%f0", PtxType::F32),
+        dst_pred: None,
+        src: make_reg_op("%f1", PtxType::F32),
+        lane: Operand::Immediate(ImmValue::U32(16)),
+        c: Operand::Immediate(ImmValue::U32(31)),
+        membership_mask: 0xFFFF_FFFF,
+    };
+    assert_eq!(
+        inst.emit(),
+        "shfl.sync.bfly.b32 %f0, %f1, 16, 31, 0xffffffff;"
+    );
+}
+
+#[test]
+fn emit_shfl_up_with_predicate_destination() {
+    let inst = Instruction::Shfl {
+        mode: ShflMode::Up,
+        dst: make_reg("%r0", PtxType::U32),
+        dst_pred: Some(make_reg("%p0", PtxType::Pred)),
+        src: make_reg_op("%r1", PtxType::U32),
+        lane: Operand::Immediate(ImmValue::U32(1)),
+        c: Operand::Immediate(ImmValue::U32(0)),
+        membership_mask: 0xFFFF_FFFF,
+    };
+    assert_eq!(
+        inst.emit(),
+        "shfl.sync.up.b32 %r0|%p0, %r1, 1, 0, 0xffffffff;"
+    );
+}
+
+#[test]
+fn emit_vote_all_and_ballot() {
+    let all = Instruction::Vote {
+        mode: VoteMode::All,
+        dst: make_reg("%p0", PtxType::Pred),
+        src: make_reg("%p1", PtxType::Pred),
+        negate_src: false,
+        membership_mask: 0xFFFF_FFFF,
+    };
+    assert_eq!(all.emit(), "vote.sync.all.pred %p0, %p1, 0xffffffff;");
+
+    let ballot = Instruction::Vote {
+        mode: VoteMode::Ballot,
+        dst: make_reg("%r0", PtxType::B32),
+        src: make_reg("%p1", PtxType::Pred),
+        negate_src: true,
+        membership_mask: 0xFFFF_FFFF,
+    };
+    assert_eq!(ballot.emit(), "vote.sync.ballot.b32 %r0, !%p1, 0xffffffff;");
+}
+
+#[test]
+fn emit_mov_f32_immediate_as_hex_literal() {
+    let inst = Instruction::Mov {
+        ty: PtxType::F32,
+        dst: make_reg("%f0", PtxType::F32),
+        src: Operand::Immediate(ImmValue::F32(0.0)),
+    };
+    assert_eq!(inst.emit(), "mov.f32 %f0, 0f00000000;");
+}
+
+#[test]
+fn emit_pack_unpack_b64x2() {
+    let pack = Instruction::PackB64x2 {
+        dst: make_reg("%fd0", PtxType::F64),
+        lo: make_reg("%r0", PtxType::B32),
+        hi: make_reg("%r1", PtxType::B32),
+    };
+    assert_eq!(pack.emit(), "mov.b64 %fd0, {%r0, %r1};");
+
+    let unpack = Instruction::UnpackB64x2 {
+        lo: make_reg("%r2", PtxType::B32),
+        hi: make_reg("%r3", PtxType::B32),
+        src: make_reg("%fd1", PtxType::F64),
+    };
+    assert_eq!(unpack.emit(), "mov.b64 {%r2, %r3}, %fd1;");
+}
+
+#[test]
+fn emit_not_pred() {
+    let inst = Instruction::Not {
+        ty: PtxType::Pred,
+        dst: make_reg("%p0", PtxType::Pred),
+        src: make_reg_op("%p1", PtxType::Pred),
+    };
+    assert_eq!(inst.emit(), "not.pred %p0, %p1;");
+}
+
+/// Regression: the bitwise redux ops must emit `.b32` — `ptxas` rejects
+/// `redux.sync.and.u32` (found by the `WarpVec` assembler battery).
+#[test]
+fn emit_redux_bitwise_uses_b32() {
+    let inst = Instruction::Redux {
+        op: ReduxOp::And,
+        dst: make_reg("%r0", PtxType::U32),
+        src: make_reg_op("%r1", PtxType::U32),
+        membership_mask: 0xFFFF_FFFF,
+    };
+    assert_eq!(inst.emit(), "redux.sync.and.b32 %r0, %r1, 0xffffffff;");
+}

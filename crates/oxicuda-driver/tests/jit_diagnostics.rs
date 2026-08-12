@@ -40,7 +40,7 @@ fn jit_failure_parses_ptxas_log() {
     let source = CudaError::InvalidValue;
     let err = make_jit_failed(source, info, error_bytes);
 
-    if let CudaError::JitFailed { log, source: _, .. } = err {
+    if let CudaError::JitFailed { log, .. } = err {
         let diags = log.parse_diagnostics();
         assert!(
             !diags.is_empty(),

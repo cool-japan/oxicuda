@@ -698,7 +698,9 @@ fn collect_src_register_names(inst: &Instruction) -> Vec<String> {
         | Instruction::Sin { src, .. }
         | Instruction::Cos { src, .. }
         | Instruction::Cvt { src, .. }
-        | Instruction::Redux { src, .. } => {
+        | Instruction::Redux { src, .. }
+        | Instruction::Mov { src, .. }
+        | Instruction::Not { src, .. } => {
             push_operand_names(src, &mut names);
         }
         Instruction::Bfe {
@@ -754,6 +756,18 @@ fn collect_src_register_names(inst: &Instruction) -> Vec<String> {
             push_operand_names(a, &mut names);
             push_operand_names(b, &mut names);
             names.push(pred.name.clone());
+        }
+        Instruction::Shfl { src, lane, c, .. } => {
+            push_operand_names(src, &mut names);
+            push_operand_names(lane, &mut names);
+            push_operand_names(c, &mut names);
+        }
+        Instruction::Vote { src, .. } | Instruction::UnpackB64x2 { src, .. } => {
+            names.push(src.name.clone());
+        }
+        Instruction::PackB64x2 { lo, hi, .. } => {
+            names.push(lo.name.clone());
+            names.push(hi.name.clone());
         }
         Instruction::AtomCas {
             addr,
@@ -937,8 +951,16 @@ fn dst_register_name(inst: &Instruction) -> Option<String> {
         | Instruction::SurfLoad { dst, .. }
         | Instruction::Redux { dst, .. }
         | Instruction::ElectSync { dst, .. }
+        | Instruction::Shfl { dst, .. }
+        | Instruction::Vote { dst, .. }
+        | Instruction::Mov { dst, .. }
+        | Instruction::Not { dst, .. }
+        | Instruction::PackB64x2 { dst, .. }
         // `mbarrier.try_wait.parity` writes its predicate result register.
         | Instruction::MbarrierWait { dst, .. } => Some(dst.name.clone()),
+        // `mov.b64 {lo, hi}, src` defines two registers; report `lo` as the
+        // representative definition (same convention as `Tex*`'s texel list).
+        Instruction::UnpackB64x2 { lo, .. } => Some(lo.name.clone()),
         // `tex.*.v4` defines four texel registers; the first is representative.
         Instruction::Tex1d { dst, .. }
         | Instruction::Tex2d { dst, .. }

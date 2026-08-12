@@ -216,11 +216,11 @@ fn main() -> Result<(), oxicuda::Error> {
 | **Vol.1 -- Foundation** | | | | |
 | `oxicuda-driver` | Driver API | FFI, device/context/stream/event/module | 16,160 | 461 |
 | `oxicuda-memory` | cuMemAlloc | DeviceBuffer, PinnedBuffer, unified, pool | 6,812 | 301 |
-| `oxicuda-launch` | cuLaunchKernel | Dim3, LaunchParams, `launch!` macro | 5,506 | 231 |
+| `oxicuda-launch` | cuLaunchKernel | Dim3, LaunchParams, `launch!` macro | 5,585 | 233 |
 | `oxicuda-runtime` | CUDA Runtime | High-level cudaRT API layer | 4,955 | 126 |
 | `oxicuda-nvrtc` | NVRTC | Runtime CUDA-C to PTX JIT, dlopen'd libnvrtc | 642 | 20 |
 | **Vol.2 -- PTX Codegen & Autotuner** | | | | |
-| `oxicuda-ptx` | nvcc / CUTLASS | PTX IR, codegen DSL, Tensor Core gen | 35,268 | 1,035 |
+| `oxicuda-ptx` | nvcc / CUTLASS | PTX IR, codegen DSL, Tensor Core gen | 37,287 | 1,061 |
 | `oxicuda-autotune` | -- | Search space, benchmark, tuning DB | 16,500 | 472 |
 | **Vol.3 -- Linear Algebra** | | | | |
 | `oxicuda-blas` | cuBLAS | BLAS L1/L2/L3, GEMM, batched, elementwise | 33,597 | 990 |
@@ -246,7 +246,7 @@ fn main() -> Result<(), oxicuda::Error> {
 | `oxicuda-rl` | -- | Replay buffers, policy dists, PPO/DQN/SAC/TD3 | 12,473 | 453 |
 | **Backends** | | | | |
 | `oxicuda-backend` | -- | Backend trait abstraction | 4,038 | 101 |
-| `oxicuda-primitives` | CUB | GPU scan, reduce, sort, histogram | 10,114 | 260 |
+| `oxicuda-primitives` | CUB | GPU scan, reduce, sort, histogram | 10,712 | 271 |
 | `oxicuda-metal` | -- | Metal compute backend (macOS) | 7,456 | 262 |
 | `oxicuda-vulkan` | -- | Vulkan Compute backend | 7,493 | 151 |
 | `oxicuda-webgpu` | -- | WebGPU backend | 5,736 | 226 |
@@ -344,7 +344,7 @@ fn main() -> Result<(), oxicuda::Error> {
 | `oxicuda-geom2d` | -- | Delaunay/Voronoi/convex-hull/sweep-line | 11,071 | 301 |
 | **Umbrella** | | | | |
 | `oxicuda` | -- | Umbrella re-export crate | 21,496 | 526 |
-| | | **Total** | **~1,296,447** | **38,675** |
+| | | **Total** | **~1,299,146** | **38,689** |
 
 ## Feature Flags
 
@@ -510,6 +510,13 @@ cargo nextest run --all-features
 - `oxicuda-fft` (`transforms::c2c`, `c2r`, `fft2d`, `fft3d`, `r2c`): fixed an async-copy race where the shared `copy_dtoh_async`/`copy_htod_async` helpers enqueued `cuMemcpyDtoHAsync`/`cuMemcpyHtoDAsync` but returned before the copy actually completed, letting the caller read a still-in-flight (effectively zeroed) buffer or drop the source before the upload landed -- both helpers now call `stream.synchronize()` before returning
 - `oxicuda-memory`: `DeviceBuffer::copy_from_host` only blocked until the host source was staged into the driver's DMA buffer, not until the transfer to device memory itself completed -- since every OxiCUDA `Stream` uses `CU_STREAM_NON_BLOCKING`, a kernel issued right after `copy_from_host` on such a stream could observe pre-upload zeros; it now also calls `cuCtxSynchronize`, mirroring `zeroed`'s existing behavior
 - Test count unchanged at 38,675 passing (`--all-features`; 37,320 with default features) -- this release is a correctness fix, not a feature addition
+
+**Released (v0.5.4) -- 2026-08-11** *(38,689 tests passing, ~1.30M SLoC, 74 crates)*
+- `oxicuda-ptx`: new `WarpVec`/`WarpMask` SIMD-flavored warp-vector expression layer (`builder::warp_vec`, exported from the prelude) -- a warp's 32 lanes as a first-class `Simd`/`Mask`-style value with elementwise arithmetic, comparisons, butterfly all-reduce reductions (`redux.sync` fast path on sm_80+), Hillis-Steele scans, and the full shuffle family, built entirely on stable Rust via runtime PTX codegen
+- `oxicuda-ptx`: six new IR instructions back the warp-vector layer -- `Shfl`/`Vote` (warp shuffle/vote), `Mov`/`Not` (typed moves/logic), `PackB64x2`/`UnpackB64x2` (64-bit-through-32-bit-shuffle routing) -- fully wired into the validator, dead-code, register-pressure, scheduling, and arch-legality passes
+- `oxicuda-launch`: new `rustc_ptx_interop` gpu-tests launch PTX compiled by upstream nightly `rustc`'s NVPTX backend (not `oxicuda-ptx`'s own generator) directly through the driver stack, proving the driver/launch stack hosts foreign-compiler PTX -- including a `core::simd` (portable-SIMD) kernel
+- Fixed a latent `Instruction::Redux` bug: bitwise warp reductions (`and`/`or`/`xor`) were emitted as `.u32` when the PTX ISA requires `.b32`, which `ptxas` rejected
+- Test suite expanded to 38,689 passing tests (`--all-features`; 37,346 with default features), up from 38,675/37,320 at 0.5.3
 
 **Next**
 - Published documentation on docs.rs

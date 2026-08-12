@@ -472,11 +472,7 @@ mod tests {
             .map(|&idx| euclidean_dist(&data[idx * 2..(idx + 1) * 2], &[0.0, 0.0]))
             .collect();
         for w in dists.windows(2) {
-            assert!(
-                w[0] <= w[1] + 1e-6,
-                "knn_dists should be sorted: {:?}",
-                &dists
-            );
+            assert!(w[0] <= w[1] + 1e-6, "knn_dists should be sorted: {dists:?}");
         }
     }
 

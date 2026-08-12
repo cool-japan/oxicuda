@@ -6,7 +6,7 @@ CUB-equivalent parallel GPU primitives with zero CUDA SDK dependency. All kernel
 
 ## Implementation Status
 
-**Actual: ~10,114 non-blank SLoC across 32 files** (sub-modules `warp/`, `block/`, `device/`, `sort/` + shared `ptx_helpers.rs`, `handle.rs`, `host_reference.rs`, `error.rs`)
+**Actual: ~10,712 non-blank SLoC across 33 files** (sub-modules `warp/`, `block/`, `device/`, `sort/`, `gpu_tests/` + shared `ptx_helpers.rs`, `handle.rs`, `host_reference.rs`, `error.rs`)
 
 Coverage spans the full CUB hierarchy: warp-level reductions / scans built on `shfl.sync.*`, block-level reductions / scans built on shared memory + warp shuffles, device-wide reduce / scan / decoupled-lookback-scan / stream-compaction / partition / run-length-encode / segmented-reduce+scan / select-unique / histogram pipelines, and the sort family (4-bit & 8-bit LSD radix, key+value/descending/float radix, onesweep, bitonic-block + co-rank merge keys and pairs). A `host_reference` module mirrors every algorithm on the CPU (slice-based, no `ndarray`). Every public template generates target-specific PTX for sm_75 through sm_120 via `oxicuda-ptx` and exposes a `workspace_bytes(input_len)` scratch query.
 
@@ -111,7 +111,7 @@ Coverage spans the full CUB hierarchy: warp-level reductions / scans built on `s
 ## Quality Status
 
 - Warnings: 0
-- Tests: 260 unit tests + 20 doctests (280 total, all passing)
+- Tests: 271 unit tests (231 with default features) + 20 doctests (291 total with --all-features, all passing)
 - unwrap() calls: 0 (production code; `expect` only inside `#[cfg(test)]` and doc-example doctests)
 - clippy: clean (`cargo clippy -p oxicuda-primitives --all-features --all-targets -- -D warnings`)
 - ptx_helpers coverage: all `PtxType` variants (including B128, E4M3/E5M2/E2M3/E3M2/E2M1, F16x2, BF16x2, TF32), all `SmVersion` variants (Sm90a, Sm100, Sm120), all `ReduceOp` identities and instruction mnemonics

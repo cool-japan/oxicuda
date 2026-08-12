@@ -624,6 +624,11 @@ const fn estimate_latency(inst: &Instruction) -> InstructionLatency {
         // Carry-add and select: 4-cycle arithmetic
         | Instruction::Addc { .. }
         | Instruction::Selp { .. }
+        // Register moves / 64-bit pack-unpack / logical not: 4-cycle ALU
+        | Instruction::Mov { .. }
+        | Instruction::PackB64x2 { .. }
+        | Instruction::UnpackB64x2 { .. }
+        | Instruction::Not { .. }
         // Dot-product accumulate: 4-cycle arithmetic
         | Instruction::Dp4a { .. }
         | Instruction::Dp2a { .. } => InstructionLatency {
@@ -747,6 +752,9 @@ const fn estimate_latency(inst: &Instruction) -> InstructionLatency {
         | Instruction::Pragma(_)
         // PTX 8.x: barriers, fences, control flow — ~1 cycle
         | Instruction::Redux { .. }
+        // Warp shuffle / vote: warp-synchronous register exchange
+        | Instruction::Shfl { .. }
+        | Instruction::Vote { .. }
         | Instruction::Stmatrix { .. }
         | Instruction::ElectSync { .. }
         | Instruction::Setmaxnreg { .. }
@@ -816,7 +824,17 @@ fn defs(inst: &Instruction) -> Vec<&Register> {
         | Instruction::Dp2a { dst, .. }
         | Instruction::SurfLoad { dst, .. }
         | Instruction::Redux { dst, .. }
-        | Instruction::ElectSync { dst, .. } => vec![dst],
+        | Instruction::ElectSync { dst, .. }
+        | Instruction::Vote { dst, .. }
+        | Instruction::Mov { dst, .. }
+        | Instruction::Not { dst, .. }
+        | Instruction::PackB64x2 { dst, .. } => vec![dst],
+        // `shfl.sync` optionally defines the in-range predicate as well.
+        Instruction::Shfl { dst, dst_pred, .. } => dst_pred
+            .as_ref()
+            .map_or_else(|| vec![dst], |p| vec![dst, p]),
+        // `mov.b64 {lo, hi}, src` defines both 32-bit halves.
+        Instruction::UnpackB64x2 { lo, hi, .. } => vec![lo, hi],
         // `tex.*.v4` defines four texel destination registers.
         Instruction::Tex1d { dst, .. }
         | Instruction::Tex2d { dst, .. }
@@ -916,7 +934,17 @@ fn uses(inst: &Instruction) -> Vec<&Register> {
         | Instruction::Sin { src, .. }
         | Instruction::Cos { src, .. }
         | Instruction::Cvt { src, .. }
-        | Instruction::Redux { src, .. } => operand_regs(src),
+        | Instruction::Redux { src, .. }
+        | Instruction::Mov { src, .. }
+        | Instruction::Not { src, .. } => operand_regs(src),
+        Instruction::Shfl { src, lane, c, .. } => {
+            let mut regs = operand_regs(src);
+            regs.extend(operand_regs(lane));
+            regs.extend(operand_regs(c));
+            regs
+        }
+        Instruction::Vote { src, .. } | Instruction::UnpackB64x2 { src, .. } => vec![src],
+        Instruction::PackB64x2 { lo, hi, .. } => vec![lo, hi],
 
         Instruction::Bfe {
             src, start, len, ..
@@ -1233,6 +1261,14 @@ const fn has_side_effects(inst: &Instruction) -> bool {
         | Instruction::SurfLoad { .. }
         | Instruction::Redux { .. }
         | Instruction::ElectSync { .. }
+        // Warp shuffle/vote and register moves are pure register-data
+        // movement (same classification as `Redux`/`ElectSync` above).
+        | Instruction::Shfl { .. }
+        | Instruction::Vote { .. }
+        | Instruction::Mov { .. }
+        | Instruction::PackB64x2 { .. }
+        | Instruction::UnpackB64x2 { .. }
+        | Instruction::Not { .. }
         // ldmatrix: warp-cooperative shared memory load — pure read, no write side effect
         | Instruction::Ldmatrix { .. } => false,
     }

@@ -204,6 +204,13 @@ pub const fn minimum_sm_for_instruction(instr: &Instruction) -> Option<SmVersion
         | Instruction::AtomGlobalAddFloat { .. }
         | Instruction::Addc { .. }
         | Instruction::Selp { .. }
+        // shfl.sync / vote.sync need sm_70; the crate minimum is sm_75.
+        | Instruction::Shfl { .. }
+        | Instruction::Vote { .. }
+        | Instruction::Mov { .. }
+        | Instruction::PackB64x2 { .. }
+        | Instruction::UnpackB64x2 { .. }
+        | Instruction::Not { .. }
         | Instruction::MovSpecial { .. }
         | Instruction::LoadParam { .. }
         | Instruction::Comment(_)
@@ -332,6 +339,7 @@ pub fn is_instruction_legal(instr: &Instruction, target_sm: SmVersion) -> bool {
 }
 
 /// Returns a short human-readable description of an instruction for diagnostics.
+#[allow(clippy::too_many_lines)]
 fn instruction_description(instr: &Instruction) -> String {
     match instr {
         Instruction::Add { ty, .. } => format!("add{}", ty.as_ptx_str()),
@@ -406,6 +414,12 @@ fn instruction_description(instr: &Instruction) -> String {
         Instruction::Dp4a { .. } => "dp4a".into(),
         Instruction::Dp2a { .. } => "dp2a".into(),
         Instruction::Redux { op, .. } => format!("redux.sync.{op:?}"),
+        Instruction::Shfl { mode, .. } => format!("shfl.sync{}.b32", mode.as_ptx_str()),
+        Instruction::Vote { mode, .. } => format!("vote.sync{}", mode.as_ptx_str()),
+        Instruction::Mov { ty, .. } => format!("mov{}", ty.as_ptx_str()),
+        Instruction::PackB64x2 { .. } => "mov.b64 (pack)".into(),
+        Instruction::UnpackB64x2 { .. } => "mov.b64 (unpack)".into(),
+        Instruction::Not { ty, .. } => format!("not{}", ty.as_ptx_str()),
         Instruction::Stmatrix { shape, trans, .. } => {
             let t = if *trans { ".trans" } else { "" };
             format!("stmatrix.{shape:?}{t}")

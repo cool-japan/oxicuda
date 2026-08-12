@@ -16,8 +16,8 @@ mod types;
 pub use block::BasicBlock;
 pub use function::PtxFunction;
 pub use instruction::{
-    GridDepAction, Instruction, MmaShape, ReduxOp, SetmaxnregAction, StmatrixShape, WgmmaShape,
-    WmmaLayout, WmmaOp, WmmaShape,
+    GridDepAction, Instruction, MmaShape, ReduxOp, SetmaxnregAction, ShflMode, StmatrixShape,
+    VoteMode, WgmmaShape, WmmaLayout, WmmaOp, WmmaShape,
 };
 pub use module::PtxModule;
 pub use operand::{ImmValue, Operand};

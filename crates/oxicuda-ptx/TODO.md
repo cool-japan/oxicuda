@@ -6,7 +6,7 @@ Pure Rust PTX code generation DSL and intermediate representation. Generates NVI
 
 ## Implementation Status
 
-**Actual SLoC: 33,988** (65 files) (estimated 130K-230K for oxicuda-ptx portion of Vol.2)
+**Actual SLoC: 37,287** (68 files) (estimated 130K-230K for oxicuda-ptx portion of Vol.2)
 
 The PTX crate is the largest in Vol.1+2 and the core differentiator of OxiCUDA. It provides a typed IR, builder DSL, kernel templates, Tensor Core instruction helpers, validation, disk caching, atomic operations, bit manipulation, special math functions, and compiler-style analysis passes. Current coverage handles the most important instruction classes with room for significant expansion.
 
@@ -106,7 +106,7 @@ The PTX crate is the largest in Vol.1+2 and the core differentiator of OxiCUDA. 
 ## Quality Status
 
 - Warnings: 0
-- Tests: 1035 unit + 31 doc passing (0.5.0: added F64 elementwise/reduction register-width and transcendental-precision-validation regression tests; previously added cp_async_gen + fusion_cost_model)
+- Tests: 1061 unit + 32 doc passing (0.5.4: added WarpVec/WarpMask warp-vector layer + shfl.sync/vote.sync IR regression tests; 0.5.0: added F64 elementwise/reduction register-width and transcendental-precision-validation regression tests; previously added cp_async_gen + fusion_cost_model)
 - unwrap() calls: 0 (production code; tests use `.unwrap()` on infallible `new()` fixtures)
 - Clippy: clean (pedantic + nursery)
 - `#![deny(unsafe_code)]` -- entire crate is safe Rust

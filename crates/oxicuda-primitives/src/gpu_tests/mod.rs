@@ -43,6 +43,7 @@ use oxicuda_ptx::arch::SmVersion;
 mod reduce_scan;
 mod sort;
 mod stream_compaction;
+mod warp_vec;
 
 // ---------------------------------------------------------------------------
 // Shared fixture + helpers

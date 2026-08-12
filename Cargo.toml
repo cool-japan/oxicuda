@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -12,55 +12,55 @@ authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
 
 [workspace.dependencies]
 # Internal crates
-oxicuda-backend = { path = "crates/oxicuda-backend", version = "0.5.3" }
-oxicuda-driver = { path = "crates/oxicuda-driver", version = "0.5.3" }
-oxicuda-nvrtc = { path = "crates/oxicuda-nvrtc", version = "0.5.3" }
-oxicuda-memory = { path = "crates/oxicuda-memory", version = "0.5.3" }
-oxicuda-launch = { path = "crates/oxicuda-launch", version = "0.5.3" }
-oxicuda-ptx = { path = "crates/oxicuda-ptx", version = "0.5.3" }
-oxicuda-autotune = { path = "crates/oxicuda-autotune", version = "0.5.3" }
-oxicuda-blas = { path = "crates/oxicuda-blas", version = "0.5.3" }
-oxicuda-dnn = { path = "crates/oxicuda-dnn", version = "0.5.3" }
-oxicuda-fft = { path = "crates/oxicuda-fft", version = "0.5.3" }
-oxicuda-sparse = { path = "crates/oxicuda-sparse", version = "0.5.3" }
-oxicuda-solver = { path = "crates/oxicuda-solver", version = "0.5.3" }
-oxicuda-rand = { path = "crates/oxicuda-rand", version = "0.5.3" }
-oxicuda-webgpu = { path = "crates/oxicuda-webgpu", version = "0.5.3" }
-oxicuda-vulkan = { path = "crates/oxicuda-vulkan", version = "0.5.3" }
-oxicuda-metal = { path = "crates/oxicuda-metal", version = "0.5.3" }
-oxicuda-rocm = { path = "crates/oxicuda-rocm", version = "0.5.3" }
-oxicuda-levelzero = { path = "crates/oxicuda-levelzero", version = "0.5.3" }
-oxicuda-primitives = { path = "crates/oxicuda-primitives", version = "0.5.3" }
-oxicuda-signal = { path = "crates/oxicuda-signal", version = "0.5.3" }
-oxicuda-graph = { path = "crates/oxicuda-graph", version = "0.5.3" }
-oxicuda-train = { path = "crates/oxicuda-train", version = "0.5.3" }
-oxicuda-rl    = { path = "crates/oxicuda-rl",    version = "0.5.3" }
-oxicuda-quant = { path = "crates/oxicuda-quant", version = "0.5.3" }
-oxicuda-infer      = { path = "crates/oxicuda-infer",      version = "0.5.3" }
-oxicuda-dist-infer = { path = "crates/oxicuda-dist-infer", version = "0.5.3" }
-oxicuda-lm         = { path = "crates/oxicuda-lm",         version = "0.5.3" }
-oxicuda-runtime    = { path = "crates/oxicuda-runtime",    version = "0.5.3" }
-oxicuda-causal     = { path = "crates/oxicuda-causal",     version = "0.5.3" }
-oxicuda-peft       = { path = "crates/oxicuda-peft",       version = "0.5.3" }
-oxicuda-distill    = { path = "crates/oxicuda-distill",    version = "0.5.3" }
-oxicuda-ot         = { path = "crates/oxicuda-ot",         version = "0.5.3" }
-oxicuda-snn        = { path = "crates/oxicuda-snn",        version = "0.5.3" }
-oxicuda-privacy    = { path = "crates/oxicuda-privacy",    version = "0.5.3" }
-oxicuda-hdc        = { path = "crates/oxicuda-hdc",        version = "0.5.3" }
-oxicuda-evol       = { path = "crates/oxicuda-evol",       version = "0.5.3" }
-oxicuda-tda        = { path = "crates/oxicuda-tda",        version = "0.5.3" }
-oxicuda-tn         = { path = "crates/oxicuda-tn",         version = "0.5.3" }
-oxicuda-seq        = { path = "crates/oxicuda-seq",        version = "0.5.3" }
-oxicuda-pde        = { path = "crates/oxicuda-pde",        version = "0.5.3" }
-oxicuda-manifold   = { path = "crates/oxicuda-manifold",   version = "0.5.3" }
-oxicuda-stats      = { path = "crates/oxicuda-stats",      version = "0.5.3" }
-oxicuda-sketch     = { path = "crates/oxicuda-sketch",     version = "0.5.3" }
-oxicuda-survival   = { path = "crates/oxicuda-survival",   version = "0.5.3" }
-oxicuda-cvx        = { path = "crates/oxicuda-cvx",        version = "0.5.3" }
-oxicuda-cs         = { path = "crates/oxicuda-cs",         version = "0.5.3" }
-oxicuda-graphalg   = { path = "crates/oxicuda-graphalg",   version = "0.5.3" }
-oxicuda-numeric    = { path = "crates/oxicuda-numeric",    version = "0.5.3" }
-oxicuda-geom2d     = { path = "crates/oxicuda-geom2d",     version = "0.5.3" }
+oxicuda-backend = { path = "crates/oxicuda-backend", version = "0.5.4" }
+oxicuda-driver = { path = "crates/oxicuda-driver", version = "0.5.4" }
+oxicuda-nvrtc = { path = "crates/oxicuda-nvrtc", version = "0.5.4" }
+oxicuda-memory = { path = "crates/oxicuda-memory", version = "0.5.4" }
+oxicuda-launch = { path = "crates/oxicuda-launch", version = "0.5.4" }
+oxicuda-ptx = { path = "crates/oxicuda-ptx", version = "0.5.4" }
+oxicuda-autotune = { path = "crates/oxicuda-autotune", version = "0.5.4" }
+oxicuda-blas = { path = "crates/oxicuda-blas", version = "0.5.4" }
+oxicuda-dnn = { path = "crates/oxicuda-dnn", version = "0.5.4" }
+oxicuda-fft = { path = "crates/oxicuda-fft", version = "0.5.4" }
+oxicuda-sparse = { path = "crates/oxicuda-sparse", version = "0.5.4" }
+oxicuda-solver = { path = "crates/oxicuda-solver", version = "0.5.4" }
+oxicuda-rand = { path = "crates/oxicuda-rand", version = "0.5.4" }
+oxicuda-webgpu = { path = "crates/oxicuda-webgpu", version = "0.5.4" }
+oxicuda-vulkan = { path = "crates/oxicuda-vulkan", version = "0.5.4" }
+oxicuda-metal = { path = "crates/oxicuda-metal", version = "0.5.4" }
+oxicuda-rocm = { path = "crates/oxicuda-rocm", version = "0.5.4" }
+oxicuda-levelzero = { path = "crates/oxicuda-levelzero", version = "0.5.4" }
+oxicuda-primitives = { path = "crates/oxicuda-primitives", version = "0.5.4" }
+oxicuda-signal = { path = "crates/oxicuda-signal", version = "0.5.4" }
+oxicuda-graph = { path = "crates/oxicuda-graph", version = "0.5.4" }
+oxicuda-train = { path = "crates/oxicuda-train", version = "0.5.4" }
+oxicuda-rl    = { path = "crates/oxicuda-rl",    version = "0.5.4" }
+oxicuda-quant = { path = "crates/oxicuda-quant", version = "0.5.4" }
+oxicuda-infer      = { path = "crates/oxicuda-infer",      version = "0.5.4" }
+oxicuda-dist-infer = { path = "crates/oxicuda-dist-infer", version = "0.5.4" }
+oxicuda-lm         = { path = "crates/oxicuda-lm",         version = "0.5.4" }
+oxicuda-runtime    = { path = "crates/oxicuda-runtime",    version = "0.5.4" }
+oxicuda-causal     = { path = "crates/oxicuda-causal",     version = "0.5.4" }
+oxicuda-peft       = { path = "crates/oxicuda-peft",       version = "0.5.4" }
+oxicuda-distill    = { path = "crates/oxicuda-distill",    version = "0.5.4" }
+oxicuda-ot         = { path = "crates/oxicuda-ot",         version = "0.5.4" }
+oxicuda-snn        = { path = "crates/oxicuda-snn",        version = "0.5.4" }
+oxicuda-privacy    = { path = "crates/oxicuda-privacy",    version = "0.5.4" }
+oxicuda-hdc        = { path = "crates/oxicuda-hdc",        version = "0.5.4" }
+oxicuda-evol       = { path = "crates/oxicuda-evol",       version = "0.5.4" }
+oxicuda-tda        = { path = "crates/oxicuda-tda",        version = "0.5.4" }
+oxicuda-tn         = { path = "crates/oxicuda-tn",         version = "0.5.4" }
+oxicuda-seq        = { path = "crates/oxicuda-seq",        version = "0.5.4" }
+oxicuda-pde        = { path = "crates/oxicuda-pde",        version = "0.5.4" }
+oxicuda-manifold   = { path = "crates/oxicuda-manifold",   version = "0.5.4" }
+oxicuda-stats      = { path = "crates/oxicuda-stats",      version = "0.5.4" }
+oxicuda-sketch     = { path = "crates/oxicuda-sketch",     version = "0.5.4" }
+oxicuda-survival   = { path = "crates/oxicuda-survival",   version = "0.5.4" }
+oxicuda-cvx        = { path = "crates/oxicuda-cvx",        version = "0.5.4" }
+oxicuda-cs         = { path = "crates/oxicuda-cs",         version = "0.5.4" }
+oxicuda-graphalg   = { path = "crates/oxicuda-graphalg",   version = "0.5.4" }
+oxicuda-numeric    = { path = "crates/oxicuda-numeric",    version = "0.5.4" }
+oxicuda-geom2d     = { path = "crates/oxicuda-geom2d",     version = "0.5.4" }
 
 # Vulkan bindings (runtime loader — no compile-time libvulkan dependency)
 ash = "0.38"
