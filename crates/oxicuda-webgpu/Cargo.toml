@@ -14,6 +14,12 @@ categories = ["hardware-support", "science", "mathematics"]
 [features]
 default = []
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+# When enabled, the device-presence test in `tests/gpu_presence.rs` FAILS
+# (rather than silently skipping) if no real wgpu adapter can be acquired.
+# Off by default so headless/CI builds without a GPU stay green; turn it on
+# explicitly on a machine that is expected to have one:
+#   cargo nextest run -p oxicuda-webgpu --features gpu-tests
+gpu-tests = []
 
 [dependencies]
 oxicuda-backend.workspace = true
@@ -27,6 +33,23 @@ js-sys = { workspace = true, optional = true }
 [dev-dependencies]
 naga = { workspace = true }
 half = { workspace = true }
+criterion.workspace = true
+
+[[bench]]
+name = "gemm_bench"
+harness = false
+
+[[bench]]
+name = "reduce_bench"
+harness = false
+
+[[bench]]
+name = "conv2d_bench"
+harness = false
+
+[[bench]]
+name = "attention_bench"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

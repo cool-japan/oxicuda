@@ -20,6 +20,33 @@ thiserror.workspace = true
 tracing.workspace = true
 num-complex.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[features]
+# When enabled, the device-presence test in `tests/gpu_presence.rs` FAILS
+# (rather than silently skipping) if no real Metal device can be acquired.
+# Off by default so headless/CI builds without a GPU stay green; turn it on
+# explicitly on a machine that is expected to have one:
+#   cargo nextest run -p oxicuda-metal --features gpu-tests
+gpu-tests = []
+
+[[bench]]
+name = "gemm_bench"
+harness = false
+
+[[bench]]
+name = "reduce_bench"
+harness = false
+
+[[bench]]
+name = "conv2d_bench"
+harness = false
+
+[[bench]]
+name = "attention_bench"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
