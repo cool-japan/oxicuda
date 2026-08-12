@@ -408,8 +408,8 @@ fn main() -> Result<(), oxicuda::Error> {
 | Linux x86_64 | Full support | Primary development target |
 | Windows x86_64 | Full support | nvcuda.dll loaded at runtime |
 | macOS — CUDA driver API | Unavailable | `Err(CudaError::NotInitialized)` at runtime — there is no NVIDIA driver on macOS (not `UnsupportedPlatform`; `CudaError` has no such variant) |
-| macOS — Metal backend (`features = ["metal"]`) | GPU compute | `gemm`, `batched_gemm`, unary/binary elementwise, and axis `reduce` run on the Apple GPU; see below |
-| macOS — WebGPU backend (`features = ["webgpu"]`) | GPU compute | Cross-platform via `wgpu` (Metal / Vulkan / D3D12 / browser WebGPU) |
+| macOS — Metal backend (`features = ["metal"]`) | GPU compute | `gemm`/`batched_gemm` (all transpose combinations), unary/binary elementwise, axis `reduce`, `conv2d_forward`, `attention`, and `softmax` all run on the Apple GPU; see below |
+| macOS — WebGPU backend (`features = ["webgpu"]`) | GPU compute | Cross-platform via `wgpu` (runs on Metal on macOS, same as on Vulkan/D3D12/browser WebGPU elsewhere) — `gemm`/`batched_gemm`, unary/binary, `reduce`, `conv2d_forward`, and `attention` |
 | macOS — CPU fallback | Full support | Always available, no feature flag needed (`oxicuda::backend::CpuBackend`) |
 
 ### Using OxiCUDA on macOS
@@ -446,23 +446,39 @@ let backend = oxicuda::compute::default_backend()?;
 println!("computing on the {} backend", backend.name());
 ```
 
-Honest scope of the Metal backend today (see
+Honest scope of the Metal backend today, current as of the 2026-08-12
+alt-backend audit (see
 [`crates/oxicuda-metal/README.md`](crates/oxicuda-metal/README.md#op-coverage)
 for the full table):
 
-- **GPU-executed via Metal**: `gemm`, `batched_gemm`, the element-wise
-  `unary`/`binary` ops, and axis `reduce`.
-- **Not GPU-accelerated yet**: `conv2d_forward` and `attention` currently run
-  on the host CPU inside the Metal backend (round-tripping through device
-  buffers); `softmax`, `gather`, `scatter`, `gemm_mixed_precision`, and the
-  `conv2d` backward passes return `BackendError::Unsupported`.
+- **GPU-executed via Metal**: `gemm`/`batched_gemm` (a runtime-parameterised
+  kernel now covers all four transpose combinations, not just `NoTrans`), the
+  element-wise `unary`/`binary` ops, axis `reduce`, `conv2d_forward`,
+  `attention` (falls back to a host implementation only when a head is too
+  wide for one threadgroup-memory accumulator slice), and last-axis `softmax`.
+  As of this session's fixes, `conv2d_forward` and `attention` dispatch real
+  MSL kernels; earlier releases silently ran them as host-side scalar loops
+  while the finished kernels sat unused in the crate, and `softmax` returned
+  `Unsupported` despite a working shader already shipping alongside it.
+- **Not GPU-accelerated / not overridden**: `gather`, `scatter`,
+  `gemm_mixed_precision`, the `conv2d` backward passes, and
+  `recommended_tile_for` all still return the trait's default
+  (`BackendError::Unsupported`, or a CPU-profile capability guess).
 - **Not reachable from Metal at all**: the `blas`, `dnn`, `fft`, `sparse`,
   `solver`, and `rand` features are built on the CUDA driver path only, so
   they still fail with `NotInitialized` on macOS — use the `ComputeBackend`
   API above for GPU work on a Mac instead of those features.
 
-Without the `metal` feature nothing breaks — backend selection simply falls
-through to the CPU backend, which computes correctly everywhere.
+The `webgpu` feature offers a second, cross-platform GPU path on the same
+machine (via `wgpu`, which itself runs on Metal under the hood on macOS):
+`gemm`/`batched_gemm`, `unary`/`binary`, `reduce`, `conv2d_forward`, and
+`attention` all dispatch real WGSL compute shaders, with a CPU fallback for
+shapes its fixed-literal 2-D dispatch can't express. It does not override
+`softmax` (unlike the `metal` feature above) — see
+[`crates/oxicuda-webgpu/README.md`](crates/oxicuda-webgpu/README.md#op-coverage).
+
+Without the `metal`/`webgpu` features nothing breaks — backend selection
+simply falls through to the CPU backend, which computes correctly everywhere.
 
 ## Building
 

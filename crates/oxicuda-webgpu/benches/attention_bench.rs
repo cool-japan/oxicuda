@@ -60,7 +60,13 @@ fn try_setup() -> Option<AttentionHarness> {
     let v = upload_filled(&backend, qkv_elems, 23)?;
     let o = backend.alloc(qkv_elems * 4).ok()?;
 
-    Some(AttentionHarness { backend, q, k, v, o })
+    Some(AttentionHarness {
+        backend,
+        q,
+        k,
+        v,
+        o,
+    })
 }
 
 fn bench_attention(criterion: &mut Criterion) {
@@ -90,7 +96,14 @@ fn bench_attention(criterion: &mut Criterion) {
                 scale,
                 true,
             );
-            black_box(r.ok());
+            // Synchronize every iteration: the GPU dispatch path only
+            // submits (wgpu executes in FIFO order with no per-op poll), so
+            // without an explicit wait the measured time is submission
+            // latency, not GPU execution time, and unsynchronized
+            // submissions pile up across criterion's iterations — observed
+            // to overflow wgpu-core's own drop-time submission wait and
+            // panic.
+            black_box(r.and_then(|()| harness.backend.synchronize()).ok());
         });
     });
     group.finish();

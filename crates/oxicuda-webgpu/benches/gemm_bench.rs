@@ -96,7 +96,17 @@ fn bench_gemm_n(criterion: &mut Criterion, n: usize) {
                 harness.c,
                 harness.n,
             );
-            black_box(r.ok());
+            // `gemm` only submits (see the "No per-op poll" note on
+            // `WebGpuBackend::gemm`); without an explicit wait here the
+            // measured time is CPU-side submission latency, not GPU
+            // execution time, AND thousands of unsynchronized submissions
+            // pile up across criterion's iterations, which was observed to
+            // overflow wgpu-core's own drop-time submission wait and panic
+            // ("timed out while waiting on the last successful submission").
+            // Synchronizing every iteration keeps this bench's numbers
+            // comparable to the Metal bench (which waits per-dispatch by
+            // default) and keeps the queue from ever backing up.
+            black_box(r.and_then(|()| harness.backend.synchronize()).ok());
         });
     });
     group.finish();

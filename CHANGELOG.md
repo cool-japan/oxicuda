@@ -7,6 +7,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.5] - Unreleased
 
+This release runs the alt-backend audit that the 2026-07-06 production-readiness wave queued but
+never reached (`oxicuda-vulkan`/`metal`/`rocm`/`levelzero`/`webgpu` all hit the session token limit
+before a single agent ran — see `TODO.md`). `oxicuda-metal` and `oxicuda-webgpu` are now audited and
+fixed on real Apple Silicon (M3, Metal 4, macOS/arm64); `vulkan`/`rocm`/`levelzero` remain pending.
+The headline finding is that `oxicuda-metal`'s `conv2d_forward` and `attention` were false
+completions — pure-CPU scalar loops round-tripping every operand through the host even though
+finished MSL kernels for both sat unused in the same crate, and `softmax` inherited the trait's
+`Unsupported` default despite a complete shader shipping alongside it. All three now dispatch real
+GPU kernels. `oxicuda-webgpu` had no comparable false completion, but the same adversarial pass found
+a device-limits bug that silently capped every allocation and dispatch at the WebGPU conformance
+baseline regardless of the real GPU, a process-fatal default error handler, and several
+integer-overflow / out-of-bounds-write bugs in generated shaders.
+
+### Fixed
+
+- `oxicuda-metal`: `ComputeBackend::conv2d_forward` and `ComputeBackend::attention` copied every
+  operand to the host and ran scalar Rust loops, even though the finished `conv2d_msl`/`attention_msl`
+  MSL kernels existed with no caller anywhere in the crate. Both now dispatch on the GPU via a new
+  `backend/nn.rs` module: `conv2d_forward` unconditionally (no host fallback — it errors on `u32`
+  overflow and no-ops on zero output elements), `attention` via a new single-pass online-softmax
+  `attention_msl_v2` kernel (one SIMD-group per query), falling back to the host implementation only
+  when `head_dim`'s accumulator cannot fit in one threadgroup-memory slice — a real, caller-reachable
+  limit that a new on-device test (`gpu_device_is_live_when_required`) asserts is not silently taken
+  by default.
+- `oxicuda-metal`: `ComputeBackend::softmax` inherited the trait's `Unsupported` default despite a
+  complete numerically-stable softmax MSL shader already shipping in the crate; it now dispatches
+  `softmax_msl_with_mode` for real (last-axis only — an earlier axis still returns `Unsupported`
+  rather than silently reducing the wrong dimension).
+- `oxicuda-metal`: six ad-hoc GPU dispatch paths (unary/binary/reduce/gemm/batched_gemm/gemm_f16),
+  plus the FFT plan, treated a non-`Completed` `MTLCommandBuffer` status as success. All now route
+  through a shared `commit_and_wait`/`status_to_result` (`pipeline.rs`), so a GPU-side failure
+  (device removal, out-of-memory, shader-validation error at runtime) surfaces as `Err` instead of a
+  silently wrong or stale result.
+- `oxicuda-metal`: the buffer-handle map's mutex was held across kernel encoding *and* the blocking
+  `waitUntilCompleted`, serializing otherwise-independent dispatches (and a latent deadlock risk under
+  contention). `resolve_buffers` now takes its `metal::Buffer` retains under the lock and drops it
+  before encoding.
+- `oxicuda-metal`: `MetalMemoryManager::alloc` called `new_buffer` on `bytes == 0` and on requests
+  larger than `device.max_buffer_length()` without checking first; it now pre-validates both
+  (`InvalidArgument` / `OutOfMemory`) plus a post-hoc nil/short-length probe as defence in depth.
+- `oxicuda-metal`: `reduce` masked every zero-length shape dimension to `1` via `.max(1)`, so a
+  zero-extent axis silently reduced over one phantom element instead of erroring — `Mean` in
+  particular could produce `NaN` with no diagnostic. Zero-length dimensions are now rejected with
+  `InvalidArgument`.
+- `oxicuda-metal`: `simdgroup_gemm_msl` read past the end of its operands with a raw
+  `simdgroup_load` and accumulated into one 64-float threadgroup tile shared (and raced) across every
+  SIMD-group. Fixed with zero-filled threadgroup staging, per-element store guards, and a private
+  per-SIMD-group accumulator; a new `simdgroup_gemm_msl_v2` (same fix, `simdgroup_float8x8` MMA) is
+  F32-only for now — the F16 path returns `Unsupported` rather than accumulate in `half`.
+- `oxicuda-metal`: `next_power_of_2` shifted by 64 (undefined/panicking in debug) for inputs near
+  `usize::MAX`; replaced with `checked_next_power_of_two`. Every v2-kernel dimension parameter (m/n/k,
+  batch counts, strides) now goes through a checked `usize -> u32` conversion instead of `as u32`.
+- `oxicuda-metal`: `DoubleSingle::from_f64` could produce a `NaN` low limb on overflow instead of
+  saturating; fixed, plus new `try_from_f64`/`is_finite`/`pack_df64_checked` and `msl_float_literal`
+  now rejects NaN/inf float literals outright rather than emitting invalid MSL.
+- `oxicuda-metal`: the FFT plan's `determine_threadgroup_size` unconditionally halved an
+  already-power-of-two threadgroup width (e.g. 512 -> 256, wrongly under-occupying the device); it now
+  only rounds down when the input was *not* already a power of two.
+- `oxicuda-metal`: FFT twiddle factors were recomputed per-thread via `cos`/`sin` on `M_PI_F`; the
+  butterfly kernel now indexes a precomputed forward-twiddle table (`twiddle_buffer`, uploaded once
+  per plan), negating the imaginary part for the inverse transform instead of a second table.
+- `oxicuda-webgpu`: `WebGpuDevice::new_async` requested `wgpu::Limits::default()` — the WebGPU
+  conformance *baseline* (e.g. a 256 MiB `max_buffer_size`, 65535 workgroups per dimension) — instead
+  of the real adapter capability, silently capping every allocation and dispatch even on hardware that
+  supports far more. It now requests `adapter.limits()` and `WebGpuMemoryManager::alloc` validates
+  against the real value.
+- `oxicuda-webgpu`: wgpu's default uncaptured-error handler is fatal to the process; `WebGpuDevice`
+  now installs a handler that records the message instead (drained via `poll_error`), so a GPU-side
+  validation error surfaces as a typed `Err` rather than crashing the host process.
+- `oxicuda-webgpu`: GPU readback used `let _ = device.poll(wait_indefinitely())`, silently discarding
+  a `PollError` (or hanging indefinitely) and letting the caller read a staging buffer that might not
+  have been written yet. It now waits on the specific `wgpu::SubmissionIndex` the copy itself produced,
+  with `PollError` propagated as a typed error.
+- `oxicuda-webgpu`: `batched_gemm`'s `stride_a`/`stride_b`/`stride_c` were cast to the shader's `u32`
+  uniform with a bare `as u32` (a stride above `u32::MAX` wrapped to a small value, so the kernel
+  silently read the wrong batch slice) and `batch_count` fed the Z dispatch dimension unchecked against
+  wgpu's 65535-per-axis limit. Both now go through a checked `dim_u32` conversion returning a typed
+  `Err` instead.
+- `oxicuda-webgpu`: `scan_wgsl`'s write stage guarded both elements of a thread's pair
+  (`output[base+2*tid]`, `output[base+2*tid+1]`) behind one `if (base + 2*tid < n)` check, so an odd
+  remainder within the final block (`base+2*tid < n <= base+2*tid+1`) let the second write land one
+  element past `n`. Each element now carries its own independent bound.
+
+### Changed
+
+- `oxicuda-metal`: `gemm`/`batched_gemm`/`gemm_f16` now dispatch through a runtime-parameterised v2
+  kernel family (`gemm_msl_v2`/`batched_gemm_msl_v2`, `GemmParamsV2`/`BatchedGemmParamsV2`) that
+  supports **all four transpose combinations** with padded (non-packed) leading dimensions. Previously
+  only `NoTrans` operands with tightly-packed leading dimensions were accepted; every other combination
+  correctly returned `BackendError::Unsupported` rather than a wrong answer, but is now actually
+  computed. `validate_gemm_layout` now only rejects a leading dimension smaller than the operand it
+  describes.
+- `oxicuda-metal`: `MetalDevice` now owns a single `MTLCommandQueue`, created once and shared by every
+  compute pipeline built against it, replacing a `new_command_queue()` call inside
+  `MetalComputePipeline::new` (one queue per pipeline).
+- `oxicuda-metal`: the pipeline cache is now a bounded 64-entry LRU (`PipelineCache`) keyed on a
+  zero-allocation semantic `PipelineKey::Builtin { kind, op, dtype }` for built-in kernels (source is
+  only generated on a cache miss) or the full source text for `PipelineKey::Custom` kernels —
+  replacing an unbounded cache keyed on a 64-bit `DefaultHasher` digest of the generated source.
+- `oxicuda-metal`: reductions over >= 4096 flat elements now take a two-pass GPU path
+  (`chunked_reduce_msl`): a first pass spreads work across up to 1024 threadgroups into a scratch
+  buffer, a second folds the partials, both encoded into one command buffer.
+- `oxicuda-metal`: FFT batch execution now allocates its input/output buffers once per `execute()`
+  call (sized for the whole batch) and encodes bit-reversal plus every butterfly stage into **one**
+  command buffer with a 2-D dispatch grid (`gid.y` selects the batch row), instead of reallocating and
+  committing once per batch element.
+- `oxicuda-metal`: dispatch grid/threadgroup sizing for GEMM (1-D and 2-D) now goes through a new
+  `DispatchPlanner`, built from a `MetalDevice::capabilities()` probe (`supportsFamily:` plus the
+  driver-reported threadgroup limits) instead of hardcoded constants, and clamped against each
+  pipeline's own `max_total_threads_per_threadgroup`/`thread_execution_width`.
+- `oxicuda-metal`: `MetalBufferInfo` now records its `MTLStorageMode`, and `copy_to_device` /
+  `copy_device_to_device` call `did_modify_range` after a host write when the mode is `Managed` (the
+  correct way to publish a CPU-side write to the GPU under that storage mode). Untestable on this
+  session's Apple Silicon hardware, where `Managed` does not exist as a storage mode — compile-verified
+  only.
+- `oxicuda-metal`: `MetalBackend` gained an opt-in asynchronous dispatch mode
+  (`set_async_dispatch`/`async_dispatch`/`inflight_count`) — a committed command buffer is tracked
+  instead of awaited immediately, and is only waited on at the next real synchronisation point
+  (`synchronize`, a host read/write, `free`, a custom-kernel launch, or backend drop). **Off by
+  default** (every op still blocks until the GPU finishes, as before).
+- `oxicuda-metal`: new `MetalExternalBuffer` type gives `register_external`/`import_buffer` the same
+  signature on every platform (an alias for `metal::Buffer` on macOS, an inert unit struct elsewhere),
+  removing a macOS-only API surface gap.
+- `oxicuda-metal`: the existing `numeric` module gains full IEEE-754 binary16 conversions
+  (`f32_to_f16_bits`/`f16_bits_to_f32`, correct subnormals/ties-to-even/overflow-to-infinity/NaN
+  preservation) and host-side bf16 pack/unpack; no MSL `bfloat` kernel ships yet (needs a Metal-3.1
+  compile gate).
+- `oxicuda-metal`: new fast-math control (`MslMathMode::{Fast,Precise}`, `with_math_mode`, a
+  `#pragma METAL fp math_mode(safe)` prelude) for reduction/softmax/layernorm/F64-emulated-GEMM kernel
+  generation; default is `Fast`.
+
+### Performance
+
+- `oxicuda-webgpu`: pipeline compilation was already cached; the new `backend_cache` module extends
+  that cache to also bundle each pipeline's group-0 bind-group layout (previously re-fetched via
+  `get_bind_group_layout` on every single dispatch), and adds a second cache layer on top: for calls
+  that repeat with the same operand handles — the common training/inference loop shape — it reuses the
+  `wgpu::BindGroup` itself by refreshing a dedicated uniform buffer with `write_buffer` instead of
+  rebuilding the bind group from scratch. Correctness rests on wgpu's queue-timeline ordering guarantee
+  and on buffer handles never being reused while referenced; verified on real Metal hardware by a new
+  dedicated regression test. Cache entries are evicted on `free()` so a freed buffer is not kept alive
+  by a stale cache entry.
+
+### Added
+
+- `oxicuda-metal`: `backend/gpu_tests.rs` — on-device numeric tests comparing the new GPU dispatch
+  paths (conv2d, attention, both v2 GEMM families) against host f64 oracles on real hardware, plus
+  `tests/gpu_presence.rs` and four Criterion benchmarks (`gemm`/`reduce`/`conv2d`/`attention`).
+- `oxicuda-webgpu`: `backend_tests_gpu_ops.rs` / `backend_tests_pipeline.rs` /
+  `backend_tests_gemm_f16.rs` — dedicated regression coverage for the conv2d/attention GPU dispatch
+  grid, the new pipeline/bind-group cache (including the queue-timeline-ordering test above), and FP16
+  GEMM numerics; plus `tests/gpu_presence.rs` and the same four Criterion benchmarks as `oxicuda-metal`.
+- `oxicuda-backend`: `registry` module — `BackendRegistry`/`BackendEntry`/`SelectionRequest`, a
+  side-effect-free capability-based backend selector (`select`, `select_for_workload`,
+  `fallback_chain`, `route` by `OpClass`) that ranks registered backends by priority and capability
+  match, ending at the CPU reference backend. Powers `oxicuda::compute::default_backend()` and friends.
+- `oxicuda`: new `compute` module (`default_backend`, `gpu_backend`, `backend_for_workload`,
+  `select_backend`, `compiled_in_kinds`, `default_registry`) — probes every backend compiled into the
+  build, ranks them through `oxicuda-backend`'s new registry, and returns the best one already
+  initialised, so callers no longer need to know which GPU stack a given machine has.
+
+### Known issues
+
+- `oxicuda-webgpu`: the newly-added `tests/gpu_presence.rs::webgpu_backend_init_must_succeed` fails —
+  the test dispatches a unary op with the same handle as both input and output, which
+  `WebGpuBackend::unary` correctly rejects (wgpu forbids binding one buffer as both `read` and
+  `read_write` in one dispatch). The backend is right and the test is wrong; see `TODO.md` follow-ups.
+
 ## [0.5.4] - 2026-08-11
 
 This release adds a SIMD-flavored warp-vector expression layer to `oxicuda-ptx`'s builder DSL —

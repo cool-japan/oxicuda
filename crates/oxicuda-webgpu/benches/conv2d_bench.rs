@@ -95,7 +95,14 @@ fn bench_conv2d(criterion: &mut Criterion) {
                 &[STRIDE, STRIDE],
                 &[PAD, PAD],
             );
-            black_box(r.ok());
+            // Synchronize every iteration: the GPU dispatch path only
+            // submits (wgpu executes in FIFO order with no per-op poll), so
+            // without an explicit wait the measured time is submission
+            // latency, not GPU execution time, and unsynchronized
+            // submissions pile up across criterion's iterations — observed
+            // to overflow wgpu-core's own drop-time submission wait and
+            // panic.
+            black_box(r.and_then(|()| harness.backend.synchronize()).ok());
         });
     });
     group.finish();
