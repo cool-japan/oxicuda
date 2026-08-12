@@ -52,7 +52,12 @@ const ROWWISE_TARGET_THREADS: usize = 256;
 ///
 /// Field order and types mirror the MSL `ConvParamsV2` struct exactly; see that
 /// generator's doc comment for the authoritative byte-offset table.
-#[cfg(target_os = "macos")]
+///
+/// Defined on every platform, not just macOS: the MSL generator it mirrors is
+/// itself platform-independent, so the layout test that pins the two together
+/// can — and must — run on hosts without a Metal toolchain. Only macOS ever
+/// constructs one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct ConvParamsV2 {
@@ -72,7 +77,9 @@ struct ConvParamsV2 {
 }
 
 /// Runtime parameter buffer for [`crate::msl_nn::attention_msl_v2`].
-#[cfg(target_os = "macos")]
+///
+/// Defined on every platform for the same reason as [`ConvParamsV2`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct AttnParamsV2 {
@@ -562,6 +569,21 @@ impl MetalBackend {
         Err(oxicuda_backend::BackendError::DeviceError(
             "Metal requires macOS".into(),
         ))
+    }
+
+    /// Always `None`: with no Metal device there is no threadgroup-memory
+    /// budget to size an accumulator against, so no SIMD-group count is viable.
+    ///
+    /// Mirrored here purely so the shared numeric test module — which calls it
+    /// to prove the GPU kernel, not [`attention_host`], is what a test measured
+    /// — compiles off macOS, where every one of those tests returns early.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn attention_simdgroups(
+        &self,
+        _head_dim: usize,
+        _max_total_threads: u64,
+    ) -> Option<usize> {
+        None
     }
 
     pub(super) fn dispatch_attention(

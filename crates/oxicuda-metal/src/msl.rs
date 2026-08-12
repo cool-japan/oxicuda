@@ -1812,6 +1812,7 @@ kernel void math_mode_canary(
         assert_eq!(fields.len() * 4, CONV_PARAMS_V2_BYTES);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn msl_v2_sources_compile_on_macos() {
         use metal::{CompileOptions, Device};
