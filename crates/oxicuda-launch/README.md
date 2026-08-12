@@ -106,7 +106,7 @@ generator.
 
 | Item       | Value              |
 |------------|--------------------|
-| Version    | 0.5.4 (2026-08-11) |
+| Version    | 0.5.5 (2026-08-12) |
 | Tests      | 233 passing        |
 | Warnings   | 0                  |
 | `unwrap()` | 0                  |

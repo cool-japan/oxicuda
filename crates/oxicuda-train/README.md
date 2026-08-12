@@ -22,7 +22,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) ecosystem — Pure 
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxicuda-train = "0.5.2"
+oxicuda-train = "0.5.5"
 ```
 
 ```rust
