@@ -19,18 +19,32 @@
 //! The dgrad uses the same B^T/A^T transformation matrices as the forward
 //! pass. The key difference is that the GEMM uses the transposed filter
 //! weights and the roles of input/output are swapped.
-
-use std::sync::Arc;
+//!
+//! # Implementation status
+//!
+//! Like the forward pass ([`crate::conv::fprop::winograd`]), every stage
+//! here is a structural skeleton: `generate_grad_output_transform_ptx` and
+//! `generate_grad_input_transform_ptx` emit only step-marker `comment()`
+//! calls followed by `ret` -- no load, transform, or store. The middle
+//! stage, `launch_winograd_gemm_transposed`, launches no kernel at all.
+//! Calling [`WinogradDgrad::execute`] therefore leaves `grad_input`
+//! completely **untouched** rather than numerically wrong. This type is not
+//! reachable from the public
+//! [`conv_backward_data`](crate::conv::api::conv_backward_data) entry point
+//! (which dispatches through the separate
+//! [`DgradImplicitGemm`](crate::conv::dgrad::implicit_gemm::DgradImplicitGemm)
+//! engine instead) -- it is exercised only directly, by
+//! `gpu_tests::conv_other`'s load/launch canary tests, which assert the
+//! untouched-buffer behaviour as their PASS condition.
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::KernelBuilder;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 use super::super::descriptor::ConvProblem;
@@ -46,6 +60,11 @@ use crate::conv::fprop::winograd::WinogradTileSize;
 /// 1. Grad output transform (spatial -> Winograd domain)
 /// 2. Batched GEMM with transposed filter (per transform element)
 /// 3. Grad input transform (Winograd domain -> spatial)
+///
+/// **Not yet functional** -- see the module-level "Implementation status"
+/// section. [`execute`](Self::execute) leaves its `grad_input` argument
+/// completely untouched, and this type is not reachable from the public
+/// `conv_backward_data` API.
 pub struct WinogradDgrad {
     problem: ConvProblem,
     tile_size: WinogradTileSize,
@@ -254,6 +273,14 @@ impl WinogradDgrad {
     /// 2. Batched GEMM: multiply with transposed filter in Winograd domain
     /// 3. Inverse transform: `A^T * result * A` to get grad_input
     ///
+    /// # Warning: structural skeleton
+    ///
+    /// See the module-level "Implementation status" section: all three
+    /// phases are comment-only PTX (or, for phase 2, no kernel launch at
+    /// all). This runs fault-free and returns `Ok(())`, but `grad_input` is
+    /// left **completely untouched**. Not called from the public
+    /// `conv_backward_data` dispatcher.
+    ///
     /// # Errors
     ///
     /// Returns [`DnnError::WorkspaceRequired`] if workspace is too small.
@@ -294,13 +321,14 @@ impl WinogradDgrad {
         grad_output: &TensorDesc<T>,
         workspace: &mut oxicuda_memory::DeviceBuffer<u8>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_grad_output_transform_ptx()?;
         let name = format!(
             "winograd_dgrad_output_transform_f{}x3",
             self.tile_size.output_tile()
         );
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &name)?;
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&name, self.sm_version), &name, || {
+                self.generate_grad_output_transform_ptx()
+            })?;
 
         let out_h = self.problem.output_h()?;
         let out_w = self.problem.output_w()?;
@@ -311,9 +339,7 @@ impl WinogradDgrad {
         let tiles_w = in_w.div_ceil(ot);
         let num_tiles = tiles_h * tiles_w * self.problem.batch * self.problem.out_channels;
 
-        let block = 256u32;
-        let grid = grid_size_for(num_tiles, block);
-        let params = LaunchParams::new(grid, block);
+        let params = kernel.launch_1d(num_tiles);
 
         let args = (
             grad_output.ptr,
@@ -330,6 +356,7 @@ impl WinogradDgrad {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -357,13 +384,14 @@ impl WinogradDgrad {
         grad_input: &mut TensorDescMut<T>,
         workspace: &mut oxicuda_memory::DeviceBuffer<u8>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_grad_input_transform_ptx()?;
         let name = format!(
             "winograd_dgrad_input_transform_f{}x3",
             self.tile_size.output_tile()
         );
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &name)?;
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&name, self.sm_version), &name, || {
+                self.generate_grad_input_transform_ptx()
+            })?;
 
         let in_h = self.problem.in_dims.first().copied().unwrap_or(1);
         let in_w = self.problem.in_dims.get(1).copied().unwrap_or(1);
@@ -372,9 +400,7 @@ impl WinogradDgrad {
         let tiles_w = in_w.div_ceil(ot);
         let num_tiles = tiles_h * tiles_w * self.problem.batch * self.problem.in_channels;
 
-        let block = 256u32;
-        let grid = grid_size_for(num_tiles, block);
-        let params = LaunchParams::new(grid, block);
+        let params = kernel.launch_1d(num_tiles);
 
         let args = (
             workspace.as_device_ptr(),
@@ -387,6 +413,7 @@ impl WinogradDgrad {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 

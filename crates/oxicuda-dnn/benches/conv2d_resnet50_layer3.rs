@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use oxicuda_dnn::DnnError;
 use oxicuda_dnn::DnnHandle;
 use oxicuda_dnn::conv::conv_forward;
 use oxicuda_dnn::types::{ConvolutionDescriptor, TensorDesc, TensorDescMut};
@@ -125,6 +126,51 @@ fn bench_conv2d_resnet50_layer3(c: &mut Criterion) {
         }
     };
 
+    // `conv_forward` dispatches to whichever algorithm `select_algorithm`
+    // picks for this problem shape; for N=1,C=256,H=W=14,K=256,3x3,s1p1 that
+    // is im2col+GEMM, which requires a caller-provided scratch workspace and
+    // otherwise returns `Err(DnnError::WorkspaceRequired(bytes))` immediately
+    // -- *before* touching the GPU. A benchmark that discards that `Result`
+    // (as this one used to) times the cost of that instant early return, not
+    // a convolution. Probe for the requirement the same way
+    // `tests/conv_forward_xcorr_gpu.rs::gpu_xcorr` does: call once with no
+    // workspace, and on `WorkspaceRequired` allocate exactly the requested
+    // size and keep reusing that one buffer for every iteration below.
+    let mut workspace = match conv_forward(&handle, &input, &filter, &mut output, &conv_desc, None)
+    {
+        Ok(()) => None,
+        Err(DnnError::WorkspaceRequired(bytes)) => match DeviceBuffer::<u8>::zeroed(bytes) {
+            Ok(ws) => Some(ws),
+            Err(_) => {
+                eprintln!("skip: workspace alloc failed ({bytes} bytes)");
+                return;
+            }
+        },
+        Err(e) => panic!(
+            "conv_forward failed while probing its workspace requirement \
+             (expected either Ok or WorkspaceRequired): {e}"
+        ),
+    };
+
+    // Warm-up call through the real (workspace-bearing) path, outside the
+    // timed loop. `.expect()` here and in the timed closure below means a
+    // future regression that reintroduces an error (e.g. algorithm
+    // selection changing without updating the workspace probe) fails this
+    // benchmark loudly instead of silently timing an early return again.
+    conv_forward(
+        &handle,
+        &input,
+        &filter,
+        &mut output,
+        &conv_desc,
+        workspace.as_mut(),
+    )
+    .expect("conv_forward warm-up call must succeed once workspace is provided");
+    handle
+        .stream()
+        .synchronize()
+        .expect("synchronize after warm-up");
+
     let work = u64::from(out_elems as u32);
 
     let mut group = c.benchmark_group("dnn_p1_conv2d_resnet50_layer3");
@@ -133,7 +179,15 @@ fn bench_conv2d_resnet50_layer3(c: &mut Criterion) {
     group.throughput(Throughput::Elements(work));
     group.bench_function("oxicuda_f32_nchw_3x3_s1p1", |b| {
         b.iter(|| {
-            let _ = conv_forward(&handle, &input, &filter, &mut output, &conv_desc, None);
+            conv_forward(
+                &handle,
+                &input,
+                &filter,
+                &mut output,
+                &conv_desc,
+                workspace.as_mut(),
+            )
+            .expect("conv_forward");
         });
     });
     group.finish();

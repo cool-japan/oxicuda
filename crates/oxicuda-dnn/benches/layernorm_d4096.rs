@@ -105,11 +105,23 @@ fn bench_layernorm_d4096(c: &mut Criterion) {
 
     let work = elems as u64;
 
+    // Warm-up call outside the timed loop, plus `.expect()` inside it below:
+    // a silently-discarded `Result` here would let a future regression (or a
+    // future workspace requirement, mirroring the `conv_forward` bug this
+    // repository has already hit) time an early-return-on-error instead of
+    // the kernel this benchmark claims to measure.
+    layer_norm(&handle, &input, &gamma, &beta, &mut output, EPS)
+        .expect("layer_norm warm-up call must succeed");
+    handle
+        .stream()
+        .synchronize()
+        .expect("synchronize after warm-up");
+
     let mut group = c.benchmark_group("dnn_p5_layernorm_d4096");
     group.throughput(Throughput::Elements(work));
     group.bench_function("oxicuda_f32_n1024_d4096", |b| {
         b.iter(|| {
-            let _ = layer_norm(&handle, &input, &gamma, &beta, &mut output, EPS);
+            layer_norm(&handle, &input, &gamma, &beta, &mut output, EPS).expect("layer_norm");
         });
     });
     group.finish();

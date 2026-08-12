@@ -9,10 +9,13 @@ use std::sync::{Arc, RwLock};
 
 use oxicuda_driver::Module;
 use oxicuda_launch::{Dim3, Kernel, LaunchParams};
+use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{BlasError, BlasResult};
 use crate::types::{FillMode, MathMode, Transpose};
+
+use super::splitk::SplitKConfig;
 
 // ---------------------------------------------------------------------------
 // Problem description
@@ -149,6 +152,50 @@ struct GemmKernelKey {
     tile_config: TileConfig,
 }
 
+/// A compiled split-K partial-GEMM or reduction kernel (see
+/// [`super::splitk`]), together with the module that owns it.
+struct CompiledSplitK {
+    _module: Arc<Module>,
+    kernel: Kernel,
+}
+
+/// Owns the scratch workspace for a split-K launch, sized `split_factor *
+/// m * n` accumulator-precision elements. Freed on drop; `oxicuda-memory`'s
+/// `DeviceBuffer` allocates through the classic (non-stream-ordered)
+/// `cuMemAlloc`/`cuMemFree`, and the CUDA driver defines `cuMemFree` to block
+/// until every operation already submitted to every stream has completed —
+/// so simply letting this drop at the end of [`GemmDispatcher::dispatch_skinny_split_k`]
+/// is sufficient to guarantee both kernel launches have finished before the
+/// underlying device memory is reclaimed, with no separate synchronisation.
+enum SplitKWorkspace {
+    F32(DeviceBuffer<f32>),
+    F64(DeviceBuffer<f64>),
+}
+
+impl SplitKWorkspace {
+    fn alloc(output_type: PtxType, elements: usize) -> BlasResult<Self> {
+        match output_type {
+            PtxType::F32 => Ok(Self::F32(DeviceBuffer::<f32>::alloc(elements).map_err(
+                |e| BlasError::LaunchFailed(format!("split-K workspace alloc failed: {e}")),
+            )?)),
+            PtxType::F64 => Ok(Self::F64(DeviceBuffer::<f64>::alloc(elements).map_err(
+                |e| BlasError::LaunchFailed(format!("split-K workspace alloc failed: {e}")),
+            )?)),
+            other => Err(BlasError::UnsupportedOperation(format!(
+                "split-K workspace requires an F32 or F64 accumulator, got {}",
+                other.as_ptx_str()
+            ))),
+        }
+    }
+
+    fn device_ptr(&self) -> u64 {
+        match self {
+            Self::F32(buf) => buf.as_device_ptr(),
+            Self::F64(buf) => buf.as_device_ptr(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GemmDispatcher
 // ---------------------------------------------------------------------------
@@ -164,6 +211,16 @@ pub struct GemmDispatcher {
     sm_version: SmVersion,
     /// Cache of compiled kernels.
     compiled: RwLock<HashMap<GemmKernelKey, Arc<CompiledGemm>>>,
+    /// Cache of compiled split-K partial-GEMM kernels, keyed by accumulator
+    /// type. Unlike the reduction kernel below, this kernel's PTX has no
+    /// compile-time dependency on `split_factor` (`k_per_split`/`k_total`
+    /// are ordinary runtime kernel arguments), so one compiled module per
+    /// type serves every split factor.
+    split_k_partial: RwLock<HashMap<PtxType, Arc<CompiledSplitK>>>,
+    /// Cache of compiled split-K reduction kernels, keyed by (accumulator
+    /// type, split factor) — the reduction loop is unrolled at PTX-generation
+    /// time over `split_factor`, so each factor is a distinct kernel.
+    split_k_reduce: RwLock<HashMap<(PtxType, u32), Arc<CompiledSplitK>>>,
 }
 
 impl GemmDispatcher {
@@ -172,6 +229,8 @@ impl GemmDispatcher {
         Self {
             sm_version: sm,
             compiled: RwLock::new(HashMap::new()),
+            split_k_partial: RwLock::new(HashMap::new()),
+            split_k_reduce: RwLock::new(HashMap::new()),
         }
     }
 
@@ -209,6 +268,34 @@ impl GemmDispatcher {
         stream: &oxicuda_driver::Stream,
     ) -> BlasResult<()> {
         let category = self.classify(problem);
+
+        // GEMV-shaped problems (tiny M*N, large K — e.g. ArcFace's
+        // `1x25088 @ 25088x512` embedding projection, InSwapper's `1x512`
+        // emap projection) are classified `Skinny`, whose tile config caps
+        // the *single-pass* kernel at one thread per output element — for
+        // M=1, N=512 that is exactly 512 threads, each then reducing all
+        // 25088 K-elements serially. 512 threads is a rounding error next to
+        // what an Ampere-class GPU can schedule concurrently (tens of
+        // thousands), and no tile/grid tweak of the single-pass launch can
+        // improve on it: with one thread doing the *entire* K reduction per
+        // output element, M*N is a hard ceiling on useful parallelism.
+        // Route these through a genuine two-pass split-K launch instead,
+        // which parallelises the K reduction itself (see
+        // `dispatch_skinny_split_k` / `super::splitk`) — every output
+        // element still gets covered (this is not a substitute for grid
+        // coverage, it is additional parallelism the single-pass launch
+        // structurally cannot express.
+        if category == GemmCategory::Skinny
+            && fill_mode.is_none_or(|m| m == FillMode::Full)
+            && problem.trans_a == Transpose::NoTrans
+            && problem.trans_b == Transpose::NoTrans
+            && Self::should_use_split_k_workspace(problem)
+        {
+            return self.dispatch_skinny_split_k(
+                problem, a_ptr, b_ptr, c_ptr, alpha_bits, beta_bits, stream,
+            );
+        }
+
         let tile_config = self.heuristic_tile_config(problem, &category);
         let compiled = self.get_or_compile(problem, &tile_config, fill_mode)?;
 
@@ -674,6 +761,217 @@ impl GemmDispatcher {
         let warps_n = tc.tile_n / tc.warp_n.max(1);
         let threads = (warps_m * warps_n * WARP_SIZE).min(1024);
         Dim3::new(threads, 1, 1)
+    }
+
+    // -----------------------------------------------------------------------
+    // Split-K workspace launch (GEMV-shaped Skinny problems)
+    // -----------------------------------------------------------------------
+
+    /// Below this `M*N`, the output alone cannot occupy a modern GPU's
+    /// thread capacity (an RTX A4000: 48 SMs, up to 1536 resident threads
+    /// each == ~73728 concurrent slots; even a high-end consumer/datacenter
+    /// Ampere/Ada/Hopper part is in the same order of magnitude), so it is
+    /// always worth spending extra parallelism on splitting K instead. Above
+    /// it, the single-pass launch already has enough output elements to
+    /// keep the device busy and a second reduction pass would only add
+    /// overhead.
+    const SPLIT_K_MN_THRESHOLD: u64 = 65_536;
+
+    /// Splitting a short K into slivers adds a workspace allocation, a
+    /// second kernel launch, and a reduction pass for little or no benefit;
+    /// require at least two full `target_k_per_split`-sized partitions
+    /// (mirrors [`Self::splitk_tile_config`]'s own `target_k_per_split`).
+    const SPLIT_K_MIN_K: u32 = 512;
+
+    /// Whether `problem` should take the split-K workspace path (see
+    /// [`Self::dispatch_skinny_split_k`]) rather than the single-pass
+    /// tiled/naive kernel.
+    ///
+    /// Restricted to homogeneous precision (`input_type == output_type`, and
+    /// both `F32` or `F64`): the partial-sum kernel accumulates directly in
+    /// that type with no `F16`/`BF16` <-> accumulator conversion path. The
+    /// single-pass kernel already handles mixed precision correctly, so
+    /// declining here is a missed optimisation, never a correctness gap —
+    /// this targets the F32/F64 inference workload split-K actually helps.
+    fn should_use_split_k_workspace(problem: &GemmProblem) -> bool {
+        if problem.input_type != problem.output_type {
+            return false;
+        }
+        if !matches!(problem.output_type, PtxType::F32 | PtxType::F64) {
+            return false;
+        }
+        let mn = u64::from(problem.m) * u64::from(problem.n);
+        mn > 0 && mn < Self::SPLIT_K_MN_THRESHOLD && problem.k >= Self::SPLIT_K_MIN_K
+    }
+
+    /// Dispatches a `Skinny`-category GEMM through a two-pass split-K
+    /// launch: a partial-GEMM kernel with `gridDim.z == split_factor`
+    /// reduces disjoint K sub-ranges into a scratch workspace (so the
+    /// *reduction itself* is parallel, not just the M*N output-element
+    /// coverage the single-pass kernel is capped by — see
+    /// [`super::splitk::generate_splitk_partial_kernel`]), then a reduction
+    /// kernel sums the partitions and applies `alpha`/`beta`
+    /// ([`super::splitk::generate_splitk_reduction_kernel`]).
+    ///
+    /// Only ever called for `NoTrans` x `NoTrans`, full-write (no triangle
+    /// mask) problems with a homogeneous `F32`/`F64` accumulator — see the
+    /// call site in [`Self::dispatch`] and [`Self::should_use_split_k_workspace`].
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_skinny_split_k(
+        &self,
+        problem: &GemmProblem,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+        alpha_bits: u64,
+        beta_bits: u64,
+        stream: &oxicuda_driver::Stream,
+    ) -> BlasResult<()> {
+        // Same "~256 K-elements per partition" target as `splitk_tile_config`,
+        // clamped to [2, 32] partitions.
+        let target_k_per_split = 256u32;
+        let split_factor = (problem.k / target_k_per_split).clamp(2, 32);
+        let cfg = SplitKConfig::new(problem.k, split_factor);
+
+        let partial = self.get_or_compile_splitk_partial(problem.output_type)?;
+        let reduce = self.get_or_compile_splitk_reduce(problem.output_type, cfg.split_factor)?;
+
+        let mn = problem.m * problem.n;
+        let ws_elements = cfg.workspace_elements(problem.m, problem.n);
+        let ws_elements = usize::try_from(ws_elements).map_err(|_| {
+            BlasError::LaunchFailed(format!(
+                "split-K workspace of {ws_elements} elements overflows usize"
+            ))
+        })?;
+        // Every `(z, row, col)` workspace slot is written exactly once by
+        // the partial kernel below (see its doc comment), so an
+        // uninitialised allocation is safe: nothing is ever read before it
+        // is written.
+        let workspace = SplitKWorkspace::alloc(problem.output_type, ws_elements)?;
+        let ws_ptr = workspace.device_ptr();
+
+        // Partial pass: gridDim.z == split_factor selects the K-partition;
+        // gridDim.x * blockDim.x grid-strides over the flattened M*N output
+        // within each partition (see the kernel's own doc comment — the
+        // grid-stride loop makes any positive thread count correct, so
+        // sizing for full M*N coverage here is what buys the occupancy this
+        // path exists for, not a correctness requirement).
+        const PARTIAL_BLOCK: u32 = 256;
+        let partial_grid = Dim3::new(mn.div_ceil(PARTIAL_BLOCK).max(1), 1, cfg.split_factor);
+        let partial_block = Dim3::new(PARTIAL_BLOCK, 1, 1);
+        let partial_params = LaunchParams::new(partial_grid, partial_block);
+        let partial_args = (
+            a_ptr,
+            b_ptr,
+            ws_ptr,
+            problem.m,
+            problem.n,
+            problem.k,
+            cfg.k_per_split,
+        );
+        partial
+            .kernel
+            .launch(&partial_params, stream, &partial_args)
+            .map_err(|e| {
+                BlasError::LaunchFailed(format!("split-K partial GEMM launch failed: {e}"))
+            })?;
+
+        // Reduction pass: one thread per output element (no grid-stride in
+        // this kernel — see its doc comment), so `div_ceil` sizing here
+        // *is* a correctness requirement, not just a perf choice.
+        const REDUCE_BLOCK: u32 = 256;
+        let reduce_grid = mn.div_ceil(REDUCE_BLOCK).max(1);
+        let reduce_params = LaunchParams::new(reduce_grid, REDUCE_BLOCK);
+        let reduce_args = (ws_ptr, c_ptr, mn, alpha_bits, beta_bits);
+        reduce
+            .kernel
+            .launch(&reduce_params, stream, &reduce_args)
+            .map_err(|e| {
+                BlasError::LaunchFailed(format!("split-K reduction launch failed: {e}"))
+            })?;
+
+        // `workspace` drops here. `DeviceBuffer` frees through the classic
+        // `cuMemFree`, which the CUDA driver defines to block until every
+        // operation already submitted to every stream has completed --
+        // both kernel launches above are therefore guaranteed complete
+        // before the allocation is reclaimed, with no separate
+        // synchronisation needed for that safety property. (The *caller*
+        // still owns synchronising `stream` before reading `c_ptr` back to
+        // the host, exactly as for the single-pass launch path.)
+        Ok(())
+    }
+
+    /// Retrieves (or compiles and caches) the split-K partial-GEMM kernel
+    /// for `acc_type`. See [`super::splitk::generate_splitk_partial_kernel`].
+    fn get_or_compile_splitk_partial(&self, acc_type: PtxType) -> BlasResult<Arc<CompiledSplitK>> {
+        {
+            let cache = self.split_k_partial.read().map_err(|_| {
+                BlasError::LaunchFailed("split-K partial kernel cache lock poisoned".into())
+            })?;
+            if let Some(entry) = cache.get(&acc_type) {
+                return Ok(Arc::clone(entry));
+            }
+        }
+
+        let (kernel_name, ptx) =
+            super::splitk::generate_splitk_partial_kernel(self.sm_version, acc_type)?;
+        let module = Arc::new(
+            Module::from_ptx(&ptx)
+                .map_err(|e| BlasError::LaunchFailed(format!("module load failed: {e}")))?,
+        );
+        let kernel = Kernel::from_module(Arc::clone(&module), &kernel_name)
+            .map_err(|e| BlasError::LaunchFailed(format!("kernel lookup failed: {e}")))?;
+        let entry = Arc::new(CompiledSplitK {
+            _module: module,
+            kernel,
+        });
+
+        let mut cache = self.split_k_partial.write().map_err(|_| {
+            BlasError::LaunchFailed("split-K partial kernel cache lock poisoned".into())
+        })?;
+        cache.insert(acc_type, Arc::clone(&entry));
+        Ok(entry)
+    }
+
+    /// Retrieves (or compiles and caches) the split-K reduction kernel for
+    /// `(acc_type, split_factor)`. See
+    /// [`super::splitk::generate_splitk_reduction_kernel`].
+    fn get_or_compile_splitk_reduce(
+        &self,
+        acc_type: PtxType,
+        split_factor: u32,
+    ) -> BlasResult<Arc<CompiledSplitK>> {
+        let key = (acc_type, split_factor);
+        {
+            let cache = self.split_k_reduce.read().map_err(|_| {
+                BlasError::LaunchFailed("split-K reduction kernel cache lock poisoned".into())
+            })?;
+            if let Some(entry) = cache.get(&key) {
+                return Ok(Arc::clone(entry));
+            }
+        }
+
+        let (kernel_name, ptx) = super::splitk::generate_splitk_reduction_kernel(
+            self.sm_version,
+            acc_type,
+            split_factor,
+        )?;
+        let module = Arc::new(
+            Module::from_ptx(&ptx)
+                .map_err(|e| BlasError::LaunchFailed(format!("module load failed: {e}")))?,
+        );
+        let kernel = Kernel::from_module(Arc::clone(&module), &kernel_name)
+            .map_err(|e| BlasError::LaunchFailed(format!("kernel lookup failed: {e}")))?;
+        let entry = Arc::new(CompiledSplitK {
+            _module: module,
+            kernel,
+        });
+
+        let mut cache = self.split_k_reduce.write().map_err(|_| {
+            BlasError::LaunchFailed("split-K reduction kernel cache lock poisoned".into())
+        })?;
+        cache.insert(key, Arc::clone(&entry));
+        Ok(entry)
     }
 }
 

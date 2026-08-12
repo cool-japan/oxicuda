@@ -16,16 +16,14 @@
 //!
 //! Inspired by FlashInfer's fused MoE kernel design and Megablocks.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams};
+use oxicuda_launch::{Dim3, LaunchParams};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key_with;
 use crate::ptx_helpers;
 use crate::types::{Activation, TensorDesc, TensorDescMut, TensorLayout};
 
@@ -404,11 +402,12 @@ fn fused_moe_token_parallel<T: GpuFloat>(
     output: &mut TensorDescMut<T>,
     config: &MoeConfig,
 ) -> DnnResult<()> {
-    let ptx = generate_token_parallel_ptx::<T>(config)?;
     let kernel_name = format!("moe_fused_token_parallel_{}", T::NAME);
-
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(&kernel_name, config.sm_version, &config.codegen_key()),
+        &kernel_name,
+        || generate_token_parallel_ptx::<T>(config),
+    )?;
 
     let num_tokens = input.dims[0];
 
@@ -431,7 +430,7 @@ fn fused_moe_token_parallel<T: GpuFloat>(
         config.top_k,
     );
 
-    kernel.launch(&params, handle.stream(), &args)?;
+    kernel.kernel().launch(&params, handle.stream(), &args)?;
     Ok(())
 }
 
@@ -672,7 +671,14 @@ fn generate_token_parallel_ptx<T: GpuFloat>(config: &MoeConfig) -> DnnResult<Str
 
 /// Emits PTX instructions for the specified activation function.
 /// Returns a register containing the activated value.
-fn emit_activation_ptx<T: GpuFloat>(
+///
+/// `pub(crate)` so other DNN epilogues (e.g. the decomposed
+/// `conv::fused::apply_fused_bn_activation`) can reuse this exact,
+/// already-validated activation math instead of re-deriving it -- see
+/// `gpu_tests::moe_linear::activation_transcendental_approx_f32` for the
+/// on-device numeric validation of this function's `ex2.approx`-based
+/// transcendental approximations.
+pub(crate) fn emit_activation_ptx<T: GpuFloat>(
     b: &mut oxicuda_ptx::builder::BodyBuilder<'_>,
     val: oxicuda_ptx::ir::Register,
     activation: Activation,
@@ -921,11 +927,13 @@ fn expand_tokens_by_topk<T: GpuFloat>(
     top_k: u32,
 ) -> DnnResult<()> {
     let total = num_tokens * top_k;
-    let ptx = generate_expand_ptx::<T>(handle.sm_version(), top_k)?;
+    // `top_k` reaches code generation but not the entry name.
     let kernel_name = format!("moe_expand_tokens_{}", T::NAME);
-
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(&kernel_name, handle.sm_version(), &format!("k={top_k}")),
+        &kernel_name,
+        || generate_expand_ptx::<T>(handle.sm_version(), top_k),
+    )?;
 
     let grid_x = hidden_dim.div_ceil(256);
     let grid = Dim3::new(grid_x, total, 1);
@@ -940,7 +948,7 @@ fn expand_tokens_by_topk<T: GpuFloat>(
         top_k,
     );
 
-    kernel.launch(&params, handle.stream(), &args)?;
+    kernel.kernel().launch(&params, handle.stream(), &args)?;
     Ok(())
 }
 
@@ -1024,11 +1032,16 @@ fn apply_activation_inplace<T: GpuFloat>(
         return Ok(());
     }
 
-    let ptx = generate_activation_ptx::<T>(activation, sm)?;
+    // The activation selects an entirely different transcendental body but is
+    // absent from the entry name, so it must discriminate the key -- otherwise
+    // a GELU epilogue would be served the ReLU module compiled earlier on the
+    // same handle.
     let kernel_name = format!("moe_activation_{}", T::NAME);
-
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(&kernel_name, sm, &format!("act={activation:?}")),
+        &kernel_name,
+        || generate_activation_ptx::<T>(activation, sm),
+    )?;
 
     let block = 256u32;
     let n = num_elements as u32;
@@ -1037,7 +1050,7 @@ fn apply_activation_inplace<T: GpuFloat>(
 
     let args = (buffer.as_device_ptr(), n);
 
-    kernel.launch(&params, handle.stream(), &args)?;
+    kernel.kernel().launch(&params, handle.stream(), &args)?;
     Ok(())
 }
 

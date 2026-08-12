@@ -14,10 +14,14 @@ categories = ["hardware-support", "memory-management"]
 [dependencies]
 oxicuda-driver.workspace = true
 tracing.workspace = true
+half = { workspace = true, optional = true }
 
 [features]
 default = []
 gpu-tests = ["oxicuda-driver/gpu-tests"]
+# `StagingPod` impls for `half::f16` / `half::bf16` so reduced-precision
+# tensors can use `StagingBuffer`'s in-place fast paths.
+half = ["dep:half"]
 pool = []
 
 [dev-dependencies]

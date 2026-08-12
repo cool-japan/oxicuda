@@ -21,17 +21,14 @@
 //! The wgrad is typically the most expensive backward pass because it
 //! accumulates over the entire batch dimension.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::KernelBuilder;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 use super::super::descriptor::ConvProblem;
@@ -60,6 +57,12 @@ impl WgradImplicitGemm {
     }
 
     /// Returns the kernel name.
+    ///
+    /// [`Self::generate_ptx`]'s body (`emit_wgrad_body`) takes no code-gen
+    /// parameters at all — it is a structural skeleton whose only
+    /// precision-dependent aspect is the entry signature — so the precision
+    /// alone is a complete compiled-module cache key for a given target
+    /// architecture.
     #[must_use]
     pub fn kernel_name(&self) -> String {
         let prec = self.problem.input_type.as_ptx_str().trim_start_matches('.');
@@ -138,9 +141,11 @@ impl WgradImplicitGemm {
         grad_output: &TensorDesc<T>,
         grad_filter: &mut TensorDescMut<T>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_ptx()?;
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &self.kernel_name())?;
+        let entry = self.kernel_name();
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&entry, self.sm_version), &entry, || {
+                self.generate_ptx()
+            })?;
 
         let out_dims = self.problem.output_dims()?;
         let out_h = out_dims.first().copied().unwrap_or(1);
@@ -151,9 +156,7 @@ impl WgradImplicitGemm {
         let channels_per_group = self.problem.in_channels / self.problem.groups;
         let total_elements = self.problem.out_channels * channels_per_group * filter_volume;
 
-        let block_size = 256u32;
-        let grid = grid_size_for(total_elements, block_size);
-        let params = LaunchParams::new(grid, block_size);
+        let params = kernel.launch_1d(total_elements);
 
         let args = (
             input.ptr,
@@ -177,6 +180,7 @@ impl WgradImplicitGemm {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 

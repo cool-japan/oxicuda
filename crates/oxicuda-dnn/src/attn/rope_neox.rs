@@ -43,16 +43,14 @@
 //! dimension), positions are implicit `0..seq_len`, and the operation is
 //! out-of-place (`input` → `output`). This matches trustformers' `rope_f32`.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{Dim3, LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key_with;
 
 /// Applies GPT-NeoX half-split partial-rotary RoPE to a device tensor.
 ///
@@ -131,9 +129,14 @@ pub fn rope_neox_half_split_f32(
 
     let sm = handle.sm_version();
     let kernel_name = "rope_neox_half_split_f32".to_string();
-    let ptx = generate_rope_neox_ptx::<f32>(&kernel_name, sm, head_dim, rotary_dim)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    // The entry name is a fixed literal, yet the generator *unrolls* the
+    // pass-through tail `[rotary_dim, head_dim)` at code-generation time. Both
+    // dimensions must therefore discriminate the cache key.
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(&kernel_name, sm, &format!("hd={head_dim},rd={rotary_dim}")),
+        &kernel_name,
+        || generate_rope_neox_ptx::<f32>(&kernel_name, sm, head_dim, rotary_dim),
+    )?;
 
     let block_dim = 256u32;
     let grid_x = grid_size_for(total_pairs as u32, block_dim);
@@ -144,7 +147,7 @@ pub fn rope_neox_half_split_f32(
         .shared_mem(0)
         .build();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &params,
         handle.stream(),
         &(

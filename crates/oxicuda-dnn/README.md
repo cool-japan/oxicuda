@@ -18,10 +18,15 @@ generation. `DnnHandle` manages a CUDA stream, a BLAS sub-handle, and a PTX
 cache so that compiled kernels are reused across calls.
 
 Algorithm selection is automatic: the convolution dispatcher benchmarks
-implicit-GEMM, im2col+GEMM, Winograd, direct, and FFT-based strategies and
-picks the fastest for each problem shape. Fused kernels (conv+BN+ReLU,
-LayerNorm+activation, fused_add_rms_norm) are provided to minimize global
-memory traffic.
+implicit-GEMM, im2col+GEMM, direct, and FFT-based strategies and picks the
+fastest for each problem shape. Winograd is implemented as a strategy too,
+but is currently gated off pending real forward/backward kernels -- see
+`conv::algo_select::winograd_forward_implemented` -- so it is never
+selected. Fused epilogues (conv+BN+ReLU, LayerNorm+activation,
+fused_add_rms_norm) are provided to minimize global memory traffic;
+conv+BN+ReLU in particular is a decomposed real convolution plus a combined
+BN-affine + activation kernel pass, not a single monolithic kernel (see
+"Supported Operations" below).
 
 ## Modules
 
@@ -73,11 +78,27 @@ fn main() -> DnnResult<()> {
 |-----------|---------|-------|-------|
 | Implicit GEMM | yes | yes | yes |
 | im2col + GEMM | yes | -- | -- |
-| Winograd F(2,3) / F(4,3) | yes | -- | -- |
+| Winograd F(2,3) / F(4,3) | skeleton¹ | skeleton¹ | skeleton¹ |
 | Direct (1x1, depthwise) | yes | -- | -- |
 | FFT-based | yes | -- | -- |
 
-Fused: conv + BatchNorm + ReLU in a single kernel launch.
+¹ Tile selection, workspace sizing, and transform-matrix constants exist
+for all three (`conv/fprop/winograd.rs`, `conv/dgrad/winograd.rs`,
+`conv/wgrad/winograd.rs`), but the kernel bodies are load/launch-only
+skeletons that perform no numeric work (they leave the output buffer
+untouched rather than computing a wrong answer). The forward dispatcher
+(`conv::algo_select`) is gated to never route convolutions to it, falling
+back to im2col+GEMM / implicit-GEMM instead; the dgrad/wgrad variants are
+not wired into `conv_backward_data`/`conv_backward_filter` at all (those
+use separate implicit-GEMM engines) and are only reachable by constructing
+`WinogradDgrad`/`WinogradWgrad` directly. See each file's "Implementation
+status" module docs.
+
+Fused: conv + BatchNorm + ReLU via `conv_bn_relu` -- decomposed into a real
+convolution dispatch plus one combined BN-affine + activation kernel pass,
+not a single monolithic kernel launch. (The single-kernel `FusedConvBnAct`
+engine also exists in `conv/fused.rs`, but its kernel body is currently a
+load/launch-only skeleton and is not used by `conv_bn_relu`.)
 
 ### Attention
 

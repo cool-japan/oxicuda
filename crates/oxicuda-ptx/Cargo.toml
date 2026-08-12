@@ -15,6 +15,14 @@ categories = ["development-tools", "hardware-support"]
 oxicuda-driver.workspace = true
 thiserror.workspace = true
 
+[features]
+default = []
+# On-device sanity checks that query a real GPU (via oxicuda-driver) and
+# compare live hardware attributes against the constants in `arch::SmVersion`.
+# Requires a CUDA driver + device at runtime; every such test skips
+# gracefully when none is present. See `arch::gpu_tests`.
+gpu-tests = ["oxicuda-driver/gpu-tests"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

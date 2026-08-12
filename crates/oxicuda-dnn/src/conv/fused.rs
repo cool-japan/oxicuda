@@ -22,19 +22,33 @@
 //! ```text
 //! output[n, c, h, w] = activation(conv_out[n, c, h, w] * fused_scale[c] + fused_bias[c])
 //! ```
-
-use std::sync::Arc;
+//!
+//! # Implementation status
+//!
+//! [`FusedConvBnAct`] is the *aspirational* single-kernel implementation of
+//! the pattern above (convolution reduction, BN epilogue, and activation
+//! all in one launch). Its PTX body is currently a structural skeleton --
+//! see that type's docs -- so it is intentionally **not** called by the
+//! public [`conv_bn_relu`](super::api::conv_bn_relu) entry point. Instead,
+//! `conv_bn_relu` decomposes into a real convolution dispatch followed by
+//! `apply_fused_bn_activation` (crate-private, below), which applies the
+//! epilogue above (BN affine + activation, combined into one elementwise
+//! kernel pass) to the convolution's output in place. This still saves one
+//! memory round-trip relative to three fully separate conv/BN/activation
+//! kernels, even though it is not the zero-round-trip single-kernel fusion
+//! this module was originally written to describe.
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::KernelBuilder;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
-use crate::types::{Activation, TensorDesc, TensorDescMut};
+use crate::kernel_cache::cache_key;
+use crate::moe::fused_moe::emit_activation_ptx as emit_shared_activation_ptx;
+use crate::ptx_helpers;
+use crate::types::{Activation, TensorDesc, TensorDescMut, TensorLayout};
 
 use super::descriptor::ConvProblem;
 
@@ -87,6 +101,12 @@ impl FusedConvBnAct {
     }
 
     /// Returns the kernel name.
+    ///
+    /// The activation is the only code-generation parameter
+    /// [`Self::generate_ptx`] passes to its body emitter, and the precision is
+    /// the only other thing that shapes the entry signature; both appear here,
+    /// so this name is a complete compiled-module cache key for a given target
+    /// architecture.
     #[must_use]
     pub fn kernel_name(&self) -> String {
         let prec = self.problem.input_type.as_ptx_str().trim_start_matches('.');
@@ -155,6 +175,24 @@ impl FusedConvBnAct {
     ///
     /// * `bn_params` — Pre-computed fused BN scale and bias (device pointers).
     ///
+    /// # Warning: structural skeleton
+    ///
+    /// `emit_fused_body` -- the PTX body this launches -- currently emits
+    /// only step-marker `comment()`s narrating the convolution reduction,
+    /// BN epilogue, and activation, followed immediately by `ret`. The
+    /// kernel launches and synchronises fault-free but performs **no
+    /// convolution, no load, and no store**: `output` is left completely
+    /// untouched. This is exercised deliberately as a "load/launch-only
+    /// fragment" canary in `gpu_tests::conv_fprop::fused_conv_bn_relu_f32_launches`,
+    /// which asserts the untouched-buffer behaviour rather than a (currently
+    /// impossible) numeric result.
+    ///
+    /// Because of this, the public [`conv_bn_relu`](super::api::conv_bn_relu)
+    /// entry point does **not** call this method -- it decomposes into a
+    /// real convolution dispatch plus `apply_fused_bn_activation` instead.
+    /// Call this method directly only if you specifically want to exercise
+    /// (or, once implemented, benchmark) the single-kernel path itself.
+    ///
     /// # Errors
     ///
     /// Returns errors from PTX generation, module loading, or kernel launch.
@@ -166,18 +204,18 @@ impl FusedConvBnAct {
         output: &mut TensorDescMut<T>,
         bn_params: &FusedBnParams,
     ) -> DnnResult<()> {
-        let ptx = self.generate_ptx()?;
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &self.kernel_name())?;
+        let entry = self.kernel_name();
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&entry, self.sm_version), &entry, || {
+                self.generate_ptx()
+            })?;
 
         let out_dims = self.problem.output_dims()?;
         let out_h = out_dims.first().copied().unwrap_or(1);
         let out_w = out_dims.get(1).copied().unwrap_or(1);
         let total_outputs = self.problem.batch * self.problem.out_channels * out_h * out_w;
 
-        let block_size = 256u32;
-        let grid = grid_size_for(total_outputs, block_size);
-        let params = LaunchParams::new(grid, block_size);
+        let params = kernel.launch_1d(total_outputs);
 
         let args = (
             input.ptr,
@@ -203,6 +241,7 @@ impl FusedConvBnAct {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -355,6 +394,204 @@ pub fn compute_fused_bn_params(
     }
 
     Ok((fused_scale, fused_bias))
+}
+
+// ---------------------------------------------------------------------------
+// Decomposed BN + activation epilogue (used by `conv_bn_relu`)
+// ---------------------------------------------------------------------------
+
+/// Applies the pre-computed fused per-channel batch-norm affine transform
+/// followed by an activation, **in place**, over a convolution's output
+/// tensor:
+///
+/// ```text
+/// x[n, c, ...] = activation(x[n, c, ...] * fused_scale[c] + fused_bias[c])
+/// ```
+///
+/// This is the real, numerically-verified epilogue half of
+/// [`conv_bn_relu`](super::api::conv_bn_relu)'s decomposition. It combines
+/// the BN affine and the activation into a single elementwise kernel pass
+/// (one load, one store per element), reusing the exact activation math
+/// already validated on-device for the MoE epilogue
+/// ([`crate::moe::fused_moe::emit_activation_ptx`], see
+/// `gpu_tests::moe_linear::activation_transcendental_approx_f32`) rather
+/// than re-deriving the transcendental approximations a second time.
+///
+/// `problem` describes the *convolution* that produced `buffer` (its
+/// `out_channels`, `output_h`/`output_w`, `batch`, and `layout` are what
+/// determine the per-element channel index); `buffer`'s element count must
+/// match `problem.batch * problem.out_channels * output_h * output_w`.
+///
+/// # Errors
+///
+/// Returns [`DnnError::UnsupportedOperation`] for tensor layouts other than
+/// NCHW/NHWC (the only layouts [`super::api::conv_forward`] itself
+/// supports for 2-D convolution, so no real caller can reach this with
+/// anything else). Returns errors from PTX generation, module loading, or
+/// kernel launch.
+pub(crate) fn apply_fused_bn_activation<T: GpuFloat>(
+    handle: &DnnHandle,
+    buffer: &mut TensorDescMut<T>,
+    problem: &ConvProblem,
+    bn_params: &FusedBnParams,
+    activation: Activation,
+) -> DnnResult<()> {
+    let channels_last = match problem.layout {
+        TensorLayout::Nchw => false,
+        TensorLayout::Nhwc => true,
+        other => {
+            return Err(DnnError::UnsupportedOperation(format!(
+                "fused BN+activation epilogue supports NCHW/NHWC only, got {other:?}"
+            )));
+        }
+    };
+
+    let out_h = problem.output_h()?;
+    let out_w = problem.output_w()?;
+    let spatial = out_h * out_w;
+    let channels = problem.out_channels;
+    let num_elements = problem.batch * channels * spatial;
+
+    // Nothing to do for a degenerate (zero-sized) tensor.
+    if num_elements == 0 {
+        return Ok(());
+    }
+
+    let sm = handle.sm_version();
+    let entry = fused_bn_activation_kernel_name::<T>(activation, channels_last);
+    let kernel = handle.get_or_compile_kernel(&cache_key(&entry, sm), &entry, || {
+        generate_fused_bn_activation_ptx::<T>(sm, activation, channels_last)
+    })?;
+
+    let params = kernel.launch_1d(num_elements);
+
+    let args = (
+        buffer.ptr,
+        bn_params.fused_scale_ptr,
+        bn_params.fused_bias_ptr,
+        num_elements,
+        channels,
+        spatial,
+    );
+
+    kernel
+        .kernel()
+        .launch(&params, handle.stream(), &args)
+        .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Kernel name for [`apply_fused_bn_activation`]'s epilogue, encoding
+/// precision, activation, and layout so distinct variants never collide in
+/// the module cache.
+fn fused_bn_activation_kernel_name<T: GpuFloat>(
+    activation: Activation,
+    channels_last: bool,
+) -> String {
+    let act = fused_bn_activation_name(activation);
+    let layout = if channels_last { "nhwc" } else { "nchw" };
+    format!("fused_bn_act_{act}_{}_{layout}", T::NAME)
+}
+
+/// Short activation-name suffix used in generated kernel names.
+fn fused_bn_activation_name(activation: Activation) -> &'static str {
+    match activation {
+        Activation::Relu => "relu",
+        Activation::Gelu => "gelu",
+        Activation::GeluTanh => "gelu_tanh",
+        Activation::Silu => "silu",
+        Activation::Sigmoid => "sigmoid",
+        Activation::Tanh => "tanh",
+        Activation::None => "identity",
+    }
+}
+
+/// Generates PTX for [`apply_fused_bn_activation`]'s epilogue kernel.
+///
+/// Kernel parameters (in this exact order -- must match the launch args
+/// tuple in [`apply_fused_bn_activation`]):
+/// - `data`         (u64) -- tensor to transform in place
+/// - `fused_scale`  (u64) -- per-channel scale, length `channels`
+/// - `fused_bias`   (u64) -- per-channel bias, length `channels`
+/// - `num_elements` (u32) -- total element count (`batch*channels*spatial`)
+/// - `channels`     (u32)
+/// - `spatial`      (u32) -- `out_h * out_w`
+///
+/// One thread per element; the channel index is recovered from the
+/// flattened element index according to `channels_last`:
+/// - NCHW (`channels_last == false`): `c = (idx / spatial) % channels`
+/// - NHWC (`channels_last == true`):  `c = idx % channels`
+fn generate_fused_bn_activation_ptx<T: GpuFloat>(
+    sm: SmVersion,
+    activation: Activation,
+    channels_last: bool,
+) -> DnnResult<String> {
+    let name = fused_bn_activation_kernel_name::<T>(activation, channels_last);
+    let elem_bytes = T::SIZE as u32;
+
+    let ptx = KernelBuilder::new(&name)
+        .target(sm)
+        .param("data", PtxType::U64)
+        .param("fused_scale", PtxType::U64)
+        .param("fused_bias", PtxType::U64)
+        .param("num_elements", PtxType::U32)
+        .param("channels", PtxType::U32)
+        .param("spatial", PtxType::U32)
+        .body(move |b| {
+            b.comment("=== Decomposed Conv+BN+Act epilogue ===");
+            b.comment("x = activation(x * fused_scale[c] + fused_bias[c])");
+
+            let gid = b.global_thread_id_x();
+            let n = b.load_param_u32("num_elements");
+
+            let exit_lbl = b.fresh_label("exit");
+            let oob = b.alloc_reg(PtxType::Pred);
+            b.raw_ptx(&format!("setp.ge.u32 {oob}, {gid}, {n};"));
+            b.branch_if(oob, &exit_lbl);
+
+            let channels = b.load_param_u32("channels");
+
+            // Recover the channel index from the flattened element index.
+            let c = if channels_last {
+                b.comment("NHWC: channel is the fastest-varying index");
+                let c = b.alloc_reg(PtxType::U32);
+                b.raw_ptx(&format!("rem.u32 {c}, {gid}, {channels};"));
+                c
+            } else {
+                b.comment("NCHW: channel is the second-slowest-varying index");
+                let spatial = b.load_param_u32("spatial");
+                let n_hw = b.alloc_reg(PtxType::U32);
+                b.raw_ptx(&format!("div.u32 {n_hw}, {gid}, {spatial};"));
+                let c = b.alloc_reg(PtxType::U32);
+                b.raw_ptx(&format!("rem.u32 {c}, {n_hw}, {channels};"));
+                c
+            };
+
+            let data_ptr = b.load_param_u64("data");
+            let addr = b.byte_offset_addr(data_ptr, gid, elem_bytes);
+            let x = ptx_helpers::load_global_float::<T>(b, addr.clone());
+
+            let scale_ptr = b.load_param_u64("fused_scale");
+            let bias_ptr = b.load_param_u64("fused_bias");
+            let scale_addr = b.byte_offset_addr(scale_ptr, c.clone(), elem_bytes);
+            let bias_addr = b.byte_offset_addr(bias_ptr, c, elem_bytes);
+            let scale = ptx_helpers::load_global_float::<T>(b, scale_addr);
+            let bias = ptx_helpers::load_global_float::<T>(b, bias_addr);
+
+            // affine = x * fused_scale[c] + fused_bias[c]
+            let affine = ptx_helpers::fma_float::<T>(b, x, scale, bias);
+            let activated = emit_shared_activation_ptx::<T>(b, affine, activation);
+
+            ptx_helpers::store_global_float::<T>(b, addr, activated);
+
+            b.label(&exit_lbl);
+            b.ret();
+        })
+        .build()
+        .map_err(|e| DnnError::PtxGeneration(e.to_string()))?;
+
+    Ok(ptx)
 }
 
 #[cfg(test)]

@@ -123,11 +123,36 @@ fn bench_batchnorm_inference(c: &mut Criterion) {
 
     let work = elems as u64;
 
+    // Warm-up call outside the timed loop, plus `.expect()` inside it below:
+    // a silently-discarded `Result` here would let a future regression (or a
+    // future workspace requirement, mirroring the `conv_forward` bug this
+    // repository has already hit) time an early-return-on-error instead of
+    // the kernel this benchmark claims to measure.
+    batch_norm_forward(
+        &handle,
+        &input,
+        &gamma,
+        &beta,
+        &mut running_mean,
+        &mut running_var,
+        &mut output,
+        EPS,
+        MOMENTUM,
+        false, // inference mode
+        None,
+        None,
+    )
+    .expect("batch_norm_forward warm-up call must succeed");
+    handle
+        .stream()
+        .synchronize()
+        .expect("synchronize after warm-up");
+
     let mut group = c.benchmark_group("dnn_p7_batchnorm_inference");
     group.throughput(Throughput::Elements(work));
     group.bench_function("oxicuda_f32_n64_c256_28x28", |b| {
         b.iter(|| {
-            let _ = batch_norm_forward(
+            batch_norm_forward(
                 &handle,
                 &input,
                 &gamma,
@@ -140,7 +165,8 @@ fn bench_batchnorm_inference(c: &mut Criterion) {
                 false, // inference mode
                 None,
                 None,
-            );
+            )
+            .expect("batch_norm_forward");
         });
     });
     group.finish();

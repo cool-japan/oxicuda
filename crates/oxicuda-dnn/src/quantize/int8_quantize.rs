@@ -3,16 +3,14 @@
 //! Uses symmetric quantization: `scale = absmax / 127.0`, then each value
 //! is divided by scale and clamped to [-127, 127].
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 use crate::types::{TensorDesc, TensorDescMut};
 
@@ -57,23 +55,28 @@ pub fn quantize_to_int8<T: GpuFloat>(
     let n_u32 = n as u32;
 
     // Step 1: Absmax (reuse FP8's absmax kernel pattern, but with INT8 scale divisor)
-    let absmax_ptx = generate_int8_absmax_ptx::<T>(handle.sm_version())?;
-    let absmax_mod = Arc::new(Module::from_ptx(&absmax_ptx)?);
     let absmax_name = format!("dnn_int8_absmax_{}", T::NAME);
-    let absmax_kernel = Kernel::from_module(absmax_mod, &absmax_name)?;
+    let absmax_kernel = handle.get_or_compile_kernel(
+        &cache_key(&absmax_name, handle.sm_version()),
+        &absmax_name,
+        || generate_int8_absmax_ptx::<T>(handle.sm_version()),
+    )?;
 
     let params1 = LaunchParams::new(1u32, INT8_QUANT_BLOCK);
     let args1 = (input.ptr, scale.as_device_ptr(), n_u32);
 
     absmax_kernel
+        .kernel()
         .launch(&params1, handle.stream(), &args1)
         .map_err(|e| DnnError::LaunchFailed(format!("int8 absmax: {e}")))?;
 
     // Step 2: Quantize
-    let quant_ptx = generate_int8_quant_ptx::<T>(handle.sm_version())?;
-    let quant_mod = Arc::new(Module::from_ptx(&quant_ptx)?);
     let quant_name = format!("dnn_int8_quantize_{}", T::NAME);
-    let quant_kernel = Kernel::from_module(quant_mod, &quant_name)?;
+    let quant_kernel = handle.get_or_compile_kernel(
+        &cache_key(&quant_name, handle.sm_version()),
+        &quant_name,
+        || generate_int8_quant_ptx::<T>(handle.sm_version()),
+    )?;
 
     let grid = grid_size_for(n_u32, INT8_QUANT_BLOCK);
     let params2 = LaunchParams::new(grid, INT8_QUANT_BLOCK);
@@ -85,6 +88,7 @@ pub fn quantize_to_int8<T: GpuFloat>(
     );
 
     quant_kernel
+        .kernel()
         .launch(&params2, handle.stream(), &args2)
         .map_err(|e| DnnError::LaunchFailed(format!("int8 quantize: {e}")))?;
 
@@ -129,16 +133,18 @@ pub fn dequantize_from_int8<T: GpuFloat>(
         });
     }
 
-    let ptx = generate_int8_dequant_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let name = format!("dnn_int8_dequantize_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &name)?;
+    let kernel =
+        handle.get_or_compile_kernel(&cache_key(&name, handle.sm_version()), &name, || {
+            generate_int8_dequant_ptx::<T>(handle.sm_version())
+        })?;
 
     let grid = grid_size_for(n, INT8_QUANT_BLOCK);
     let params = LaunchParams::new(grid, INT8_QUANT_BLOCK);
     let args = (input.as_device_ptr(), scale.as_device_ptr(), output.ptr, n);
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("int8 dequantize: {e}")))?;
 

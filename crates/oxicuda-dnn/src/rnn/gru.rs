@@ -11,11 +11,8 @@
 //!
 //! Each GPU thread handles one `(batch, hidden_unit)` pair.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::ir::PtxType;
@@ -23,6 +20,7 @@ use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 
 /// Block size for GRU gate-fusion kernels.
@@ -142,10 +140,12 @@ pub fn gru_cell_forward<T: GpuFloat>(
         });
     }
 
-    let ptx = generate_gru_fused_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let kernel_name = format!("dnn_gru_fused_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_gru_fused_ptx::<T>(handle.sm_version()),
+    )?;
 
     let total_threads = bh as u32;
     let grid = grid_size_for(total_threads, GRU_BLOCK);
@@ -164,6 +164,7 @@ pub fn gru_cell_forward<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("GRU cell forward: {e}")))?;
 
@@ -243,10 +244,12 @@ pub fn gru_sequence_forward<T: GpuFloat>(
     }
 
     // Generate the kernel once
-    let ptx = generate_gru_fused_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let kernel_name = format!("dnn_gru_fused_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_gru_fused_ptx::<T>(handle.sm_version()),
+    )?;
 
     let total_threads = bh as u32;
     let grid = grid_size_for(total_threads, GRU_BLOCK);
@@ -273,6 +276,7 @@ pub fn gru_sequence_forward<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args_0)
         .map_err(|e| DnnError::LaunchFailed(format!("GRU sequence t=0: {e}")))?;
 
@@ -295,15 +299,18 @@ pub fn gru_sequence_forward<T: GpuFloat>(
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args_t)
             .map_err(|e| DnnError::LaunchFailed(format!("GRU sequence t={t}: {e}")))?;
     }
 
     // Copy final hidden state: h_seq[last] -> h_n via copy kernel
-    let copy_ptx = generate_copy_kernel_ptx_gru::<T>(handle.sm_version())?;
-    let copy_mod = Arc::new(Module::from_ptx(&copy_ptx)?);
     let copy_name = format!("dnn_gru_copy_{}", T::NAME);
-    let copy_kernel_fn = Kernel::from_module(copy_mod, &copy_name)?;
+    let copy_kernel_fn = handle.get_or_compile_kernel(
+        &cache_key(&copy_name, handle.sm_version()),
+        &copy_name,
+        || generate_copy_kernel_ptx_gru::<T>(handle.sm_version()),
+    )?;
 
     let copy_n = bh as u32;
     let copy_grid = grid_size_for(copy_n, GRU_BLOCK);
@@ -312,6 +319,7 @@ pub fn gru_sequence_forward<T: GpuFloat>(
     let copy_args = (h_last_ptr, h_n.as_device_ptr(), copy_n);
 
     copy_kernel_fn
+        .kernel()
         .launch(&copy_params, handle.stream(), &copy_args)
         .map_err(|e| DnnError::LaunchFailed(format!("GRU copy final h: {e}")))?;
 

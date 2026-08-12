@@ -29,18 +29,33 @@
 //! ```
 //!
 //! In practice, we pre-compute these inverse matrices at compile time.
-
-use std::sync::Arc;
+//!
+//! # Implementation status
+//!
+//! Like the forward pass ([`crate::conv::fprop::winograd`]), every stage
+//! here is a structural skeleton: the three PTX generators
+//! (`generate_input_transform_ptx`, `generate_grad_output_transform_ptx`,
+//! `generate_filter_grad_transform_ptx`) emit only step-marker `comment()`
+//! calls followed by `ret` -- no load, transform, or store. The
+//! accumulation stage, `launch_winograd_gemm_accum`, launches no kernel at
+//! all. Calling [`WinogradWgrad::execute`] therefore leaves `grad_filter`
+//! completely **untouched** rather than numerically wrong. This type is not
+//! reachable from the public
+//! [`conv_backward_filter`](crate::conv::api::conv_backward_filter) entry
+//! point (which dispatches through the separate
+//! [`WgradImplicitGemm`](crate::conv::wgrad::implicit_gemm::WgradImplicitGemm)
+//! engine instead) -- it is exercised only directly, by
+//! `gpu_tests::conv_other`'s load/launch canary tests, which assert the
+//! untouched-buffer behaviour as their PASS condition.
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::KernelBuilder;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 use super::super::descriptor::ConvProblem;
@@ -107,6 +122,11 @@ const G_INV_T_F4X3: [[f32; 3]; 6] = [
 /// 2. Grad output transform (same as dgrad)
 /// 3. Batched GEMM (accumulate over batch and tiles)
 /// 4. Inverse filter transform (G^{-1} * result * G^{-T})
+///
+/// **Not yet functional** -- see the module-level "Implementation status"
+/// section. [`execute`](Self::execute) leaves its `grad_filter` argument
+/// completely untouched, and this type is not reachable from the public
+/// `conv_backward_filter` API.
 pub struct WinogradWgrad {
     problem: ConvProblem,
     tile_size: WinogradTileSize,
@@ -363,6 +383,14 @@ impl WinogradWgrad {
     /// 3. Batched GEMM: accumulate `grad_filter_wino[xi] += d_grad[xi]^T * d_input[xi]`
     /// 4. Inverse filter transform: `G^{-1} * grad_filter_wino * G^{-T}`
     ///
+    /// # Warning: structural skeleton
+    ///
+    /// See the module-level "Implementation status" section: all four
+    /// phases are comment-only PTX (or, for phase 3, no kernel launch at
+    /// all). This runs fault-free and returns `Ok(())`, but `grad_filter`
+    /// is left **completely untouched**. Not called from the public
+    /// `conv_backward_filter` dispatcher.
+    ///
     /// # Errors
     ///
     /// Returns [`DnnError::WorkspaceRequired`] if workspace is too small.
@@ -405,13 +433,14 @@ impl WinogradWgrad {
         input: &TensorDesc<T>,
         workspace: &mut oxicuda_memory::DeviceBuffer<u8>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_input_transform_ptx()?;
         let name = format!(
             "winograd_wgrad_input_transform_f{}x3",
             self.tile_size.output_tile()
         );
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &name)?;
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&name, self.sm_version), &name, || {
+                self.generate_input_transform_ptx()
+            })?;
 
         let out_h = self.problem.output_h()?;
         let out_w = self.problem.output_w()?;
@@ -420,9 +449,7 @@ impl WinogradWgrad {
         let tiles_w = out_w.div_ceil(ot);
         let num_tiles = tiles_h * tiles_w * self.problem.batch * self.problem.in_channels;
 
-        let block = 256u32;
-        let grid = grid_size_for(num_tiles, block);
-        let params = LaunchParams::new(grid, block);
+        let params = kernel.launch_1d(num_tiles);
 
         let args = (
             input.ptr,
@@ -439,6 +466,7 @@ impl WinogradWgrad {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -451,13 +479,14 @@ impl WinogradWgrad {
         grad_output: &TensorDesc<T>,
         workspace: &mut oxicuda_memory::DeviceBuffer<u8>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_grad_output_transform_ptx()?;
         let name = format!(
             "winograd_wgrad_grad_output_transform_f{}x3",
             self.tile_size.output_tile()
         );
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &name)?;
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&name, self.sm_version), &name, || {
+                self.generate_grad_output_transform_ptx()
+            })?;
 
         let out_h = self.problem.output_h()?;
         let out_w = self.problem.output_w()?;
@@ -466,9 +495,7 @@ impl WinogradWgrad {
         let tiles_w = out_w.div_ceil(ot);
         let num_tiles = tiles_h * tiles_w * self.problem.batch * self.problem.out_channels;
 
-        let block = 256u32;
-        let grid = grid_size_for(num_tiles, block);
-        let params = LaunchParams::new(grid, block);
+        let params = kernel.launch_1d(num_tiles);
 
         let args = (
             grad_output.ptr,
@@ -483,6 +510,7 @@ impl WinogradWgrad {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -509,19 +537,18 @@ impl WinogradWgrad {
         grad_filter: &mut TensorDescMut<T>,
         workspace: &mut oxicuda_memory::DeviceBuffer<u8>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_filter_grad_transform_ptx()?;
         let name = format!(
             "winograd_wgrad_filter_transform_f{}x3",
             self.tile_size.output_tile()
         );
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &name)?;
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&name, self.sm_version), &name, || {
+                self.generate_filter_grad_transform_ptx()
+            })?;
 
         let num_filters = self.problem.out_channels * self.problem.in_channels;
 
-        let block = 256u32;
-        let grid = grid_size_for(num_filters, block);
-        let params = LaunchParams::new(grid, block);
+        let params = kernel.launch_1d(num_filters);
 
         let args = (
             workspace.as_device_ptr(),
@@ -532,6 +559,7 @@ impl WinogradWgrad {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 

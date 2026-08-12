@@ -14,16 +14,14 @@
 //! 3. Accumulate `o += softmax(s[t]) * v[t]`.
 //! 4. Final normalisation and store.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams};
+use oxicuda_launch::{Dim3, LaunchParams};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::tensor_util::{attn_dims, attn_dims_mut};
 use crate::types::{TensorDesc, TensorDescMut};
 
@@ -59,9 +57,13 @@ pub fn single_query_decode_attention<T: GpuFloat>(
     let sm = handle.sm_version();
 
     let kernel_name = format!("decode_attn_d{}_{}", head_dim, T::NAME);
-    let ptx = generate_decode_ptx::<T>(&kernel_name, sm, head_dim, max_seq_len)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    // `head_dim` (already in the name) fixes the shared-memory size and the
+    // `.maxntid` bound; `max_seq_len` is unused by the generator and is a
+    // runtime kernel parameter, so the name is a complete key.
+    let kernel =
+        handle.get_or_compile_kernel(&cache_key(&kernel_name, sm), &kernel_name, || {
+            generate_decode_ptx::<T>(&kernel_name, sm, head_dim, max_seq_len)
+        })?;
 
     let threads = 256u32.min(head_dim.div_ceil(32) * 32).max(32);
 
@@ -75,7 +77,7 @@ pub fn single_query_decode_attention<T: GpuFloat>(
         .shared_mem(smem_bytes)
         .build();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &params,
         handle.stream(),
         &(

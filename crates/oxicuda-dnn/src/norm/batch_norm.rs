@@ -16,16 +16,15 @@
 //! ```
 
 use std::fmt::Write as FmtWrite;
-use std::sync::Arc;
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams};
+use oxicuda_launch::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 #[cfg(test)]
 use crate::types::TensorLayout;
 use crate::types::{TensorDesc, TensorDescMut};
@@ -86,14 +85,13 @@ pub fn batch_norm_forward<T: GpuFloat>(
         channels,
     )?;
 
-    let ptx_source = generate_batch_norm_ptx::<T>(handle.sm_version(), spatial, training)?;
+    let sm = handle.sm_version();
     let kernel_name = batch_norm_kernel_name::<T>(spatial, training);
-    let module = Arc::new(
-        Module::from_ptx(&ptx_source)
-            .map_err(|e| DnnError::LaunchFailed(format!("module load for batch_norm: {e}")))?,
-    );
-    let kernel = Kernel::from_module(module, &kernel_name)
-        .map_err(|e| DnnError::LaunchFailed(format!("kernel lookup for {kernel_name}: {e}")))?;
+    let kernel = handle
+        .get_or_compile_kernel(&cache_key(&kernel_name, sm), &kernel_name, || {
+            generate_batch_norm_ptx::<T>(sm, spatial, training)
+        })
+        .map_err(|e| DnnError::LaunchFailed(format!("compile {kernel_name}: {e}")))?;
 
     // One block per channel. The block size MUST match the constant baked into
     // the PTX (`generate_batch_norm_ptx` uses `spatial * 32` as the strided-loop
@@ -127,6 +125,7 @@ pub fn batch_norm_forward<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("batch_norm: {e}")))?;
 

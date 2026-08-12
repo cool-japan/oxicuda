@@ -25,17 +25,14 @@
 //! D[m, n] = output
 //! ```
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::KernelBuilder;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut, TensorLayout, TileConfig};
 
 use super::super::descriptor::ConvProblem;
@@ -81,10 +78,26 @@ impl ImplicitGemmConv {
         }
     }
 
-    /// Returns a unique kernel name encoding the problem parameters.
+    /// Returns a unique kernel name encoding every code-generation constant.
     ///
-    /// The tile dimensions and layout are folded into the name so distinct
-    /// problem shapes never collide in the module cache.
+    /// # Cache-key contract
+    ///
+    /// This name is the compiled-module cache key (see
+    /// [`crate::kernel_cache`]), so it must discriminate everything
+    /// [`Self::generate_ptx`] bakes into the instruction stream:
+    ///
+    /// | Code-gen constant | Encoded as |
+    /// |---|---|
+    /// | element type | `prec` |
+    /// | `channels_last` | `nchw` / `nhwc` |
+    /// | filter extent `R`, `S` (unrolled tap loops) | `{r}x{s}` |
+    /// | `C_in / groups`, `C_out / groups` (group routing immediates) | `g{icpg}x{ocpg}` |
+    ///
+    /// The tile dimensions are also folded in. They do **not** currently affect
+    /// the emitted body — the shared `emit_standard_conv_body` is one thread
+    /// per output element, not a tiled GEMM — but keeping them in the key means
+    /// a future tiled implementation cannot silently reuse a module compiled
+    /// for a different tiling.
     #[must_use]
     pub fn kernel_name(&self) -> String {
         let prec = self.problem.input_type.as_ptx_str().trim_start_matches('.');
@@ -93,9 +106,14 @@ impl ImplicitGemmConv {
         } else {
             "nchw"
         };
+        let r = self.problem.filter_dims.first().copied().unwrap_or(1);
+        let s = self.problem.filter_dims.get(1).copied().unwrap_or(1);
+        let groups = self.problem.groups.max(1);
+        let in_cpg = self.problem.in_channels / groups;
+        let out_cpg = self.problem.out_channels / groups;
         format!(
-            "implicit_gemm_conv_{}x{}x{}_{}_{}",
-            self.tile_config.tile_m, self.tile_config.tile_n, self.tile_config.tile_k, prec, layout,
+            "implicit_gemm_conv_{}x{}x{}_{r}x{s}_g{in_cpg}x{out_cpg}_{prec}_{layout}",
+            self.tile_config.tile_m, self.tile_config.tile_n, self.tile_config.tile_k,
         )
     }
 
@@ -174,9 +192,11 @@ impl ImplicitGemmConv {
         bias: Option<&TensorDesc<T>>,
         output: &mut TensorDescMut<T>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_ptx()?;
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &self.kernel_name())?;
+        let entry = self.kernel_name();
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&entry, self.sm_version), &entry, || {
+                self.generate_ptx()
+            })?;
 
         let out_dims = self.problem.output_dims()?;
         let out_h = out_dims.first().copied().unwrap_or(1);
@@ -188,9 +208,7 @@ impl ImplicitGemmConv {
             .saturating_mul(out_h)
             .saturating_mul(out_w);
 
-        let block_size = 256u32;
-        let grid = grid_size_for(total_outputs, block_size);
-        let params = LaunchParams::new(grid, block_size);
+        let params = kernel.launch_1d(total_outputs);
 
         // Optional bias: pass the device pointer, or 0 when absent. The
         // kernel epilogue treats a zero pointer as "no bias".
@@ -217,6 +235,7 @@ impl ImplicitGemmConv {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -311,6 +330,66 @@ mod tests {
         let name = conv.kernel_name();
         assert!(name.contains("implicit_gemm_conv"));
         assert!(name.contains("f32"));
+    }
+
+    /// The name is the compiled-module cache key, so every constant baked into
+    /// the PTX must move it. A shared name for differently-generated PTX would
+    /// hand one problem the other's module — wrong results, no error.
+    #[test]
+    fn kernel_name_discriminates_every_codegen_constant() {
+        let base = ImplicitGemmConv::new(make_problem(), SmVersion::Sm80).kernel_name();
+
+        let mut filter_5x5 = make_problem();
+        filter_5x5.filter_dims = vec![5, 5];
+        assert_ne!(
+            base,
+            ImplicitGemmConv::new(filter_5x5, SmVersion::Sm80).kernel_name(),
+            "filter extent is unrolled into the PTX"
+        );
+
+        let mut more_channels = make_problem();
+        more_channels.in_channels = 128;
+        assert_ne!(
+            base,
+            ImplicitGemmConv::new(more_channels, SmVersion::Sm80).kernel_name(),
+            "C_in/groups is a code-gen immediate"
+        );
+
+        let mut grouped = make_problem();
+        grouped.groups = 2;
+        assert_ne!(
+            base,
+            ImplicitGemmConv::new(grouped, SmVersion::Sm80).kernel_name(),
+            "grouping changes both channels-per-group immediates"
+        );
+
+        let mut nhwc = make_problem();
+        nhwc.layout = TensorLayout::Nhwc;
+        assert_ne!(
+            base,
+            ImplicitGemmConv::new(nhwc, SmVersion::Sm80).kernel_name(),
+            "layout selects a different addressing path"
+        );
+
+        let mut f64_problem = make_problem();
+        f64_problem.input_type = PtxType::F64;
+        assert_ne!(
+            base,
+            ImplicitGemmConv::new(f64_problem, SmVersion::Sm80).kernel_name(),
+            "precision changes the register class and instruction widths"
+        );
+    }
+
+    /// The cache looks the entry point up by `kernel_name()`, so the name must
+    /// be exactly what the generated PTX declares.
+    #[test]
+    fn kernel_name_is_the_emitted_entry() {
+        let conv = ImplicitGemmConv::new(make_problem(), SmVersion::Sm80);
+        let ptx = conv.generate_ptx().unwrap_or_default();
+        assert!(
+            ptx.contains(&format!(".visible .entry {}", conv.kernel_name())),
+            "kernel_name() must name the emitted entry point"
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! | [`UnifiedBuffer<T>`]                  | Unified/managed| Accessible from both host and device     |
 //! | [`MappedBuffer<T>`] *(stub)*          | Host-mapped    | Zero-copy host memory (future)           |
 //! | `MemoryPool` *(stub, `pool` feat)*    | Device pool    | Stream-ordered allocation (CUDA 11.2+)   |
+//! | [`StagingBuffer`]                     | Host (pinned)  | Reused H2D/D2H staging for hot paths     |
 //!
 //! ## Freestanding copy helpers
 //!
@@ -37,6 +38,7 @@
 //! |--------------|--------------------------------------------------|
 //! | `pool`       | Enable stream-ordered memory pool (CUDA 11.2+)   |
 //! | `gpu-tests`  | Enable integration tests that require a real GPU  |
+//! | `half`       | `StagingPod` impls for `half::f16` / `half::bf16` |
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -63,6 +65,7 @@ pub mod peer_copy;
 pub mod pool;
 pub mod pool_pressure;
 pub mod pool_stats;
+pub mod staging;
 pub mod unified;
 pub mod virtual_memory;
 pub mod zero_copy;
@@ -108,6 +111,8 @@ pub use aligned::{
 };
 
 pub use pool_stats::{AllocationHistogram, FragmentationMetrics, PoolReport, PoolStatsTracker};
+
+pub use staging::{DEFAULT_AUTO_STAGE_MAX_BYTES, StagingBuffer, StagingPod, StagingStats};
 
 #[cfg(feature = "pool")]
 pub use pool::{MemoryPool, PoolStats, PooledBuffer};

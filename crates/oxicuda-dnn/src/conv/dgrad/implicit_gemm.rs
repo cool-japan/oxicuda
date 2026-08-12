@@ -22,17 +22,14 @@
 //! Note: when the forward convolution has stride > 1, the dgrad becomes
 //! a dilated convolution (inserting zeros between gradient output elements).
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::KernelBuilder;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 use super::super::descriptor::ConvProblem;
@@ -61,6 +58,12 @@ impl DgradImplicitGemm {
     }
 
     /// Returns the kernel name.
+    ///
+    /// [`Self::generate_ptx`]'s body (`emit_dgrad_body`) takes no code-gen
+    /// parameters at all — it is a structural skeleton whose only
+    /// precision-dependent aspect is the entry signature — so the precision
+    /// alone is a complete compiled-module cache key for a given target
+    /// architecture.
     #[must_use]
     pub fn kernel_name(&self) -> String {
         let prec = self.problem.input_type.as_ptx_str().trim_start_matches('.');
@@ -135,18 +138,18 @@ impl DgradImplicitGemm {
         filter: &TensorDesc<T>,
         grad_input: &mut TensorDescMut<T>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_ptx()?;
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &self.kernel_name())?;
+        let entry = self.kernel_name();
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&entry, self.sm_version), &entry, || {
+                self.generate_ptx()
+            })?;
 
         let (gemm_m, _gemm_n, _gemm_k) = self.dgrad_gemm_dims()?;
         let out_dims = self.problem.output_dims()?;
         let out_h = out_dims.first().copied().unwrap_or(1);
         let out_w = out_dims.get(1).copied().unwrap_or(1);
 
-        let block_size = 256u32;
-        let grid = grid_size_for(gemm_m, block_size);
-        let params = LaunchParams::new(grid, block_size);
+        let params = kernel.launch_1d(gemm_m);
 
         let args = (
             grad_output.ptr,
@@ -170,6 +173,7 @@ impl DgradImplicitGemm {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 

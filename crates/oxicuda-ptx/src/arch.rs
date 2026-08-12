@@ -140,8 +140,21 @@ impl SmVersion {
     pub const fn max_threads_per_sm(self) -> u32 {
         match self {
             Self::Sm75 => 1024,
-            Self::Sm89 => 1536,
-            Self::Sm80 | Self::Sm86 | Self::Sm90 | Self::Sm90a | Self::Sm100 | Self::Sm120 => 2048,
+            // Ampere `GA10x` (RTX 30-series / A4000-A6000-class workstation
+            // cards) and Ada Lovelace `AD10x`: 48 resident warps/SM = 1_536
+            // threads/SM, NOT the 2_048 of datacenter Ampere (`Sm80`, e.g.
+            // A100). `Sm86`'s figure is live-verified via
+            // `Device::max_threads_per_multiprocessor()` against a real RTX
+            // A4000 (compute capability 8.6); `Sm89` was already correct.
+            // `GA10x`/`AD10x` are distinct dies from `GA100` with a smaller
+            // scheduler partition per SM; this arm must NOT be merged with
+            // the `Sm80` arm below just because all three are "Ampere or
+            // later" -- that unverified equivalence (specifically `Sm86`
+            // folded into `Sm80`) is exactly the bug this arm fixes.
+            // `Sm86` and `Sm89` sharing a value here is a verified hardware
+            // fact (both independently confirmed), not an assumption.
+            Self::Sm86 | Self::Sm89 => 1536,
+            Self::Sm80 | Self::Sm90 | Self::Sm90a | Self::Sm100 | Self::Sm120 => 2048,
         }
     }
 
@@ -156,8 +169,28 @@ impl SmVersion {
     pub const fn max_shared_mem_per_block(self) -> u32 {
         match self {
             Self::Sm75 => 65536,
-            Self::Sm80 | Self::Sm86 => 163_840,
-            Self::Sm89 => 101_376,
+            Self::Sm80 => 163_840,
+            // Ampere `GA10x` (RTX 30-series / A4000-A6000-class workstation
+            // cards) and Ada Lovelace `AD10x`: 99 KiB opt-in per block
+            // (101_376 bytes), NOT the 163_840 of datacenter Ampere (`Sm80`,
+            // e.g. A100). `Sm86`'s figure is live-verified via
+            // `Device::max_shared_memory_per_block_optin()` against a real
+            // RTX A4000 (compute capability 8.6): the device reports a
+            // 102_400-byte physical shared-memory partition per SM, of which
+            // 101_376 bytes are available to a single block's opt-in
+            // request (the remainder is reserved by the driver); `Sm89` was
+            // already correct. `GA10x`/`AD10x`'s per-SM partition is
+            // materially smaller than `GA100`'s; this arm must NOT be merged
+            // with the `Sm80` arm above just because all are "Ampere or
+            // later" -- that unverified equivalence (specifically `Sm86`
+            // folded into `Sm80`) is exactly the bug this arm fixes (it let
+            // a GEMM tile config request up to 163_840 bytes on hardware
+            // that can only satisfy 101_376, i.e. a config that passed its
+            // own legality check but would fail `cuFuncSetAttribute`/kernel
+            // launch on real Sm86 silicon). `Sm86` and `Sm89` sharing a
+            // value here is a verified hardware fact (both independently
+            // confirmed), not an assumption.
+            Self::Sm86 | Self::Sm89 => 101_376,
             Self::Sm90 | Self::Sm90a | Self::Sm100 | Self::Sm120 => 232_448,
         }
     }
@@ -433,9 +466,93 @@ mod tests {
 
     #[test]
     fn shared_memory_limits() {
-        assert_eq!(SmVersion::Sm75.max_shared_mem_per_block(), 65536);
+        // Exhaustive over every `SmVersion` variant -- deliberately not just
+        // a representative subset. `Sm86` used to be grouped into `Sm80`'s
+        // match arm and silently inherited its (too-large) value; no test in
+        // this module exercised `Sm86` at all, so nothing caught it. See
+        // `sm86_hardware_capacity_matches_verified_rtx_a4000_values` below
+        // for the dedicated regression test and provenance of these numbers.
+        assert_eq!(SmVersion::Sm75.max_shared_mem_per_block(), 65_536);
         assert_eq!(SmVersion::Sm80.max_shared_mem_per_block(), 163_840);
+        assert_eq!(SmVersion::Sm86.max_shared_mem_per_block(), 101_376);
+        assert_eq!(SmVersion::Sm89.max_shared_mem_per_block(), 101_376);
         assert_eq!(SmVersion::Sm90.max_shared_mem_per_block(), 232_448);
+        assert_eq!(SmVersion::Sm90a.max_shared_mem_per_block(), 232_448);
+        assert_eq!(SmVersion::Sm100.max_shared_mem_per_block(), 232_448);
+        assert_eq!(SmVersion::Sm120.max_shared_mem_per_block(), 232_448);
+    }
+
+    #[test]
+    fn max_threads_per_sm_all_sm() {
+        // `max_threads_per_sm` had no test coverage at all before this fix
+        // (grep the pre-fix history: the only call site was a consumer in
+        // `profile_guided.rs`, never this module) -- exhaustive over every
+        // variant so a future accidental merge (the `Sm86`-into-`Sm80` bug
+        // fixed here) cannot hide behind an untested variant again.
+        assert_eq!(SmVersion::Sm75.max_threads_per_sm(), 1024);
+        assert_eq!(SmVersion::Sm80.max_threads_per_sm(), 2048);
+        assert_eq!(SmVersion::Sm86.max_threads_per_sm(), 1536);
+        assert_eq!(SmVersion::Sm89.max_threads_per_sm(), 1536);
+        assert_eq!(SmVersion::Sm90.max_threads_per_sm(), 2048);
+        assert_eq!(SmVersion::Sm90a.max_threads_per_sm(), 2048);
+        assert_eq!(SmVersion::Sm100.max_threads_per_sm(), 2048);
+        assert_eq!(SmVersion::Sm120.max_threads_per_sm(), 2048);
+    }
+
+    /// Regression test for the `Sm86` hardware-capacity bug: `Sm86` (Ampere
+    /// `GA10x`, e.g. RTX A4000/A5000/A6000/3080/3090) was folded into
+    /// `Sm80`'s (Ampere `GA100`, e.g. A100) match arm for both
+    /// `max_shared_mem_per_block` and `max_threads_per_sm`, overstating both
+    /// figures for real `GA10x` silicon. These specific numbers were
+    /// confirmed live against this machine's real RTX A4000 (driver
+    /// 550.144.03, compute capability 8.6) via
+    /// `Device::max_shared_memory_per_block_optin()` and
+    /// `Device::max_threads_per_multiprocessor()` (see
+    /// `gpu_tests::sm_capacity_constants_match_live_device_query` in the
+    /// `gpu-tests`-gated module below for the on-device version of this
+    /// check). `oxicuda_launch`'s
+    /// independently-maintained local `SmVersion` copy
+    /// (`oxicuda_launch::telemetry::SmVersion`, in a different crate)
+    /// already encoded the correct `Sm86` figures before this fix, which
+    /// independently corroborates the values asserted here.
+    #[test]
+    fn sm86_hardware_capacity_matches_verified_rtx_a4000_values() {
+        assert_eq!(
+            SmVersion::Sm86.max_shared_mem_per_block(),
+            101_376,
+            "Sm86 (GA10x) must NOT inherit Sm80 (GA100)'s 163_840-byte budget",
+        );
+        assert_eq!(
+            SmVersion::Sm86.max_threads_per_sm(),
+            1536,
+            "Sm86 (GA10x) must NOT inherit Sm80 (GA100)'s 2048 threads/SM figure",
+        );
+        // Sm86 must differ from Sm80's values -- that mismatch is exactly
+        // the bug this test guards against.
+        assert_ne!(
+            SmVersion::Sm86.max_shared_mem_per_block(),
+            SmVersion::Sm80.max_shared_mem_per_block(),
+            "Sm86 must not share Sm80's shared-memory limit",
+        );
+        assert_ne!(
+            SmVersion::Sm86.max_threads_per_sm(),
+            SmVersion::Sm80.max_threads_per_sm(),
+            "Sm86 must not share Sm80's max-threads-per-SM limit",
+        );
+        // ... and must match Sm89 (Ada Lovelace AD10x), which independently
+        // has the same GA10x/AD10x-class per-SM resource partition.
+        assert_eq!(
+            SmVersion::Sm86.max_shared_mem_per_block(),
+            SmVersion::Sm89.max_shared_mem_per_block(),
+            "Sm86 (GA10x) and Sm89 (AD10x) are independently verified to \
+             share this limit",
+        );
+        assert_eq!(
+            SmVersion::Sm86.max_threads_per_sm(),
+            SmVersion::Sm89.max_threads_per_sm(),
+            "Sm86 (GA10x) and Sm89 (AD10x) are independently verified to \
+             share this limit",
+        );
     }
 
     #[test]
@@ -494,5 +611,93 @@ mod tests {
         assert!(caps.has_setmaxnreg);
         assert!(caps.has_bulk_copy);
         assert!(caps.has_sm120_features);
+    }
+}
+
+/// On-device sanity checks that compare `SmVersion`'s hardcoded capacity
+/// table against what the CUDA driver reports for the GPU actually present
+/// on the machine running the tests.
+///
+/// The plain `tests` module above pins specific literal values (verified
+/// once, by hand, against this development machine's RTX A4000). These
+/// tests instead *re-derive* the expected values from the live device at
+/// test time, so they keep validating the table even if it is extended for
+/// new architectures or run on a machine with different hardware -- closing
+/// the exact gap that let `Sm86` silently drift from reality: nothing here
+/// depends on a human having independently verified a specific number in
+/// advance.
+///
+/// Requires the `gpu-tests` feature and, to do anything beyond a no-op, an
+/// actual CUDA-capable device at runtime; every test skips gracefully (that
+/// is, passes trivially) when neither the driver nor a device is present,
+/// matching the convention used by `oxicuda-driver`, `oxicuda-blas`,
+/// `oxicuda-launch`, and `oxicuda-memory`'s own `gpu-tests`-gated tests.
+#[cfg(all(test, feature = "gpu-tests"))]
+mod gpu_tests {
+    use super::*;
+    use oxicuda_driver::Device;
+
+    /// Queries the real GPU on this machine and asserts that
+    /// [`SmVersion::max_shared_mem_per_block`] and
+    /// [`SmVersion::max_threads_per_sm`] match what
+    /// `cuDeviceGetAttribute` itself reports, for whichever compute
+    /// capability this device actually identifies as.
+    ///
+    /// On this development machine (NVIDIA RTX A4000, driver 550.144.03,
+    /// compute capability 8.6) this exercises the real driver call and
+    /// resolves to `SmVersion::Sm86`, directly reproducing the fix this
+    /// module accompanies: before the fix, this assertion would have failed
+    /// with `sm.max_shared_mem_per_block() == 163_840` vs a live
+    /// `163_840 != 101_376` mismatch (and `2048 != 1536` for
+    /// `max_threads_per_sm`).
+    #[test]
+    fn sm_capacity_constants_match_live_device_query() {
+        oxicuda_driver::init().ok();
+        let Ok(dev) = Device::get(0) else {
+            // No CUDA-capable device on this machine -- nothing to verify.
+            return;
+        };
+
+        let (major, minor) = dev
+            .compute_capability()
+            .expect("compute_capability query failed on a device that was just opened");
+        let Some(sm) = SmVersion::from_compute_capability(major, minor) else {
+            // This device's compute capability isn't modeled by SmVersion
+            // yet (e.g. an architecture newer or older than this crate
+            // supports) -- nothing to compare against.
+            return;
+        };
+
+        let live_max_threads_per_sm = u32::try_from(
+            dev.max_threads_per_multiprocessor()
+                .expect("MAX_THREADS_PER_MULTIPROCESSOR query failed"),
+        )
+        .expect("MAX_THREADS_PER_MULTIPROCESSOR must be non-negative");
+        let live_max_smem_optin = u32::try_from(
+            dev.max_shared_memory_per_block_optin()
+                .expect("MAX_SHARED_MEMORY_PER_BLOCK_OPTIN query failed"),
+        )
+        .expect("MAX_SHARED_MEMORY_PER_BLOCK_OPTIN must be non-negative");
+
+        assert_eq!(
+            sm.max_threads_per_sm(),
+            live_max_threads_per_sm,
+            "arch::SmVersion::{sm:?}::max_threads_per_sm() returns {}, but this \
+             machine's real device (compute capability {major}.{minor}) reports \
+             {live_max_threads_per_sm} via \
+             cuDeviceGetAttribute(MAX_THREADS_PER_MULTIPROCESSOR) -- the \
+             hardcoded table in arch.rs has drifted from hardware reality",
+            sm.max_threads_per_sm(),
+        );
+        assert_eq!(
+            sm.max_shared_mem_per_block(),
+            live_max_smem_optin,
+            "arch::SmVersion::{sm:?}::max_shared_mem_per_block() returns {}, but \
+             this machine's real device (compute capability {major}.{minor}) \
+             reports {live_max_smem_optin} via \
+             cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_BLOCK_OPTIN) -- the \
+             hardcoded table in arch.rs has drifted from hardware reality",
+            sm.max_shared_mem_per_block(),
+        );
     }
 }

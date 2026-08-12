@@ -15,11 +15,8 @@
 //! handles one hidden unit, computing all gates and the state update in a
 //! single pass.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::ir::PtxType;
@@ -27,6 +24,7 @@ use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 
 /// Block size for LSTM gate-fusion kernels.
@@ -168,10 +166,12 @@ pub fn lstm_cell_forward<T: GpuFloat>(
     }
 
     // Generate and launch the fused LSTM gate kernel
-    let ptx = generate_lstm_fused_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let kernel_name = format!("dnn_lstm_fused_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_lstm_fused_ptx::<T>(handle.sm_version()),
+    )?;
 
     let total_threads = bh as u32;
     let grid = grid_size_for(total_threads, LSTM_BLOCK);
@@ -192,6 +192,7 @@ pub fn lstm_cell_forward<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("LSTM cell forward: {e}")))?;
 
@@ -286,10 +287,12 @@ pub fn lstm_sequence_forward<T: GpuFloat>(
     }
 
     // Generate the kernel once, reuse across timesteps
-    let ptx = generate_lstm_fused_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let kernel_name = format!("dnn_lstm_fused_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_lstm_fused_ptx::<T>(handle.sm_version()),
+    )?;
 
     let total_threads = bh as u32;
     let grid = grid_size_for(total_threads, LSTM_BLOCK);
@@ -323,6 +326,7 @@ pub fn lstm_sequence_forward<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args_0)
         .map_err(|e| DnnError::LaunchFailed(format!("LSTM sequence t=0: {e}")))?;
 
@@ -356,6 +360,7 @@ pub fn lstm_sequence_forward<T: GpuFloat>(
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args_t)
             .map_err(|e| DnnError::LaunchFailed(format!("LSTM sequence t={t}: {e}")))?;
     }
@@ -391,10 +396,12 @@ pub fn lstm_sequence_forward<T: GpuFloat>(
 
     // Copy final hidden state: h_seq[last] -> h_n
     // We use a PTX copy kernel that reads from an offset within h_seq
-    let copy_ptx = generate_copy_kernel_ptx::<T>(handle.sm_version())?;
-    let copy_mod = Arc::new(Module::from_ptx(&copy_ptx)?);
     let copy_name = format!("dnn_copy_{}", T::NAME);
-    let copy_kernel = Kernel::from_module(copy_mod, &copy_name)?;
+    let copy_kernel = handle.get_or_compile_kernel(
+        &cache_key(&copy_name, handle.sm_version()),
+        &copy_name,
+        || generate_copy_kernel_ptx::<T>(handle.sm_version()),
+    )?;
 
     let copy_n = bh as u32;
     let copy_grid = grid_size_for(copy_n, LSTM_BLOCK);
@@ -403,6 +410,7 @@ pub fn lstm_sequence_forward<T: GpuFloat>(
     let copy_args = (h_last_ptr, h_n.as_device_ptr(), copy_n);
 
     copy_kernel
+        .kernel()
         .launch(&copy_params, handle.stream(), &copy_args)
         .map_err(|e| DnnError::LaunchFailed(format!("LSTM copy final h: {e}")))?;
 

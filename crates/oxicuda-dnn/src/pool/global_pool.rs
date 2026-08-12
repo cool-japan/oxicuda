@@ -6,15 +6,13 @@
 //! Uses a dedicated kernel that performs a channel-wise reduction over the
 //! entire spatial extent, with one thread block per (N, C) plane.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams};
+use oxicuda_launch::LaunchParams;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 use crate::tensor_util::{nchw_dims, nchw_dims_mut};
 use crate::types::{TensorDesc, TensorDescMut};
@@ -49,10 +47,11 @@ pub fn global_avg_pool2d<T: GpuFloat>(
     }
     let hw = in_h * in_w;
 
-    let ptx = generate_global_avg_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let name = format!("dnn_global_avg_pool2d_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &name)?;
+    let kernel =
+        handle.get_or_compile_kernel(&cache_key(&name, handle.sm_version()), &name, || {
+            generate_global_avg_ptx::<T>(handle.sm_version())
+        })?;
 
     // One block per (N, C) plane
     let params = LaunchParams::new(nc, GLOBAL_POOL_BLOCK);
@@ -60,6 +59,7 @@ pub fn global_avg_pool2d<T: GpuFloat>(
     let args = (input.ptr, output.ptr, hw, nc);
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("global_avg_pool2d: {e}")))?;
 
@@ -93,16 +93,18 @@ pub fn global_max_pool2d<T: GpuFloat>(
     }
     let hw = in_h * in_w;
 
-    let ptx = generate_global_max_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let name = format!("dnn_global_max_pool2d_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &name)?;
+    let kernel =
+        handle.get_or_compile_kernel(&cache_key(&name, handle.sm_version()), &name, || {
+            generate_global_max_ptx::<T>(handle.sm_version())
+        })?;
 
     let params = LaunchParams::new(nc, GLOBAL_POOL_BLOCK);
 
     let args = (input.ptr, output.ptr, hw, nc);
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("global_max_pool2d: {e}")))?;
 

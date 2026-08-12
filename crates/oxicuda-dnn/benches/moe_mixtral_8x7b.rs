@@ -175,11 +175,32 @@ fn bench_moe_mixtral_8x7b(c: &mut Criterion) {
 
     let tokens_per_call = u64::from(NUM_TOKENS);
 
+    // Warm-up call outside the timed loop, plus `.expect()` inside it below:
+    // a silently-discarded `Result` here would let a future regression (or a
+    // future workspace requirement, mirroring the `conv_forward` bug this
+    // repository has already hit) time an early-return-on-error instead of
+    // the kernel this benchmark claims to measure.
+    fused_moe(
+        &handle,
+        &input,
+        &w1,
+        &w2,
+        &expert_indices,
+        &expert_weights,
+        &mut output,
+        &config,
+    )
+    .expect("fused_moe warm-up call must succeed");
+    handle
+        .stream()
+        .synchronize()
+        .expect("synchronize after warm-up");
+
     let mut group = c.benchmark_group("dnn_p4_moe_mixtral_8x7b");
     group.throughput(Throughput::Elements(tokens_per_call));
     group.bench_function("oxicuda_f32_e8_topk2_h4096_i14336", |b| {
         b.iter(|| {
-            let _ = fused_moe(
+            fused_moe(
                 &handle,
                 &input,
                 &w1,
@@ -188,7 +209,8 @@ fn bench_moe_mixtral_8x7b(c: &mut Criterion) {
                 &expert_weights,
                 &mut output,
                 &config,
-            );
+            )
+            .expect("fused_moe");
         });
     });
     group.finish();

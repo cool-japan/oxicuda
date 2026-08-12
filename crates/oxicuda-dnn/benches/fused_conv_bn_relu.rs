@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use oxicuda_dnn::DnnError;
 use oxicuda_dnn::DnnHandle;
 use oxicuda_dnn::conv::fused::FusedBnParams;
 use oxicuda_dnn::conv::{conv_bn_relu, conv_forward};
@@ -143,11 +144,32 @@ fn bench_fused_conv_bn_relu(c: &mut Criterion) {
 
     let work = u64::from(out_elems as u32);
 
+    // Warm-up call outside the timed loop: `.expect()` here and inside the
+    // timed closure below means a future regression that reintroduces an
+    // error fails this benchmark loudly instead of silently timing whatever
+    // the early-return-on-error path costs (effectively nothing).
+    // `conv_bn_relu` takes no workspace parameter, so unlike the `unfused`
+    // group below there is nothing to probe for.
+    conv_bn_relu(
+        &handle,
+        &input,
+        &filter,
+        &mut output,
+        &conv_desc,
+        &bn_params,
+        Activation::Relu,
+    )
+    .expect("conv_bn_relu warm-up call must succeed");
+    handle
+        .stream()
+        .synchronize()
+        .expect("synchronize after fused warm-up");
+
     let mut fused = c.benchmark_group("dnn_p8_fused_conv_bn_relu_fused");
     fused.throughput(Throughput::Elements(work));
     fused.bench_function("oxicuda_f32_n8_c128_28x28_3x3_relu", |b| {
         b.iter(|| {
-            let _ = conv_bn_relu(
+            conv_bn_relu(
                 &handle,
                 &input,
                 &filter,
@@ -155,16 +177,67 @@ fn bench_fused_conv_bn_relu(c: &mut Criterion) {
                 &conv_desc,
                 &bn_params,
                 Activation::Relu,
-            );
+            )
+            .expect("conv_bn_relu");
         });
     });
     fused.finish();
+
+    // `conv_forward` dispatches to whichever algorithm `select_algorithm`
+    // picks for this problem shape; for N=8,C=128,H=W=28,K=128,3x3,s1p1 the
+    // estimated GEMM FLOP count clears `WINOGRAD_FLOP_THRESHOLD`, so it is
+    // Winograd, which -- like im2col+GEMM -- requires a caller-provided
+    // scratch workspace and otherwise returns
+    // `Err(DnnError::WorkspaceRequired(bytes))` immediately, before touching
+    // the GPU. A benchmark that discards that `Result` (as this one used to)
+    // times the cost of that instant early return, not a convolution. Probe
+    // for the requirement the same way
+    // `tests/conv_forward_xcorr_gpu.rs::gpu_xcorr` does: call once with no
+    // workspace, and on `WorkspaceRequired` allocate exactly the requested
+    // size and keep reusing that one buffer for every iteration below.
+    let mut workspace = match conv_forward(&handle, &input, &filter, &mut output, &conv_desc, None)
+    {
+        Ok(()) => None,
+        Err(DnnError::WorkspaceRequired(bytes)) => match DeviceBuffer::<u8>::zeroed(bytes) {
+            Ok(ws) => Some(ws),
+            Err(_) => {
+                eprintln!("skip: workspace alloc failed ({bytes} bytes)");
+                return;
+            }
+        },
+        Err(e) => panic!(
+            "conv_forward failed while probing its workspace requirement \
+             (expected either Ok or WorkspaceRequired): {e}"
+        ),
+    };
+
+    conv_forward(
+        &handle,
+        &input,
+        &filter,
+        &mut output,
+        &conv_desc,
+        workspace.as_mut(),
+    )
+    .expect("conv_forward warm-up call must succeed once workspace is provided");
+    handle
+        .stream()
+        .synchronize()
+        .expect("synchronize after unfused warm-up");
 
     let mut unfused = c.benchmark_group("dnn_p8_fused_conv_bn_relu_unfused");
     unfused.throughput(Throughput::Elements(work));
     unfused.bench_function("oxicuda_f32_n8_c128_28x28_3x3_baseline", |b| {
         b.iter(|| {
-            let _ = conv_forward(&handle, &input, &filter, &mut output, &conv_desc, None);
+            conv_forward(
+                &handle,
+                &input,
+                &filter,
+                &mut output,
+                &conv_desc,
+                workspace.as_mut(),
+            )
+            .expect("conv_forward");
         });
     });
     unfused.finish();

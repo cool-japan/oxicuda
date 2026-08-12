@@ -18,6 +18,24 @@
 //!   green-washing a wrong numeric result — that the output buffer is left
 //!   untouched (the kernels perform no stores). These tests are canaries: they
 //!   will (correctly) fail the moment the kernels are given a real body.
+//! * **Dispatch regression (capability gate)** — `conv::algo_select` must never
+//!   route a convolution into the broken `WinogradConv` engine above via the
+//!   public `conv::api::conv_forward` entry point. `conv_forward_winograd_eligible_shape_matches_cpu_oracle`
+//!   drives a shape that is genuinely Winograd-eligible and over the
+//!   profitability threshold end-to-end through `conv_forward` (not through
+//!   any single engine directly) and checks the result against `conv2d_ref`,
+//!   proving the dispatcher fell back to a numerically-correct engine instead.
+//! * **Decomposed fusion (`conv_bn_relu`)** — unlike the `FusedConvBnAct`
+//!   fragment above, the public `conv::api::conv_bn_relu` entry point no
+//!   longer dispatches into that no-op skeleton. It decomposes into a real
+//!   `conv_forward` call plus a real BN-affine + activation epilogue kernel
+//!   (`conv::fused::apply_fused_bn_activation`). `conv_bn_relu_nchw_relu_matches_cpu_oracle`
+//!   and `conv_bn_relu_nhwc_silu_matches_cpu_oracle` drive the public entry
+//!   point end-to-end (NCHW/ReLU at a Winograd-eligible scale, NHWC/SiLU for
+//!   layout + transcendental-activation coverage) and check the result
+//!   against `conv2d_ref` composed with the BN-affine + activation formula,
+//!   proving both that the untouched-buffer failure mode is gone and that
+//!   the decomposed math is numerically correct.
 
 use super::*;
 
@@ -26,15 +44,17 @@ use oxicuda_launch::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::ir::PtxType;
 
+use crate::conv::algo_select::{estimate_gemm_flops, is_winograd_eligible};
+use crate::conv::api::{conv_bn_relu, conv_forward};
 use crate::conv::descriptor::ConvProblem;
 use crate::conv::fprop::direct::{Conv1x1, DepthwiseConv};
 use crate::conv::fprop::im2col_gemm::Im2colGemmConv;
 use crate::conv::fprop::implicit_gemm::ImplicitGemmConv;
 use crate::conv::fprop::winograd::{WinogradConv, WinogradTileSize};
 use crate::conv::fused::{FusedBnParams, FusedConvBnAct};
-use crate::error::DnnResult;
+use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
-use crate::types::{Activation, TensorDesc, TensorDescMut, TensorLayout};
+use crate::types::{Activation, ConvolutionDescriptor, TensorDesc, TensorDescMut, TensorLayout};
 
 // ---------------------------------------------------------------------------
 // Shared geometry + CPU oracle
@@ -1185,6 +1205,164 @@ fn winograd_output_transform_f4x3_launches() {
 }
 
 // ---------------------------------------------------------------------------
+// conv_forward — Winograd capability-gate regression (algo_select.rs)
+// ---------------------------------------------------------------------------
+//
+// The Winograd fragment tests above prove `WinogradConv`'s own kernels are
+// no-ops. The test below proves the *dispatcher* no longer routes anything
+// there: `conv::algo_select::select_algorithm` gates Rule 3 behind
+// `winograd_forward_implemented()` (currently `false`), so the public
+// `conv::api::conv_forward` entry point must fall back to a real engine for
+// a shape that is otherwise squarely Winograd-eligible.
+
+/// A conv shape that is Winograd-*eligible* (3x3 filter, unit stride and
+/// dilation, F32, groups=1) and clears the Winograd profitability FLOP
+/// threshold: 128 in/out channels, 80x80 output, batch 1 — mirroring a
+/// realistic SCRFD-scale mid-network layer (~1.89e9 estimated GEMM FLOPs).
+/// This is exactly the class of shape `select_algorithm`'s Rule 3 would
+/// have routed into the broken, no-op `WinogradConv` engine before
+/// `winograd_forward_implemented()` gated it closed.
+///
+/// Regression test for the public, high-level `conv_forward` API: before
+/// the gate existed, this call would have returned `Ok(())` while leaving
+/// `output` at whatever value it was initialised to, because
+/// `WinogradConv::execute` launches kernels that never load, transform, or
+/// store anything (see the "Honesty contract" above and in
+/// `gpu_tests/mod.rs`). The test drives the *actual* dispatcher
+/// (`ConvProblem::from_descriptors` + `select_algorithm`, exactly as
+/// `conv_forward` does internally) rather than constructing a specific
+/// engine directly, so it fails the same way a real caller of
+/// `oxicuda_dnn::conv::api::conv_forward` would have failed.
+#[test]
+fn conv_forward_winograd_eligible_shape_matches_cpu_oracle() {
+    let Some(fx) = gpu_fixture() else {
+        return;
+    };
+    let case = ConvCase {
+        n: 1,
+        c: 128,
+        h: 80,
+        w: 80,
+        k: 128,
+        r: 3,
+        s: 3,
+        pad_h: 1,
+        pad_w: 1,
+        str_h: 1,
+        str_w: 1,
+        dil_h: 1,
+        dil_w: 1,
+        groups: 1,
+        layout: TensorLayout::Nchw,
+    };
+
+    // Confirm this shape really is Winograd-eligible and over the
+    // profitability threshold using the crate's own eligibility logic —
+    // i.e. this test exercises the capability gate specifically, rather
+    // than a shape that happens to fall through to Im2colGemm for some
+    // unrelated reason (wrong dtype, non-unit stride, etc).
+    let problem = case.problem(PtxType::F32);
+    assert!(
+        is_winograd_eligible(&problem, case.r, case.s),
+        "regression shape must be Winograd-eligible"
+    );
+    assert!(
+        estimate_gemm_flops(&problem, case.r, case.s) > 1_000_000_000,
+        "regression shape must clear the Winograd FLOP threshold"
+    );
+
+    let (out_h, out_w) = case.out_hw();
+    let in_n = (case.n * case.c * case.h * case.w) as usize;
+    let fil_n = (case.k * case.c * case.r * case.s) as usize;
+    let out_n = (case.n * case.k * out_h * out_w) as usize;
+
+    let mut lcg = Lcg::new(0x9016_0729_dead_c0de);
+    let in32: Vec<f32> = (0..in_n).map(|_| lcg.range_f32(-1.0, 1.0)).collect();
+    let fil32: Vec<f32> = (0..fil_n).map(|_| lcg.range_f32(-1.0, 1.0)).collect();
+
+    let in_buf = DeviceBuffer::from_host(&in32).expect("upload input");
+    let fil_buf = DeviceBuffer::from_host(&fil32).expect("upload filter");
+    let sentinel = -555.0f32;
+    let mut out_buf = DeviceBuffer::from_host(&vec![sentinel; out_n]).expect("alloc output");
+
+    let in_desc = TensorDesc::nchw(&in_buf, case.n, case.c, case.h, case.w).expect("input desc");
+    let fil_desc = TensorDesc::nchw(&fil_buf, case.k, case.c, case.r, case.s).expect("filter desc");
+    let mut out_desc =
+        TensorDescMut::nchw(&mut out_buf, case.n, case.k, out_h, out_w).expect("output desc");
+    let conv_desc = ConvolutionDescriptor::conv2d(
+        case.pad_h,
+        case.pad_w,
+        case.str_h,
+        case.str_w,
+        case.dil_h,
+        case.dil_w,
+        case.groups,
+    )
+    .expect("conv desc");
+
+    // Drive the *public* dispatcher exactly as a real caller would: call
+    // with no workspace first so the algorithm `select_algorithm` actually
+    // picked reports how much it needs. This also confirms the shape
+    // selected an algorithm that requires workspace at all (Winograd and
+    // Im2colGemm both do; Direct/ImplicitGemm don't), so a pass here is
+    // real evidence the Winograd path specifically was avoided rather than
+    // some unrelated no-workspace engine being selected by coincidence.
+    let err = conv_forward(
+        &fx.handle,
+        &in_desc,
+        &fil_desc,
+        &mut out_desc,
+        &conv_desc,
+        None,
+    )
+    .expect_err("algorithm selected for this shape must require a workspace");
+    let ws_bytes = match err {
+        DnnError::WorkspaceRequired(n) => n,
+        other => panic!("expected WorkspaceRequired, got {other:?}"),
+    };
+    assert!(ws_bytes > 0, "reported workspace size must be positive");
+    let mut ws = DeviceBuffer::from_host(&vec![0u8; ws_bytes]).expect("alloc workspace");
+
+    conv_forward(
+        &fx.handle,
+        &in_desc,
+        &fil_desc,
+        &mut out_desc,
+        &conv_desc,
+        Some(&mut ws),
+    )
+    .expect("conv_forward with workspace");
+    fx.stream().synchronize().expect("synchronize");
+
+    let mut gpu = vec![0.0f32; out_n];
+    out_buf.copy_to_host(&mut gpu).expect("copy output");
+
+    // Before the capability gate, `WinogradConv::execute` would have
+    // returned `Ok(())` while leaving every element at the sentinel. Catch
+    // that failure mode explicitly and separately from the numeric
+    // comparison below (an all-sentinel buffer could in principle, if
+    // astronomically unlikely with random f32 inputs, still slip past a
+    // per-element tolerance check).
+    assert!(
+        gpu.iter().any(|&v| v != sentinel),
+        "output buffer was never written -- looks like the broken no-op \
+         Winograd path was selected"
+    );
+
+    let in_o: Vec<f64> = in32.iter().map(|&x| f64::from(x)).collect();
+    let fil_o: Vec<f64> = fil32.iter().map(|&x| f64::from(x)).collect();
+    let exp64 = conv2d_ref(case, &in_o, &fil_o, None);
+    let exp32: Vec<f32> = exp64.iter().map(|&x| x as f32).collect();
+    assert_close_f32(
+        &gpu,
+        &exp32,
+        2e-4,
+        2e-4,
+        "conv_forward_winograd_eligible_shape",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // FusedConvBnAct  (fused.rs — load/launch-only fragment)
 // ---------------------------------------------------------------------------
 
@@ -1281,6 +1459,254 @@ fn fused_conv_bn_identity_f32_launches() {
 }
 
 // ---------------------------------------------------------------------------
+// conv_bn_relu  (api.rs — decomposed conv + BN-affine + activation)
+// ---------------------------------------------------------------------------
+//
+// `conv_bn_relu` used to dispatch straight into the `FusedConvBnAct`
+// fragment above and return `Ok(())` while leaving `output` completely
+// untouched -- the exact same failure mode `run_fused` documents for that
+// fragment directly. It now decomposes into a real convolution dispatch
+// (`conv_forward`, via an internally-managed workspace) followed by a real
+// BN-affine + activation epilogue kernel (`fused::apply_fused_bn_activation`,
+// which reuses `moe::fused_moe::emit_activation_ptx`'s already-validated
+// activation math). The tests below drive the *public* `conv_bn_relu` entry
+// point end-to-end -- no direct engine construction -- and check the result
+// against an independent CPU oracle: `conv2d_ref` (the same proven
+// convolution reference used throughout this file) composed with the
+// BN-affine + activation formula from `fused.rs`'s own module doc.
+
+/// f64 CPU reference for [`Activation`], matching
+/// `crate::moe::fused_moe::emit_activation_ptx`'s exact math (the same
+/// `ex2.approx`-based transcendental approximations validated on-device by
+/// `gpu_tests::moe_linear::activation_transcendental_approx_f32`, which
+/// `apply_fused_bn_activation` reuses rather than re-deriving).
+fn bn_epilogue_activation_oracle(act: Activation, x: f64) -> f64 {
+    match act {
+        Activation::None => x,
+        Activation::Relu => x.max(0.0),
+        Activation::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+        Activation::Silu => x / (1.0 + (-x).exp()),
+        Activation::Tanh => x.tanh(),
+        Activation::Gelu | Activation::GeluTanh => {
+            let sqrt_2_over_pi = 0.797_884_560_802_865_4_f64;
+            let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+            0.5 * x * (1.0 + inner.tanh())
+        }
+    }
+}
+
+/// CPU oracle for `conv_bn_relu`'s full decomposition: `conv2d_ref` followed
+/// by the per-channel fused-BN affine and activation. `channels_last`
+/// mirrors `apply_fused_bn_activation`'s own layout-dependent channel-index
+/// recovery (`idx % channels` for NHWC, `(idx / spatial) % channels` for
+/// NCHW).
+fn conv_bn_act_ref(
+    case: ConvCase,
+    input: &[f64],
+    filter: &[f64],
+    fused_scale: &[f32],
+    fused_bias: &[f32],
+    activation: Activation,
+) -> Vec<f64> {
+    let conv_out = conv2d_ref(case, input, filter, None);
+    let (out_h, out_w) = case.out_hw();
+    let spatial = (out_h * out_w) as usize;
+    let channels = case.k as usize;
+    let channels_last = case.layout.is_channels_last();
+
+    conv_out
+        .iter()
+        .enumerate()
+        .map(|(idx, &x)| {
+            let c = if channels_last {
+                idx % channels
+            } else {
+                (idx / spatial) % channels
+            };
+            let affine = x * f64::from(fused_scale[c]) + f64::from(fused_bias[c]);
+            bn_epilogue_activation_oracle(activation, affine)
+        })
+        .collect()
+}
+
+/// Drives the *public* `conv::api::conv_bn_relu` entry point end-to-end
+/// (exactly as a real caller would) and checks the result against
+/// [`conv_bn_act_ref`]. `tol` is `(rel, abs)`.
+fn run_conv_bn_relu(
+    fx: &GpuFixture,
+    case: ConvCase,
+    activation: Activation,
+    tol: (f32, f32),
+    tag: &str,
+) {
+    let (out_h, out_w) = case.out_hw();
+    let in_n = (case.n * case.c * case.h * case.w) as usize;
+    let fil_n = (case.k * case.c * case.r * case.s) as usize;
+    let out_n = (case.n * case.k * out_h * out_w) as usize;
+    let k = case.k as usize;
+
+    let mut lcg = Lcg::new(0xC0FF_EE00_1357_9BDF);
+    let in32: Vec<f32> = (0..in_n).map(|_| lcg.range_f32(-1.0, 1.0)).collect();
+    let fil32: Vec<f32> = (0..fil_n).map(|_| lcg.range_f32(-0.5, 0.5)).collect();
+    let scale32: Vec<f32> = (0..k).map(|_| lcg.range_f32(0.5, 1.5)).collect();
+    let bias32: Vec<f32> = (0..k).map(|_| lcg.range_f32(-0.5, 0.5)).collect();
+
+    let in_buf = DeviceBuffer::from_host(&in32).expect("upload input");
+    let fil_buf = DeviceBuffer::from_host(&fil32).expect("upload filter");
+    let scale_buf = DeviceBuffer::from_host(&scale32).expect("upload scale");
+    let bias_buf = DeviceBuffer::from_host(&bias32).expect("upload bias");
+    let sentinel = -9999.5f32;
+    let mut out_buf = DeviceBuffer::from_host(&vec![sentinel; out_n]).expect("alloc output");
+
+    let (in_desc, fil_desc, mut out_desc) = match case.layout {
+        TensorLayout::Nchw => (
+            TensorDesc::nchw(&in_buf, case.n, case.c, case.h, case.w).expect("input desc"),
+            TensorDesc::nchw(&fil_buf, case.k, case.c, case.r, case.s).expect("filter desc"),
+            TensorDescMut::nchw(&mut out_buf, case.n, case.k, out_h, out_w).expect("output desc"),
+        ),
+        TensorLayout::Nhwc => (
+            TensorDesc::nhwc(&in_buf, case.n, case.c, case.h, case.w).expect("input desc"),
+            TensorDesc::nhwc(&fil_buf, case.k, case.c, case.r, case.s).expect("filter desc"),
+            TensorDescMut::nhwc(&mut out_buf, case.n, case.k, out_h, out_w).expect("output desc"),
+        ),
+        other => panic!("run_conv_bn_relu only supports NCHW/NHWC test cases, got {other:?}"),
+    };
+    let conv_desc = ConvolutionDescriptor::conv2d(
+        case.pad_h,
+        case.pad_w,
+        case.str_h,
+        case.str_w,
+        case.dil_h,
+        case.dil_w,
+        case.groups,
+    )
+    .expect("conv desc");
+    let bn_params = FusedBnParams {
+        fused_scale_ptr: scale_buf.as_device_ptr(),
+        fused_bias_ptr: bias_buf.as_device_ptr(),
+        channels: case.k,
+    };
+
+    conv_bn_relu(
+        &fx.handle,
+        &in_desc,
+        &fil_desc,
+        &mut out_desc,
+        &conv_desc,
+        &bn_params,
+        activation,
+    )
+    .expect("conv_bn_relu");
+    fx.stream().synchronize().expect("synchronize");
+
+    let mut gpu = vec![0.0f32; out_n];
+    out_buf.copy_to_host(&mut gpu).expect("copy output");
+
+    // The pre-fix `conv_bn_relu` returned `Ok(())` after dispatching straight
+    // into the `FusedConvBnAct` no-op skeleton, leaving every element at
+    // whatever `output` was initialised to. Catch that failure mode
+    // explicitly -- the same way the Winograd dispatcher regression test
+    // does -- before the (much stricter) numeric comparison below.
+    assert!(
+        gpu.iter().any(|&v| v != sentinel),
+        "{tag}: output buffer was never written -- conv_bn_relu regressed to \
+         the silent conv+BN+act no-op"
+    );
+
+    let in_o: Vec<f64> = in32.iter().map(|&x| f64::from(x)).collect();
+    let fil_o: Vec<f64> = fil32.iter().map(|&x| f64::from(x)).collect();
+    let exp64 = conv_bn_act_ref(case, &in_o, &fil_o, &scale32, &bias32, activation);
+    let exp32: Vec<f32> = exp64.iter().map(|&x| x as f32).collect();
+    assert_close_f32(&gpu, &exp32, tol.0, tol.1, tag);
+}
+
+/// `conv_bn_relu` over a shape that is Winograd-*eligible* and clears the
+/// Winograd profitability threshold -- the same shape as
+/// `conv_forward_winograd_eligible_shape_matches_cpu_oracle` above, one of
+/// the "ordinary mid-size 3x3 CNN layers" `algo_select`'s docs call out as
+/// exactly what the pre-gate heuristic would have routed into the broken
+/// `WinogradConv` engine. `conv_bn_relu` has its own dispatch path
+/// (`conv_forward` via an auto-sized workspace, then
+/// `apply_fused_bn_activation`), so this is not redundant with that
+/// `conv_forward`-only regression test -- it proves the *fused entry point
+/// itself* stays safe at this scale, on top of proving the decomposition's
+/// BN + ReLU epilogue is numerically correct.
+#[test]
+fn conv_bn_relu_nchw_relu_matches_cpu_oracle() {
+    let Some(fx) = gpu_fixture() else {
+        return;
+    };
+    let case = ConvCase {
+        n: 1,
+        c: 128,
+        h: 80,
+        w: 80,
+        k: 128,
+        r: 3,
+        s: 3,
+        pad_h: 1,
+        pad_w: 1,
+        str_h: 1,
+        str_w: 1,
+        dil_h: 1,
+        dil_w: 1,
+        groups: 1,
+        layout: TensorLayout::Nchw,
+    };
+    let problem = case.problem(PtxType::F32);
+    assert!(
+        is_winograd_eligible(&problem, case.r, case.s),
+        "regression shape must be Winograd-eligible"
+    );
+    assert!(
+        estimate_gemm_flops(&problem, case.r, case.s) > 1_000_000_000,
+        "regression shape must clear the Winograd FLOP threshold"
+    );
+    run_conv_bn_relu(
+        &fx,
+        case,
+        Activation::Relu,
+        (2e-4, 2e-4),
+        "conv_bn_relu_nchw_relu",
+    );
+}
+
+/// `conv_bn_relu` over an NHWC tensor with a transcendental activation
+/// (SiLU), exercising both the channels-last channel-index recovery in
+/// `apply_fused_bn_activation` and the `ex2.approx`-based activation math it
+/// reuses from the MoE epilogue, end-to-end through the public API.
+#[test]
+fn conv_bn_relu_nhwc_silu_matches_cpu_oracle() {
+    let Some(fx) = gpu_fixture() else {
+        return;
+    };
+    let case = ConvCase {
+        n: 2,
+        c: 6,
+        h: 9,
+        w: 11,
+        k: 5,
+        r: 3,
+        s: 3,
+        pad_h: 1,
+        pad_w: 1,
+        str_h: 1,
+        str_w: 1,
+        dil_h: 1,
+        dil_w: 1,
+        groups: 1,
+        layout: TensorLayout::Nhwc,
+    };
+    run_conv_bn_relu(
+        &fx,
+        case,
+        Activation::Silu,
+        (1e-2, 1e-2),
+        "conv_bn_relu_nhwc_silu",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // ptxas pre-screen guarantees (numeric kernels assemble for sm_86)
 // ---------------------------------------------------------------------------
 
@@ -1343,4 +1769,234 @@ fn conv_fprop_kernels_assemble_sm86() {
         .generate_ptx()
         .expect("implicit gemm f64 ptx");
     ptxas_assembles(&ig_f64, "implicit_gemm_f64").expect("implicit gemm f64 assembles");
+}
+
+// ---------------------------------------------------------------------------
+// Compiled-kernel cache (handle module cache + occupancy launch config)
+// ---------------------------------------------------------------------------
+
+/// Runs one `ImplicitGemmConv` shape on `handle` and asserts the result against
+/// the CPU oracle, returning nothing. Unlike [`run_conv_f32`] this takes an
+/// explicit handle so several shapes can share one handle — which is exactly
+/// what makes it a cache-key test.
+fn assert_implicit_gemm_correct(handle: &DnnHandle, sm: SmVersion, case: ConvCase, tag: &str) {
+    let (out_h, out_w) = case.out_hw();
+    let icpg = case.c / case.groups;
+    let in_n = (case.n * case.c * case.h * case.w) as usize;
+    let fil_n = (case.k * icpg * case.r * case.s) as usize;
+    let out_n = (case.n * case.k * out_h * out_w) as usize;
+
+    let mut lcg = Lcg::new(0x05ee_d0fc_ac4e_u64);
+    let in32: Vec<f32> = (0..in_n).map(|_| lcg.range_f32(-1.0, 1.0)).collect();
+    let fil32: Vec<f32> = (0..fil_n).map(|_| lcg.range_f32(-1.0, 1.0)).collect();
+
+    let in_buf = DeviceBuffer::from_host(&in32).expect("upload input");
+    let fil_buf = DeviceBuffer::from_host(&fil32).expect("upload filter");
+    let out_buf = DeviceBuffer::from_host(&vec![-987.0f32; out_n]).expect("alloc output");
+
+    let in_desc = make_desc(&in_buf, case.layout);
+    let fil_desc = make_desc(&fil_buf, case.layout);
+    let mut out_desc = make_desc_mut(&out_buf, case.layout);
+
+    ImplicitGemmConv::new(case.problem(PtxType::F32), sm)
+        .execute(handle, &in_desc, &fil_desc, None, &mut out_desc)
+        .expect("implicit gemm launch");
+    handle.stream().synchronize().expect("synchronize");
+
+    let mut gpu = vec![0.0f32; out_n];
+    out_buf.copy_to_host(&mut gpu).expect("copy output");
+
+    let in64: Vec<f64> = in32.iter().map(|&v| f64::from(v)).collect();
+    let fil64: Vec<f64> = fil32.iter().map(|&v| f64::from(v)).collect();
+    let exp: Vec<f32> = conv2d_ref(case, &in64, &fil64, None)
+        .into_iter()
+        .map(|v| v as f32)
+        .collect();
+    assert_close_f32(&gpu, &exp, 1e-5, 1e-6, tag);
+}
+
+/// The cache must actually *hit*: calling the same convolution shape many times
+/// on one handle may JIT exactly one module, not one per call.
+///
+/// This is the whole point of the compiled-kernel cache — before it existed
+/// every `execute` ran `Module::from_ptx`, a real `cuModuleLoadData` compile, on
+/// every single call. A regression here is silent (results stay correct, the
+/// pipeline just gets ~194 us/call slower), so it is asserted rather than
+/// eyeballed.
+#[test]
+fn repeated_conv_compiles_exactly_one_module() {
+    let Some(fx) = gpu_fixture() else {
+        return;
+    };
+    let case = ConvCase {
+        n: 1,
+        c: 8,
+        h: 12,
+        w: 10,
+        k: 6,
+        r: 3,
+        s: 3,
+        pad_h: 1,
+        pad_w: 1,
+        str_h: 1,
+        str_w: 1,
+        dil_h: 1,
+        dil_w: 1,
+        groups: 1,
+        layout: TensorLayout::Nchw,
+    };
+
+    let before = fx.handle.compiled_module_count();
+    for _ in 0..16 {
+        assert_implicit_gemm_correct(&fx.handle, fx.sm, case, "cache_hit");
+    }
+    let after = fx.handle.compiled_module_count();
+
+    assert_eq!(
+        after - before,
+        1,
+        "16 identical convolutions must JIT one module, not {}",
+        after - before
+    );
+}
+
+/// Two convolution shapes that differ *only* in what the generator bakes into
+/// the PTX as an immediate must not share a cached module.
+///
+/// `ImplicitGemmConv` folds the filter extent and the channels-per-group counts
+/// into the instruction stream. Its kernel name — which is the cache key — used
+/// to encode neither, so caching by name would have served the second shape the
+/// first shape's compiled module and produced silently wrong output. Both
+/// shapes run on the *same handle* (so they share one cache) and both are
+/// checked against the CPU oracle, so a key regression fails loudly here.
+#[test]
+fn distinct_conv_shapes_on_one_handle_stay_correct() {
+    let Some(fx) = gpu_fixture() else {
+        return;
+    };
+    let base = ConvCase {
+        n: 1,
+        c: 4,
+        h: 9,
+        w: 7,
+        k: 4,
+        r: 3,
+        s: 3,
+        pad_h: 1,
+        pad_w: 1,
+        str_h: 1,
+        str_w: 1,
+        dil_h: 1,
+        dil_w: 1,
+        groups: 1,
+        layout: TensorLayout::Nchw,
+    };
+    // Same precision and layout, different code-gen immediates each time.
+    let wider_channels = ConvCase { c: 12, ..base };
+    let bigger_filter = ConvCase {
+        r: 5,
+        s: 5,
+        pad_h: 2,
+        pad_w: 2,
+        ..base
+    };
+    let grouped = ConvCase {
+        c: 8,
+        k: 8,
+        groups: 2,
+        ..base
+    };
+
+    // Interleave so a stale cache entry from an earlier shape would be picked
+    // up by a later one.
+    for (case, tag) in [
+        (base, "base"),
+        (wider_channels, "wider_channels"),
+        (bigger_filter, "bigger_filter"),
+        (grouped, "grouped"),
+        (base, "base_again"),
+        (bigger_filter, "bigger_filter_again"),
+        (wider_channels, "wider_channels_again"),
+    ] {
+        assert_implicit_gemm_correct(&fx.handle, fx.sm, case, tag);
+    }
+
+    // The key must be exactly as discriminating as the generated PTX -- no
+    // more, no less. `grouped` (C=8, K=8, groups=2) has the *same*
+    // channels-per-group pair as `base` (C=4, K=4, groups=1), and `groups`
+    // itself is never baked in (the kernel derives the group index at runtime
+    // from the `ocpg` immediate), so the two emit byte-identical PTX and
+    // correctly share one module. Assert that directly rather than hard-coding
+    // a count nobody can check.
+    let ptx_of = |case: ConvCase| {
+        ImplicitGemmConv::new(case.problem(PtxType::F32), fx.sm)
+            .generate_ptx()
+            .expect("ptx")
+    };
+    assert_eq!(
+        ptx_of(base),
+        ptx_of(grouped),
+        "same channels-per-group and filter extent must emit identical PTX"
+    );
+    for other in [wider_channels, bigger_filter] {
+        assert_ne!(
+            ptx_of(base),
+            ptx_of(other),
+            "differing code-gen immediates must emit different PTX"
+        );
+    }
+
+    // Hence three distinct modules for the four shapes, and every repeat a hit.
+    assert_eq!(
+        fx.handle.compiled_module_count(),
+        3,
+        "one module per distinct PTX, and repeats must hit the cache"
+    );
+}
+
+/// The occupancy-derived launch configuration must still cover every output
+/// element, across problem sizes that straddle warp and block boundaries.
+///
+/// The block size is now whatever `cuOccupancyMaxPotentialBlockSize` suggests
+/// for the compiled kernel rather than a hard-coded 256, so the grid math is
+/// re-verified on real hardware at sizes that are deliberately *not* multiples
+/// of any plausible block size. An under-covering grid would leave the output
+/// buffer's sentinel fill in place, which the oracle comparison catches.
+#[test]
+fn occupancy_launch_covers_every_output_element() {
+    let Some(fx) = gpu_fixture() else {
+        return;
+    };
+    // Output extents chosen so `n*k*out_h*out_w` lands just below, on, and just
+    // above 32/64/256/1024 multiples.
+    for (w, k, tag) in [
+        (1u32, 1u32, "tiny_1_output"),
+        (5, 1, "under_one_warp"),
+        (8, 4, "exactly_32"),
+        (9, 4, "just_over_32"),
+        (16, 16, "exactly_256"),
+        (17, 16, "just_over_256"),
+        (33, 31, "prime_ish"),
+        (64, 16, "exactly_1024"),
+        (65, 16, "just_over_1024"),
+    ] {
+        let case = ConvCase {
+            n: 1,
+            c: 3,
+            h: 4,
+            w: w + 2,
+            k,
+            r: 3,
+            s: 3,
+            pad_h: 1,
+            pad_w: 0,
+            str_h: 1,
+            str_w: 1,
+            dil_h: 1,
+            dil_w: 1,
+            groups: 1,
+            layout: TensorLayout::Nchw,
+        };
+        assert_implicit_gemm_correct(&fx.handle, fx.sm, case, tag);
+    }
 }

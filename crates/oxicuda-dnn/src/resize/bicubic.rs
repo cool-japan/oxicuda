@@ -4,15 +4,13 @@
 //! using cubic weights. This provides higher-quality upsampling than bilinear
 //! at the cost of more memory accesses and arithmetic per output element.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 use crate::tensor_util::{nchw_dims, nchw_dims_mut};
 use crate::types::{TensorDesc, TensorDescMut};
@@ -48,11 +46,12 @@ pub fn resize_bicubic<T: GpuFloat>(
         return Ok(());
     }
 
-    let ptx = generate_bicubic_ptx::<T>(handle.sm_version(), align_corners)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let suffix = if align_corners { "ac" } else { "noac" };
     let name = format!("dnn_resize_bicubic_{suffix}_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &name)?;
+    let kernel =
+        handle.get_or_compile_kernel(&cache_key(&name, handle.sm_version()), &name, || {
+            generate_bicubic_ptx::<T>(handle.sm_version(), align_corners)
+        })?;
 
     let grid = grid_size_for(total, BICUBIC_BLOCK);
     let params = LaunchParams::new(grid, BICUBIC_BLOCK);
@@ -62,6 +61,7 @@ pub fn resize_bicubic<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("resize_bicubic: {e}")))?;
 

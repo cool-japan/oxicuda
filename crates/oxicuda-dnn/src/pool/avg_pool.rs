@@ -4,15 +4,13 @@
 //! the kernel window. The `count_include_pad` flag controls whether
 //! zero-padded elements contribute to the denominator.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 use crate::tensor_util::{nchw_dims, nchw_dims_mut};
 use crate::types::{TensorDesc, TensorDescMut, pool_output_size};
@@ -68,10 +66,11 @@ pub fn avg_pool2d<T: GpuFloat>(
         return Ok(());
     }
 
-    let ptx = generate_avg_pool2d_ptx::<T>(handle.sm_version(), count_include_pad)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let name = avg_pool2d_kernel_name::<T>(count_include_pad);
-    let kernel = Kernel::from_module(module, &name)?;
+    let kernel =
+        handle.get_or_compile_kernel(&cache_key(&name, handle.sm_version()), &name, || {
+            generate_avg_pool2d_ptx::<T>(handle.sm_version(), count_include_pad)
+        })?;
 
     let grid = grid_size_for(total_output, AVG_POOL_BLOCK);
     let params = LaunchParams::new(grid, AVG_POOL_BLOCK);
@@ -95,6 +94,7 @@ pub fn avg_pool2d<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("avg_pool2d: {e}")))?;
 

@@ -15,16 +15,14 @@
 //!    - Load V block to shared memory, accumulate `O += P_block @ V_block`.
 //! 4. Final rescale and store `O`.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams};
+use oxicuda_launch::{Dim3, LaunchParams};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key_with;
 use crate::tensor_util::{attn_dims, attn_dims_mut};
 use crate::types::{TensorDesc, TensorDescMut};
 
@@ -67,6 +65,24 @@ pub struct FlashAttentionConfig {
 }
 
 impl FlashAttentionConfig {
+    /// Returns the code-generation discriminators this config contributes that
+    /// the kernel entry name does not already encode.
+    ///
+    /// [`Self::generate_ptx`] and [`generate_backward_ptx`](super::backward)
+    /// specialise on `head_dim`, `block_m`, `block_n`, `precision`, `causal`
+    /// and `num_warps`. The first four appear in the entry name; the last two
+    /// do not, so they must join the compiled-module cache key or a causal
+    /// kernel could be served from a non-causal compile of the same shape.
+    ///
+    /// Deliberately excluded: `seq_len_q`, `seq_len_kv`, `num_heads` and
+    /// `sm_scale` are runtime kernel parameters, not code-gen constants.
+    /// Including a per-call sequence length would compile and retain a fresh
+    /// module on every call.
+    #[must_use]
+    pub(crate) fn codegen_key(&self) -> String {
+        format!("causal={},warps={}", self.causal, self.num_warps)
+    }
+
     /// Creates an auto-tuned configuration for common cases.
     ///
     /// Selects tile sizes and warp counts based on head dimension and
@@ -293,7 +309,6 @@ pub fn flash_attention_forward<T: GpuFloat>(
 
     let (batch, num_heads, _seq_q, _head_dim) = attn_dims(q)?;
 
-    let ptx = config.generate_ptx()?;
     let kernel_name = format!(
         "flash_attn_fwd_d{}_bm{}_bn{}_{}",
         config.head_dim,
@@ -301,8 +316,11 @@ pub fn flash_attention_forward<T: GpuFloat>(
         config.block_n,
         ptx_type_suffix(config.precision)
     );
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(&kernel_name, config.sm_version, &config.codegen_key()),
+        &kernel_name,
+        || config.generate_ptx(),
+    )?;
 
     let num_q_tiles = config.num_q_tiles();
     let num_kv_tiles = config.num_kv_tiles();
@@ -317,7 +335,7 @@ pub fn flash_attention_forward<T: GpuFloat>(
         .shared_mem(config.shared_mem_bytes())
         .build();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &params,
         handle.stream(),
         &(

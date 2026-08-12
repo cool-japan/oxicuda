@@ -19,18 +19,41 @@
 //! |------|--------------------|--------------------|---------|
 //! | F(2,3) | 2x2 x 3x3 = 36 | 4x4 = 16 | 2.25x |
 //! | F(4,3) | 4x4 x 3x3 = 144 | 6x6 = 36 | 4.0x |
-
-use std::sync::Arc;
+//!
+//! # Implementation status
+//!
+//! The algorithm description above is the design this module targets, not
+//! what currently executes. [`WinogradConv::generate_input_transform_ptx`]
+//! and [`WinogradConv::generate_output_transform_ptx`] emit PTX bodies that
+//! are structural skeletons -- only step-marker `comment()` calls narrating
+//! each stage, then `ret`; no load, transform, multiply, or store is ever
+//! emitted. The middle stage, `launch_winograd_gemm`, launches no kernel at
+//! all (`let _ = handle; Ok(())`). Net effect: calling
+//! [`WinogradConv::execute`] leaves the caller's `output` buffer completely
+//! **untouched** (whatever device memory happened to already be there),
+//! not merely numerically wrong.
+//!
+//! Because of this, [`select_algorithm`](super::super::algo_select::select_algorithm)
+//! gates this engine off behind
+//! [`winograd_forward_implemented`](super::super::algo_select::winograd_forward_implemented)
+//! (currently `false`): the public [`conv_forward`](super::super::api::conv_forward)
+//! entry point never routes a convolution here, falling back to the
+//! numerically-verified `Im2colGemmConv` / `ImplicitGemmConv` engines
+//! instead. See `algo_select.rs`'s module docs and the load/launch-only
+//! fragment tests in `gpu_tests::conv_fprop` (which assert the
+//! untouched-buffer behaviour as their PASS condition) for the full
+//! picture. `WinogradConv` can still be constructed and driven directly (as
+//! those tests do) -- it is only unreachable through the normal dispatch
+//! path.
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::KernelBuilder;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 use super::super::descriptor::ConvProblem;
@@ -207,6 +230,11 @@ impl WinogradTileSize {
 /// 1. Input transform (spatial -> Winograd domain)
 /// 2. Batched GEMM (per transform element)
 /// 3. Output transform (Winograd domain -> spatial)
+///
+/// **Not yet functional** -- see the module-level "Implementation status"
+/// section. All three stages are currently load/launch-only skeletons (or,
+/// for the GEMM stage, not even a kernel launch); [`execute`](Self::execute)
+/// leaves its `output` argument completely untouched.
 pub struct WinogradConv {
     problem: ConvProblem,
     tile_size: WinogradTileSize,
@@ -379,6 +407,17 @@ impl WinogradConv {
 
     /// Executes the full Winograd convolution pipeline.
     ///
+    /// # Warning: structural skeleton
+    ///
+    /// This launches three stages (see the module-level "Implementation
+    /// status" section) whose PTX bodies are comment-only skeletons, plus a
+    /// middle "GEMM" stage that launches no kernel at all. It runs
+    /// fault-free and returns `Ok(())`, but `output` is left **completely
+    /// untouched** -- not numerically wrong, simply never written. The
+    /// public [`conv_forward`](super::super::api::conv_forward) dispatcher
+    /// never calls this (see `algo_select::winograd_forward_implemented`);
+    /// call it directly only to exercise or extend the skeleton itself.
+    ///
     /// # Errors
     ///
     /// Returns [`DnnError::WorkspaceRequired`] if workspace is too small.
@@ -417,13 +456,14 @@ impl WinogradConv {
         input: &TensorDesc<T>,
         workspace: &mut oxicuda_memory::DeviceBuffer<u8>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_input_transform_ptx()?;
         let name = format!(
             "winograd_input_transform_f{}x3",
             self.tile_size.output_tile()
         );
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &name)?;
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&name, self.sm_version), &name, || {
+                self.generate_input_transform_ptx()
+            })?;
 
         let out_h = self.problem.output_h()?;
         let out_w = self.problem.output_w()?;
@@ -432,9 +472,7 @@ impl WinogradConv {
         let tiles_w = out_w.div_ceil(ot);
         let num_tiles = tiles_h * tiles_w * self.problem.batch * self.problem.in_channels;
 
-        let block = 256u32;
-        let grid = grid_size_for(num_tiles, block);
-        let params = LaunchParams::new(grid, block);
+        let params = kernel.launch_1d(num_tiles);
 
         let args = (
             input.ptr,
@@ -451,6 +489,7 @@ impl WinogradConv {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -476,13 +515,14 @@ impl WinogradConv {
         output: &mut TensorDescMut<T>,
         workspace: &mut oxicuda_memory::DeviceBuffer<u8>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_output_transform_ptx()?;
         let name = format!(
             "winograd_output_transform_f{}x3",
             self.tile_size.output_tile()
         );
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &name)?;
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&name, self.sm_version), &name, || {
+                self.generate_output_transform_ptx()
+            })?;
 
         let out_h = self.problem.output_h()?;
         let out_w = self.problem.output_w()?;
@@ -491,9 +531,7 @@ impl WinogradConv {
         let tiles_w = out_w.div_ceil(ot);
         let num_tiles = tiles_h * tiles_w * self.problem.batch * self.problem.out_channels;
 
-        let block = 256u32;
-        let grid = grid_size_for(num_tiles, block);
-        let params = LaunchParams::new(grid, block);
+        let params = kernel.launch_1d(num_tiles);
 
         let args = (
             workspace.as_device_ptr(),
@@ -507,6 +545,7 @@ impl WinogradConv {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 

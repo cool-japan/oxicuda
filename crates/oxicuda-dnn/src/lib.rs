@@ -32,6 +32,7 @@ pub mod resize;
 pub mod rnn;
 pub mod types;
 
+pub(crate) mod kernel_cache;
 pub(crate) mod ptx_helpers;
 pub(crate) mod tensor_util;
 

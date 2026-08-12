@@ -11,16 +11,15 @@
 //! - [`fused_rms_norm_silu`] -- RMSNorm followed by SiLU (Swish)
 
 use std::fmt::Write as FmtWrite;
-use std::sync::Arc;
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams};
+use oxicuda_launch::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 // ---------------------------------------------------------------------------
@@ -183,13 +182,13 @@ fn launch_fused_norm<T: GpuFloat>(
         });
     }
 
-    let ptx_source = generate_fused_ptx::<T>(handle.sm_version(), hidden_dim, kind)?;
+    let sm = handle.sm_version();
     let kernel_name = fused_kernel_name::<T>(hidden_dim, kind);
-    let module = Arc::new(Module::from_ptx(&ptx_source).map_err(|e| {
-        DnnError::LaunchFailed(format!("module load for fused_{}: {e}", kind.tag()))
-    })?);
-    let kernel = Kernel::from_module(module, &kernel_name)
-        .map_err(|e| DnnError::LaunchFailed(format!("kernel lookup for {kernel_name}: {e}")))?;
+    let kernel = handle
+        .get_or_compile_kernel(&cache_key(&kernel_name, sm), &kernel_name, || {
+            generate_fused_ptx::<T>(sm, hidden_dim, kind)
+        })
+        .map_err(|e| DnnError::LaunchFailed(format!("compile {kernel_name}: {e}")))?;
 
     let block_size = if hidden_dim <= 1024 {
         hidden_dim.next_power_of_two().min(1024)
@@ -207,6 +206,7 @@ fn launch_fused_norm<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("fused_{}: {e}", kind.tag())))?;
 

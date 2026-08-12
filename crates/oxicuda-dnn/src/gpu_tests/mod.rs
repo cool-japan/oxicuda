@@ -36,6 +36,7 @@ use crate::handle::DnnHandle;
 mod attn;
 mod conv_fprop;
 mod conv_other;
+mod handle_sync;
 mod moe_linear;
 mod norm;
 mod pool_resize;

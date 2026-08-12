@@ -204,6 +204,257 @@ fn write_line(ptx: &mut String, line: &str) -> BlasResult<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Split-K partial GEMM kernel generator
+// ---------------------------------------------------------------------------
+
+/// Generates a PTX kernel that computes one K-partition's worth of a GEMM
+/// reduction into a scratch workspace.
+///
+/// This is the counterpart to [`generate_splitk_reduction_kernel`] and
+/// together they form a genuine two-pass split-K GEMM, used by
+/// [`super::dispatch::GemmDispatcher`] for GEMV-shaped problems (tiny `M*N`,
+/// large `K` — e.g. ArcFace's `1x25088 @ 25088x512` embedding projection):
+/// the single-pass tiled/naive kernel can only ever launch `M*N` total
+/// threads (one per output element, each doing the *entire* `K`-length
+/// reduction serially), which for a shape like that caps the launch at a
+/// few hundred threads on hardware than can schedule tens of thousands
+/// concurrently. This kernel instead lets `gridDim.z` threads split the
+/// reduction itself: thread block `z` reduces only `A[.., k_start..k_end)`
+/// against `B[k_start..k_end, ..]` and writes its partial dot product to
+/// `workspace[z*M*N + row*N + col]` — `M*N` *times* `gridDim.z` independent
+/// threads of work, all schedulable at once.
+///
+/// # Kernel signature
+///
+/// `(a_ptr, b_ptr, workspace_ptr, m, n, k_total, k_per_split)` — all six
+/// integer parameters are unsigned 32-bit except the three pointers (64-bit).
+///
+/// * `a_ptr` — `M x k_total` row-major (the *full*, untruncated A; `k_total`
+///   is A's row stride, so addressing a K-sub-range still needs the true K).
+/// * `b_ptr` — `k_total x N` row-major.
+/// * `workspace_ptr` — `gridDim.z x M x N` scratch buffer (partition-major);
+///   every `(z, row, col)` triple is written by exactly one thread, so the
+///   caller need not zero-initialise it first.
+/// * `k_per_split` — elements of K each partition reduces; partition `z`
+///   covers `[z*k_per_split, min((z+1)*k_per_split, k_total))`. The caller
+///   derives this (and the `gridDim.z` partition count) from
+///   [`SplitKConfig`], and must launch with `gridDim.z == split_factor`
+///   exactly so every element of `k_total` is covered by exactly one
+///   partition.
+///
+/// No `alpha`/`beta`/`C` here — this pass writes the *raw* partial dot
+/// product; [`generate_splitk_reduction_kernel`] applies the epilogue once
+/// all partitions are summed.
+///
+/// # Grid shape required at launch
+///
+/// `gridDim.z` **must** equal the caller's `split_factor`. `gridDim.x`,
+/// `gridDim.y`, and `blockDim.x` are free to choose (`blockDim.y`/`.z` must
+/// be `1`): the kernel grid-strides over the flattened `M*N` output within
+/// each `z`-slice, so any positive thread count is correct, though a count
+/// approaching `M*N` is what actually buys the occupancy this exists for.
+///
+/// # Errors
+///
+/// Returns [`BlasError::PtxGeneration`] if `acc_type` is not `F32`/`F64`, or
+/// on formatting failure.
+pub fn generate_splitk_partial_kernel(
+    target: SmVersion,
+    acc_type: PtxType,
+) -> BlasResult<(String, String)> {
+    if !matches!(acc_type, PtxType::F32 | PtxType::F64) {
+        return Err(BlasError::PtxGeneration(format!(
+            "split-K partial kernel requires F32 or F64 accumulator, got {}",
+            acc_type.as_ptx_str()
+        )));
+    }
+
+    let ty = acc_type.as_ptx_str();
+    let acc_zero = acc_type.zero_literal();
+    let byte_size = acc_type.size_bytes();
+    let kernel_name = format!("splitk_partial_{}", ty.trim_start_matches('.'));
+
+    let mut ptx = String::with_capacity(6144);
+
+    write_line(&mut ptx, &format!(".version {}", target.ptx_version()))?;
+    write_line(&mut ptx, &format!(".target {}", target.as_ptx_str()))?;
+    write_line(&mut ptx, ".address_size 64")?;
+    write_line(&mut ptx, "")?;
+
+    write_line(&mut ptx, &format!(".visible .entry {kernel_name}("))?;
+    write_line(&mut ptx, "    .param .u64 %param_a,")?;
+    write_line(&mut ptx, "    .param .u64 %param_b,")?;
+    write_line(&mut ptx, "    .param .u64 %param_ws,")?;
+    write_line(&mut ptx, "    .param .u32 %param_m,")?;
+    write_line(&mut ptx, "    .param .u32 %param_n,")?;
+    write_line(&mut ptx, "    .param .u32 %param_ktotal,")?;
+    write_line(&mut ptx, "    .param .u32 %param_kpersplit")?;
+    write_line(&mut ptx, ")")?;
+    write_line(&mut ptx, "{")?;
+
+    write_line(&mut ptx, "    .reg .b32 %r<40>;")?;
+    write_line(&mut ptx, "    .reg .b64 %rd<24>;")?;
+    write_line(&mut ptx, &format!("    .reg {ty} %f<8>;"))?;
+    write_line(&mut ptx, "    .reg .pred %p<4>;")?;
+    write_line(&mut ptx, "")?;
+
+    write_line(&mut ptx, "    // Load parameters")?;
+    write_line(&mut ptx, "    ld.param.u64 %rd0, [%param_a];")?;
+    write_line(&mut ptx, "    ld.param.u64 %rd1, [%param_b];")?;
+    write_line(&mut ptx, "    ld.param.u64 %rd2, [%param_ws];")?;
+    write_line(&mut ptx, "    ld.param.u32 %r8, [%param_m];")?;
+    write_line(&mut ptx, "    ld.param.u32 %r9, [%param_n];")?;
+    write_line(&mut ptx, "    ld.param.u32 %r10, [%param_ktotal];")?;
+    write_line(&mut ptx, "    ld.param.u32 %r11, [%param_kpersplit];")?;
+    write_line(&mut ptx, "")?;
+
+    // Partition index and its K-range: z selects a *disjoint* [k_start,
+    // k_end) slice of the reduction, not an output tile — gridDim.z is the
+    // split factor, one CTA-column of z per partition.
+    write_line(&mut ptx, "    // Partition (K sub-range) this z-slice owns")?;
+    write_line(&mut ptx, "    mov.u32 %r12, %ctaid.z;  // z")?;
+    write_line(
+        &mut ptx,
+        "    mul.lo.u32 %r13, %r12, %r11;  // k_start = z * k_per_split",
+    )?;
+    write_line(&mut ptx, "    add.u32 %r14, %r13, %r11;")?;
+    write_line(
+        &mut ptx,
+        "    min.u32 %r14, %r14, %r10;  // k_end = min(k_start + k_per_split, k_total)",
+    )?;
+    write_line(
+        &mut ptx,
+        "    setp.ge.u32 %p3, %r13, %r10;  // defensive: k_start >= k_total never happens",
+    )?;
+    write_line(
+        &mut ptx,
+        "    @%p3 bra $PARTIAL_DONE;  // for a correctly-sized launch",
+    )?;
+    write_line(&mut ptx, "")?;
+
+    // Linear thread id *within this z-slice* (no ctaid.z term: z already
+    // selects the K-partition, not a share of the M*N grid-stride space).
+    write_line(
+        &mut ptx,
+        "    // linear_id = (ctaid.y*gridDim.x + ctaid.x)*blockDim.x + tid.x",
+    )?;
+    write_line(&mut ptx, "    mov.u32 %r0, %tid.x;")?;
+    write_line(&mut ptx, "    mov.u32 %r1, %ctaid.x;")?;
+    write_line(&mut ptx, "    mov.u32 %r2, %ctaid.y;")?;
+    write_line(&mut ptx, "    mov.u32 %r4, %ntid.x;")?;
+    write_line(&mut ptx, "    mov.u32 %r5, %nctaid.x;")?;
+    write_line(&mut ptx, "    mov.u32 %r6, %nctaid.y;")?;
+    write_line(&mut ptx, "    mad.lo.u32 %r15, %r2, %r5, %r1;  // y*gx + x")?;
+    write_line(
+        &mut ptx,
+        "    mad.lo.u32 %r16, %r15, %r4, %r0;  // *bdx + tid.x = linear_id",
+    )?;
+    write_line(
+        &mut ptx,
+        "    // total_threads_per_slice = gridDim.x*gridDim.y*blockDim.x",
+    )?;
+    write_line(&mut ptx, "    mul.lo.u32 %r17, %r5, %r6;")?;
+    write_line(&mut ptx, "    mul.lo.u32 %r17, %r17, %r4;")?;
+    write_line(&mut ptx, "")?;
+
+    write_line(
+        &mut ptx,
+        "    // total_elems = m*n (64-bit: avoids overflow for m*n >= 2^32)",
+    )?;
+    write_line(&mut ptx, "    mul.wide.u32 %rd9, %r8, %r9;")?;
+    write_line(&mut ptx, "    cvt.u64.u32 %rd10, %r16;  // idx = linear_id")?;
+    write_line(&mut ptx, "    cvt.u64.u32 %rd11, %r17;  // stride")?;
+    write_line(&mut ptx, "    cvt.u64.u32 %rd12, %r9;   // n (64-bit)")?;
+    write_line(
+        &mut ptx,
+        "    cvt.u64.u32 %rd20, %r12;  // z (64-bit) -> partition base offset",
+    )?;
+    write_line(
+        &mut ptx,
+        "    mul.lo.u64 %rd20, %rd20, %rd9;  // z * (m*n) elements",
+    )?;
+    write_line(&mut ptx, "")?;
+
+    write_line(&mut ptx, "$PARTIAL_LOOP:")?;
+    write_line(&mut ptx, "    setp.ge.u64 %p0, %rd10, %rd9;")?;
+    write_line(&mut ptx, "    @%p0 bra $PARTIAL_DONE;")?;
+    write_line(
+        &mut ptx,
+        "    div.u64 %rd13, %rd10, %rd12;  // row = idx / n",
+    )?;
+    write_line(
+        &mut ptx,
+        "    rem.u64 %rd14, %rd10, %rd12;  // col = idx % n",
+    )?;
+    write_line(&mut ptx, "    cvt.u32.u64 %r20, %rd13;")?;
+    write_line(&mut ptx, "    cvt.u32.u64 %r21, %rd14;")?;
+    write_line(&mut ptx, "")?;
+
+    write_line(&mut ptx, &format!("    mov{ty} %f0, {acc_zero};  // acc"))?;
+    write_line(&mut ptx, "    mov.u32 %r22, %r13;  // ki = k_start")?;
+    write_line(&mut ptx, "")?;
+
+    write_line(&mut ptx, "$KP_LOOP:")?;
+    write_line(&mut ptx, "    setp.ge.u32 %p1, %r22, %r14;  // ki >= k_end")?;
+    write_line(&mut ptx, "    @%p1 bra $KP_DONE;")?;
+    write_line(
+        &mut ptx,
+        "    // A[row, ki] = a_ptr + (row*k_total + ki) * byte_size",
+    )?;
+    write_line(&mut ptx, "    cvt.u64.u32 %rd15, %r22;")?;
+    write_line(&mut ptx, "    mad.wide.u32 %rd15, %r20, %r10, %rd15;")?;
+    write_line(
+        &mut ptx,
+        &format!("    mul.lo.u64 %rd15, %rd15, {byte_size};"),
+    )?;
+    write_line(&mut ptx, "    add.u64 %rd16, %rd0, %rd15;")?;
+    write_line(&mut ptx, &format!("    ld.global{ty} %f1, [%rd16];"))?;
+    write_line(&mut ptx, "")?;
+    write_line(
+        &mut ptx,
+        "    // B[ki, col] = b_ptr + (ki*n + col) * byte_size",
+    )?;
+    write_line(&mut ptx, "    cvt.u64.u32 %rd17, %r21;")?;
+    write_line(&mut ptx, "    mad.wide.u32 %rd17, %r22, %r9, %rd17;")?;
+    write_line(
+        &mut ptx,
+        &format!("    mul.lo.u64 %rd17, %rd17, {byte_size};"),
+    )?;
+    write_line(&mut ptx, "    add.u64 %rd18, %rd1, %rd17;")?;
+    write_line(&mut ptx, &format!("    ld.global{ty} %f2, [%rd18];"))?;
+    write_line(&mut ptx, "")?;
+    write_line(&mut ptx, &format!("    fma.rn{ty} %f0, %f1, %f2, %f0;"))?;
+    write_line(&mut ptx, "    add.u32 %r22, %r22, 1;")?;
+    write_line(&mut ptx, "    bra $KP_LOOP;")?;
+    write_line(&mut ptx, "$KP_DONE:")?;
+    write_line(&mut ptx, "")?;
+
+    write_line(
+        &mut ptx,
+        "    // workspace[z*m*n + row*n + col] = acc (raw partial sum, no alpha/beta)",
+    )?;
+    write_line(&mut ptx, "    cvt.u64.u32 %rd19, %r21;")?;
+    write_line(&mut ptx, "    mad.wide.u32 %rd19, %r20, %r9, %rd19;")?;
+    write_line(&mut ptx, "    add.u64 %rd19, %rd19, %rd20;")?;
+    write_line(
+        &mut ptx,
+        &format!("    mul.lo.u64 %rd19, %rd19, {byte_size};"),
+    )?;
+    write_line(&mut ptx, "    add.u64 %rd21, %rd2, %rd19;")?;
+    write_line(&mut ptx, &format!("    st.global{ty} [%rd21], %f0;"))?;
+    write_line(&mut ptx, "")?;
+
+    write_line(&mut ptx, "    add.u64 %rd10, %rd10, %rd11;")?;
+    write_line(&mut ptx, "    bra $PARTIAL_LOOP;")?;
+    write_line(&mut ptx, "")?;
+    write_line(&mut ptx, "$PARTIAL_DONE:")?;
+    write_line(&mut ptx, "    ret;")?;
+    write_line(&mut ptx, "}")?;
+
+    Ok((kernel_name, ptx))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -254,5 +505,80 @@ mod tests {
     fn generate_reduction_invalid_type() {
         let result = generate_splitk_reduction_kernel(SmVersion::Sm80, PtxType::U32, 4);
         assert!(result.is_err());
+    }
+
+    // ── generate_splitk_partial_kernel ──────────────────────────────────────
+
+    #[test]
+    fn generate_partial_f32() {
+        let (name, ptx) =
+            generate_splitk_partial_kernel(SmVersion::Sm86, PtxType::F32).expect("f32 partial");
+        assert_eq!(name, "splitk_partial_f32");
+        assert!(ptx.contains(".entry splitk_partial_f32"));
+        assert!(ptx.contains("$PARTIAL_LOOP"));
+        assert!(ptx.contains("$KP_LOOP"));
+        assert!(ptx.contains("fma.rn.f32"));
+        // Seven parameters: a, b, ws, m, n, k_total, k_per_split. (`.matches(".param")`
+        // would also match every `ld.param.*` load instruction, so check the
+        // declaration list by name instead of counting the substring.)
+        for param in [
+            "%param_a",
+            "%param_b",
+            "%param_ws",
+            "%param_m",
+            "%param_n",
+            "%param_ktotal",
+            "%param_kpersplit",
+        ] {
+            assert!(
+                ptx.contains(&format!(".param .u64 {param}"))
+                    || ptx.contains(&format!(".param .u32 {param}")),
+                "missing parameter declaration for {param}"
+            );
+        }
+        // No alpha/beta epilogue in the partial pass -- pure accumulate-and-store.
+        assert!(!ptx.contains("%param_alpha"));
+        assert!(!ptx.contains("%param_beta"));
+    }
+
+    #[test]
+    fn generate_partial_f64() {
+        let (name, ptx) =
+            generate_splitk_partial_kernel(SmVersion::Sm86, PtxType::F64).expect("f64 partial");
+        assert_eq!(name, "splitk_partial_f64");
+        assert!(ptx.contains("fma.rn.f64"));
+        assert!(ptx.contains("ld.global.f64"));
+        assert!(ptx.contains("st.global.f64"));
+    }
+
+    #[test]
+    fn generate_partial_invalid_type() {
+        let result = generate_splitk_partial_kernel(SmVersion::Sm80, PtxType::U32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn generate_partial_is_ascii_only() {
+        // Mirrors `oxicuda_ptx::templates::gemm`'s ASCII-only regression test: a
+        // non-ASCII byte anywhere (even in a `//` comment) makes `ptxas` reject
+        // the module on CUDA 12.9+.
+        for acc in [PtxType::F32, PtxType::F64] {
+            let (_, ptx) = generate_splitk_partial_kernel(SmVersion::Sm86, acc)
+                .expect("partial kernel should generate");
+            assert!(ptx.is_ascii(), "non-ASCII byte in generated partial PTX");
+        }
+    }
+
+    #[test]
+    fn generate_partial_uses_ctaid_z_as_partition_not_ctaid_x_or_y() {
+        // The whole point of this kernel is that the K-partition comes from
+        // `ctaid.z` (so gridDim.x/y/blockDim.x are free for M*N coverage,
+        // orthogonal to gridDim.z's split-K role). Pin that down structurally.
+        let (_, ptx) =
+            generate_splitk_partial_kernel(SmVersion::Sm86, PtxType::F32).expect("f32 partial");
+        assert!(
+            ptx.contains("%ctaid.z"),
+            "partition index must read %ctaid.z"
+        );
     }
 }
