@@ -1,8 +1,9 @@
 //! Metal compute pipeline wrapper.
 //!
 //! A [`MetalComputePipeline`] compiles MSL source into a
-//! `metal::ComputePipelineState` and owns the associated `metal::CommandQueue`.
-//! On non-macOS platforms every constructor returns
+//! `metal::ComputePipelineState` and holds a retain of the **device-wide**
+//! `metal::CommandQueue` owned by [`crate::device::MetalDevice`], so dispatching
+//! needs no extra plumbing.  On non-macOS platforms every constructor returns
 //! [`MetalError::UnsupportedPlatform`].
 
 use crate::{
@@ -11,20 +12,59 @@ use crate::{
     memory::MetalMemoryManager,
 };
 
+// ─── Command-buffer completion checking ──────────────────────────────────────
+
+/// Map a finished command buffer's status onto a [`MetalResult`].
+///
+/// Anything other than `Completed` (device lost, GPU timeout/TDR, a Metal
+/// validation failure, an out-of-memory at encode time, …) becomes an error so
+/// callers can never mistake a failed GPU submission for a successful one and
+/// read back stale or uninitialised buffer contents.
+#[cfg(target_os = "macos")]
+pub(crate) fn status_to_result(
+    status: metal::MTLCommandBufferStatus,
+    what: &str,
+) -> MetalResult<()> {
+    match status {
+        metal::MTLCommandBufferStatus::Completed => Ok(()),
+        other => Err(MetalError::CommandBufferError(format!(
+            "GPU work for '{what}' finished with status {other:?} instead of Completed"
+        ))),
+    }
+}
+
+/// Commit `command_buffer`, block until the GPU finishes it, and turn a
+/// non-`Completed` status into an error.
+///
+/// This is the single place the crate implements the
+/// commit → `waitUntilCompleted` → `status()` sequence; every synchronous
+/// dispatch path routes through it so a GPU-side failure can never be reported
+/// as `Ok`.
+#[cfg(target_os = "macos")]
+pub(crate) fn commit_and_wait(
+    command_buffer: &metal::CommandBufferRef,
+    what: &str,
+) -> MetalResult<()> {
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    status_to_result(command_buffer.status(), what)
+}
+
 // ─── MetalComputePipeline ─────────────────────────────────────────────────────
 
 /// A compiled Metal compute pipeline together with its command queue.
 ///
 /// Created by compiling an MSL source string through
-/// [`MetalComputePipeline::new`].  The pipeline state and command queue are
-/// kept together so that callers can dispatch work without needing to manage
-/// them separately.
+/// [`MetalComputePipeline::new`].  The `command_queue` field is an independent
+/// retain of the **one queue owned by the device**, not a fresh queue — several
+/// hundred cached pipeline variants therefore still share a single
+/// `MTLCommandQueue`.
 pub struct MetalComputePipeline {
     /// The compiled pipeline state — only present on macOS.
     /// Used by [`MetalComputePipeline::dispatch`].
     #[cfg(target_os = "macos")]
     pub(crate) pipeline_state: metal::ComputePipelineState,
-    /// The command queue used to create command buffers — only present on macOS.
+    /// A retain of the device-wide command queue — only present on macOS.
     /// Used by [`MetalComputePipeline::dispatch`].
     #[cfg(target_os = "macos")]
     pub(crate) command_queue: metal::CommandQueue,
@@ -58,7 +98,11 @@ impl MetalComputePipeline {
                 .new_compute_pipeline_state_with_function(&function)
                 .map_err(|e| MetalError::PipelineCreation(e.to_string()))?;
 
-            let command_queue = device.device.new_command_queue();
+            // Retain the *device's* queue rather than creating a new one: a
+            // fresh `MTLCommandQueue` per cached pipeline variant is both
+            // wasteful and an ordering hazard (command buffers on different
+            // queues are unordered relative to each other).
+            let command_queue = device.command_queue().to_owned();
 
             Ok(Self {
                 pipeline_state,
@@ -156,17 +200,9 @@ impl MetalComputePipeline {
                 metal::MTLSize::new(tg, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
             // Surface GPU-side failures (device lost, timeout/TDR, …) instead of
             // returning Ok on a command buffer that finished in an error state.
-            match command_buffer.status() {
-                metal::MTLCommandBufferStatus::Completed => Ok(()),
-                status => Err(MetalError::CommandBufferError(format!(
-                    "compute dispatch for '{}' finished with status {status:?}",
-                    self.function_name
-                ))),
-            }
+            commit_and_wait(command_buffer, &self.function_name)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -228,6 +264,56 @@ mod tests {
         let src = crate::msl::gemm_msl();
         let err = MetalComputePipeline::new(&dev, src, "nonexistent_function").unwrap_err();
         assert!(matches!(err, MetalError::ShaderCompilation(_)));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn status_completed_is_ok_everything_else_is_err() {
+        use metal::MTLCommandBufferStatus as S;
+        assert!(status_to_result(S::Completed, "unit").is_ok());
+        for status in [
+            S::NotEnqueued,
+            S::Enqueued,
+            S::Committed,
+            S::Scheduled,
+            S::Error,
+        ] {
+            let err = status_to_result(status, "unit-op")
+                .expect_err("a non-Completed status must map to an error");
+            match err {
+                MetalError::CommandBufferError(msg) => {
+                    assert!(msg.contains("unit-op"), "message should name the op: {msg}");
+                    assert!(
+                        msg.contains(&format!("{status:?}")),
+                        "message should name the status: {msg}"
+                    );
+                }
+                other => panic!("expected CommandBufferError, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pipelines_share_one_device_command_queue() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        let a = MetalComputePipeline::new(&dev, crate::msl::gemm_msl(), "gemm_f32")
+            .expect("pipeline a");
+        let b = MetalComputePipeline::new(&dev, &crate::msl::binary_msl("add"), "binary_f32")
+            .expect("pipeline b");
+        // `CommandQueueRef` is a zero-sized foreign wrapper living at the
+        // Objective-C object's own address, so comparing the reference
+        // addresses compares the underlying MTLCommandQueue identities.
+        let device_queue: *const metal::CommandQueueRef = dev.command_queue();
+        let queue_a: *const metal::CommandQueueRef = &*a.command_queue;
+        let queue_b: *const metal::CommandQueueRef = &*b.command_queue;
+        assert!(
+            std::ptr::eq(queue_a, device_queue),
+            "pipelines must retain the device queue, not create their own"
+        );
+        assert!(std::ptr::eq(queue_a, queue_b));
     }
 
     #[test]

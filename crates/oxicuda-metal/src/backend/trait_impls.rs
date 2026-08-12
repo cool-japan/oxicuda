@@ -12,17 +12,60 @@
 use std::sync::Arc;
 
 use oxicuda_backend::{
-    BackendError, BackendResult, BackendTranspose, BinaryOp, ComputeBackend, ReduceOp, UnaryOp,
+    BackendError, BackendResult, BackendTranspose, BinaryOp, Capabilities, ComputeBackend,
+    DeviceInfo, MemoryKind, ReduceOp, UnaryOp,
 };
 
 use crate::{device::MetalDevice, memory::MetalMemoryManager};
 
-use super::functions::{read_f32_le, write_f32_le};
+use super::nn::{AttentionGeometry, Conv2dGeometry};
 use super::types::MetalBackend;
 
 impl Default for MetalBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Translate a live [`MetalDevice`]'s probed capability snapshot into the
+/// backend-agnostic [`Capabilities`] shape.
+///
+/// Every value comes from `[MTLDevice supportsFamily:]` plus the driver-reported
+/// threadgroup limits (see [`MetalDevice::capabilities`]), never from a guess.
+/// Before the backend is initialised there is no device to ask, so the
+/// conservative CPU profile is reported — the same thing the trait's own default
+/// would return.
+///
+/// Field-by-field rationale for the non-obvious entries:
+///
+/// * `supports_fp16` — MSL's `half` is a first-class scalar on every
+///   Metal-capable GPU, and [`MetalBackend::gemm_f16`] dispatches it.
+/// * `supports_bf16` / `supports_fp8` — `false`: MSL `bfloat` needs Metal 3.1
+///   and this crate ships no bf16 or fp8 kernel, so claiming either would be a
+///   lie the consumer acts on.
+/// * `tensor_cores` — mapped from `simdgroup_matrix` (Apple family 7+, i.e.
+///   Metal 3 `simdgroup_float8x8` MMA), the closest hardware analogue to WMMA.
+/// * `peer_access` — `false`: this backend drives the single system-default
+///   device and has no multi-GPU path.
+/// * `cluster_launch` / `async_copy` — `false`: Metal exposes no thread-block
+///   clusters and no `cp.async` equivalent.
+fn metal_capabilities(device: Option<&MetalDevice>) -> Capabilities {
+    let Some(device) = device else {
+        return Capabilities::default();
+    };
+    let caps = device.capabilities();
+    Capabilities {
+        supports_fp16: true,
+        supports_bf16: false,
+        supports_fp8: false,
+        tensor_cores: caps.simdgroup_matrix,
+        peer_access: false,
+        unified_memory: caps.unified_memory,
+        cluster_launch: false,
+        async_copy: false,
+        max_threads_per_block: u32::try_from(caps.max_threads_per_threadgroup).unwrap_or(u32::MAX),
+        max_shared_mem_per_block: u32::try_from(caps.threadgroup_memory).unwrap_or(u32::MAX),
+        warp_size: u32::try_from(caps.family.simd_width()).unwrap_or(32),
     }
 }
 
@@ -50,6 +93,31 @@ impl ComputeBackend for MetalBackend {
     fn is_initialized(&self) -> bool {
         self.initialized
     }
+    /// `C = alpha * op(A) * op(B) + beta * C` on the GPU.
+    ///
+    /// # Element type and layout — read this before mixing backends
+    ///
+    /// The operands are **`f32`, row-major**, with `lda`/`ldb`/`ldc` as physical
+    /// row strides that may exceed the packed minimum (a padded or sub-matrix
+    /// view). All four transpose combinations are honoured; the flags travel to
+    /// the kernel in a runtime parameter buffer.
+    ///
+    /// This deliberately matches `oxicuda_webgpu`'s `gemm` **exactly**, so the
+    /// two GPU backends accept the same argument space and produce the same
+    /// numbers. It does **not** match the
+    /// [`ComputeBackend::gemm`](oxicuda_backend::ComputeBackend::gemm) trait
+    /// doc's "column-major `f64`" wording, which describes
+    /// `oxicuda_backend::CpuBackend` — the reference implementation — and not
+    /// the GPU backends. (The trait is inconsistent with itself here: its own
+    /// default `batched_gemm` offsets pointers with `elem_bytes = 4`, i.e.
+    /// `f32`.) Metal has no `f64` type at all, so honouring the literal wording
+    /// would mean either emulating it in software or refusing every call;
+    /// matching the sibling GPU backend and saying so is the honest option.
+    ///
+    /// # Errors
+    /// * [`BackendError::NotInitialized`] before `init`.
+    /// * [`BackendError::InvalidArgument`] if any leading dimension is smaller
+    ///   than the stored row it describes, or a dimension exceeds `u32`.
     fn gemm(
         &self,
         trans_a: BackendTranspose,
@@ -70,7 +138,7 @@ impl ComputeBackend for MetalBackend {
         if m == 0 || n == 0 || k == 0 {
             return Ok(());
         }
-        super::types::validate_gemm_layout(trans_a, trans_b, n, k, lda, ldb, ldc)?;
+        super::types::validate_gemm_layout(trans_a, trans_b, m, n, k, lda, ldb, ldc)?;
         self.dispatch_gemm(
             trans_a, trans_b, m, n, k, alpha, a_ptr, lda, b_ptr, ldb, beta, c_ptr, ldc,
         )
@@ -112,60 +180,45 @@ impl ComputeBackend for MetalBackend {
                 "padding must have 2 elements [ph, pw]".into(),
             ));
         }
-        let n = input_shape[0];
-        let c_in = input_shape[1];
-        let h_in = input_shape[2];
-        let w_in = input_shape[3];
-        let k_out = filter_shape[0];
-        let fh = filter_shape[2];
-        let fw = filter_shape[3];
-        let oh = output_shape[2];
-        let ow = output_shape[3];
-        let stride_h = stride[0];
-        let stride_w = stride[1];
-        let pad_h = padding[0];
-        let pad_w = padding[1];
-        let input_len = n * c_in * h_in * w_in;
-        let filter_len = k_out * c_in * fh * fw;
-        let output_len = n * k_out * oh * ow;
-        let mut input_bytes = vec![0u8; input_len * 4];
-        let mut filter_bytes = vec![0u8; filter_len * 4];
-        self.copy_dtoh(&mut input_bytes, input_ptr)?;
-        self.copy_dtoh(&mut filter_bytes, filter_ptr)?;
-        let inp = read_f32_le(&input_bytes);
-        let flt = read_f32_le(&filter_bytes);
-        let mut out = vec![0.0f32; output_len];
-        for b in 0..n {
-            for kf in 0..k_out {
-                for oy in 0..oh {
-                    for ox in 0..ow {
-                        let mut acc = 0.0f32;
-                        for ci in 0..c_in {
-                            for fy in 0..fh {
-                                for fx in 0..fw {
-                                    let iy = (oy * stride_h + fy) as isize - pad_h as isize;
-                                    let ix = (ox * stride_w + fx) as isize - pad_w as isize;
-                                    if iy >= 0
-                                        && (iy as usize) < h_in
-                                        && ix >= 0
-                                        && (ix as usize) < w_in
-                                    {
-                                        let iy = iy as usize;
-                                        let ix = ix as usize;
-                                        acc += inp[((b * c_in + ci) * h_in + iy) * w_in + ix]
-                                            * flt[((kf * c_in + ci) * fh + fy) * fw + fx];
-                                    }
-                                }
-                            }
-                        }
-                        out[((b * k_out + kf) * oh + oy) * ow + ox] = acc;
-                    }
-                }
-            }
+        if stride[0] == 0 || stride[1] == 0 {
+            return Err(BackendError::InvalidArgument(
+                "stride entries must be non-zero; a zero stride makes every output element \
+                 read the same input window"
+                    .into(),
+            ));
         }
-        let out_bytes = write_f32_le(&out);
-        self.copy_htod(output_ptr, &out_bytes)?;
-        Ok(())
+        if input_shape[1] != filter_shape[1] {
+            return Err(BackendError::InvalidArgument(format!(
+                "input channels ({}) must equal filter channels ({})",
+                input_shape[1], filter_shape[1]
+            )));
+        }
+        if output_shape[0] != input_shape[0] || output_shape[1] != filter_shape[0] {
+            return Err(BackendError::InvalidArgument(format!(
+                "output_shape {output_shape:?} must be [N={}, K={}, Oh, Ow]",
+                input_shape[0], filter_shape[0]
+            )));
+        }
+        self.dispatch_conv2d(
+            input_ptr,
+            filter_ptr,
+            output_ptr,
+            Conv2dGeometry {
+                n: input_shape[0],
+                c_in: input_shape[1],
+                h_in: input_shape[2],
+                w_in: input_shape[3],
+                k_out: filter_shape[0],
+                fh: filter_shape[2],
+                fw: filter_shape[3],
+                oh: output_shape[2],
+                ow: output_shape[3],
+                stride_h: stride[0],
+                stride_w: stride[1],
+                pad_h: padding[0],
+                pad_w: padding[1],
+            },
+        )
     }
     fn attention(
         &self,
@@ -192,69 +245,97 @@ impl ComputeBackend for MetalBackend {
                 "scale must be a positive finite number, got {scale}"
             )));
         }
-        let batch_heads = batch * heads;
-        let q_len = batch_heads * seq_q * head_dim;
-        let kv_len = batch_heads * seq_kv * head_dim;
-        let o_len = batch_heads * seq_q * head_dim;
-        let mut q_bytes = vec![0u8; q_len * 4];
-        let mut k_bytes = vec![0u8; kv_len * 4];
-        let mut v_bytes = vec![0u8; kv_len * 4];
-        self.copy_dtoh(&mut q_bytes, q_ptr)?;
-        self.copy_dtoh(&mut k_bytes, k_ptr)?;
-        self.copy_dtoh(&mut v_bytes, v_ptr)?;
-        let q = read_f32_le(&q_bytes);
-        let k = read_f32_le(&k_bytes);
-        let v = read_f32_le(&v_bytes);
-        let mut o = vec![0.0f32; o_len];
-        let scale_f = scale as f32;
-        // Reusable per-(bh,sq) score buffer: the scaled Q·Kᵀ dot products are
-        // computed once in the max pass and reused in the accumulate pass instead
-        // of recomputing the O(head_dim) inner product a second time.
-        let mut scores = vec![0.0f32; seq_kv];
-        for bh in 0..batch_heads {
-            for sq in 0..seq_q {
-                let q_off = (bh * seq_q + sq) * head_dim;
-                let mut max_score = f32::NEG_INFINITY;
-                for (sk, score_slot) in scores.iter_mut().enumerate() {
-                    if causal && sk > sq {
-                        continue;
-                    }
-                    let k_off = (bh * seq_kv + sk) * head_dim;
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q[q_off + d] * k[k_off + d];
-                    }
-                    let score = dot * scale_f;
-                    *score_slot = score;
-                    if score > max_score {
-                        max_score = score;
-                    }
-                }
-                let mut sum_exp = 0.0f32;
-                let mut acc = vec![0.0f32; head_dim];
-                for (sk, &score) in scores.iter().enumerate() {
-                    if causal && sk > sq {
-                        continue;
-                    }
-                    // Reuse the scaled score cached in the max pass above.
-                    let w = (score - max_score).exp();
-                    sum_exp += w;
-                    let v_off = (bh * seq_kv + sk) * head_dim;
-                    for d in 0..head_dim {
-                        acc[d] += w * v[v_off + d];
-                    }
-                }
-                let o_off = (bh * seq_q + sq) * head_dim;
-                if sum_exp > 0.0 {
-                    for d in 0..head_dim {
-                        o[o_off + d] = acc[d] / sum_exp;
-                    }
-                }
-            }
+        let batch_heads = batch.checked_mul(heads).ok_or_else(|| {
+            BackendError::InvalidArgument("attention: batch * heads overflows".into())
+        })?;
+        self.dispatch_attention(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            o_ptr,
+            AttentionGeometry {
+                batch_heads,
+                seq_q,
+                seq_kv,
+                head_dim,
+                scale,
+                causal,
+            },
+        )
+    }
+    /// Numerically-stable softmax along `axis`, on the GPU.
+    ///
+    /// # Supported axes
+    ///
+    /// [`crate::msl_nn::softmax_msl`] is a **row-wise** kernel: one threadgroup
+    /// per row of a `rows × cols` contiguous matrix. That maps exactly onto
+    /// `axis == shape.len() - 1`, where the reduced elements are adjacent in
+    /// memory. Any earlier axis has an inner stride the kernel cannot express,
+    /// so it is rejected with [`BackendError::Unsupported`] rather than
+    /// reinterpreted as a different (wrong) reduction. As the trait doc notes,
+    /// such cases can still be composed from
+    /// `reduce(Max) + unary(Exp) + reduce(Sum) + binary(Div)`.
+    fn softmax(
+        &self,
+        input_ptr: u64,
+        output_ptr: u64,
+        shape: &[usize],
+        axis: usize,
+    ) -> BackendResult<()> {
+        self.check_init()?;
+        if shape.is_empty() {
+            return Err(BackendError::InvalidArgument(
+                "shape must not be empty".into(),
+            ));
         }
-        let o_bytes = write_f32_le(&o);
-        self.copy_htod(o_ptr, &o_bytes)?;
-        Ok(())
+        if axis >= shape.len() {
+            return Err(BackendError::InvalidArgument(format!(
+                "axis {axis} is out of bounds for shape of length {}",
+                shape.len()
+            )));
+        }
+        if let Some(pos) = shape.iter().position(|&d| d == 0) {
+            return Err(BackendError::InvalidArgument(format!(
+                "softmax: shape {shape:?} has a zero-length dimension at index {pos}"
+            )));
+        }
+        if axis != shape.len() - 1 {
+            return Err(BackendError::Unsupported(format!(
+                "Metal softmax reduces the last axis only (the kernel is row-contiguous); \
+                 got axis {axis} of a {}-dimensional shape",
+                shape.len()
+            )));
+        }
+        let cols = shape[axis];
+        let rows: usize = shape[..axis].iter().product();
+        self.dispatch_softmax(input_ptr, output_ptr, rows, cols)
+    }
+    fn capabilities(&self) -> Capabilities {
+        metal_capabilities(self.device.as_deref())
+    }
+    fn available_devices(&self) -> BackendResult<Vec<DeviceInfo>> {
+        let Some(device) = self.device.as_deref() else {
+            // Not initialised (always the case off macOS): nothing to report.
+            return Ok(Vec::new());
+        };
+        Ok(vec![DeviceInfo {
+            ordinal: 0,
+            name: device.name().to_string(),
+            // Metal has no CUDA-style compute capability; the GPU family is the
+            // closest analogue, so report it as `(family, 0)` — Apple7 → (7, 0),
+            // Mac2 → (2, 0) — rather than inventing a version number.
+            compute_capability: (device.capabilities().family.generation(), 0),
+            // Apple's Metal API exposes no total-VRAM query that is meaningful
+            // on unified memory; the largest single allocation is the honest,
+            // driver-reported bound.
+            total_memory_bytes: device.max_buffer_length(),
+            memory_kind: if device.capabilities().unified_memory {
+                MemoryKind::Unified
+            } else {
+                MemoryKind::Device
+            },
+            capabilities: metal_capabilities(Some(device)),
+        }])
     }
     fn reduce(
         &self,
@@ -299,6 +380,13 @@ impl ComputeBackend for MetalBackend {
         }
         self.dispatch_binary(op, a_ptr, b_ptr, output_ptr, n)
     }
+    /// Strided batched GEMM: `C_b = alpha * op(A_b) * op(B_b) + beta * C_b`.
+    ///
+    /// Same element type, layout and transpose support as [`Self::gemm`] —
+    /// `f32` row-major with runtime leading dimensions — plus per-operand
+    /// element strides between consecutive matrices. One kernel launch covers
+    /// the whole batch (the batch index is the grid's `z` axis), rather than the
+    /// trait's default loop of `batch_count` individual `gemm` calls.
     fn batched_gemm(
         &self,
         trans_a: BackendTranspose,
@@ -323,7 +411,7 @@ impl ComputeBackend for MetalBackend {
         if batch_count == 0 || m == 0 || n == 0 || k == 0 {
             return Ok(());
         }
-        super::types::validate_gemm_layout(trans_a, trans_b, n, k, lda, ldb, ldc)?;
+        super::types::validate_gemm_layout(trans_a, trans_b, m, n, k, lda, ldb, ldc)?;
         self.dispatch_batched_gemm(
             trans_a,
             trans_b,
@@ -344,9 +432,15 @@ impl ComputeBackend for MetalBackend {
             batch_count,
         )
     }
+    /// Block until every dispatch submitted through this backend has finished.
+    ///
+    /// In the default synchronous mode each op already waited before returning,
+    /// so there is nothing left to await and this succeeds immediately. With
+    /// [`MetalBackend::set_async_dispatch`] enabled it awaits every committed
+    /// command buffer and reports the first GPU-side failure among them.
     fn synchronize(&self) -> BackendResult<()> {
         self.check_init()?;
-        Ok(())
+        self.drain_inflight()
     }
     fn alloc(&self, bytes: usize) -> BackendResult<u64> {
         self.check_init()?;
@@ -359,6 +453,10 @@ impl ComputeBackend for MetalBackend {
     }
     fn free(&self, ptr: u64) -> BackendResult<()> {
         self.check_init()?;
+        // Synchronisation point: the allocator's reuse pool may hand this exact
+        // buffer to the next `alloc`, so it must not still be referenced by a
+        // kernel that has not finished.
+        self.drain_inflight()?;
         self.memory()?.free(ptr).map_err(BackendError::from)
     }
     fn copy_htod(&self, dst: u64, src: &[u8]) -> BackendResult<()> {
@@ -366,6 +464,9 @@ impl ComputeBackend for MetalBackend {
         if src.is_empty() {
             return Ok(());
         }
+        // Synchronisation point: overwriting a buffer an in-flight kernel still
+        // reads would corrupt that kernel's inputs.
+        self.drain_inflight()?;
         self.memory()?
             .copy_to_device(dst, src)
             .map_err(BackendError::from)
@@ -375,8 +476,26 @@ impl ComputeBackend for MetalBackend {
         if dst.is_empty() {
             return Ok(());
         }
+        // Synchronisation point: this is a plain `memcpy` out of unified memory,
+        // so without the wait it could read a buffer the GPU is still writing.
+        self.drain_inflight()?;
         self.memory()?
             .copy_from_device(dst, src)
             .map_err(BackendError::from)
+    }
+}
+
+/// Wait for any still-in-flight GPU work before the backend goes away.
+///
+/// Command buffers retain the resources they reference, so skipping this would
+/// not be *unsafe* — but it would let a program exit with kernels still running
+/// and their results never observed, and it would swallow a GPU failure that
+/// nothing had reported yet. The wait is a no-op in the default synchronous
+/// mode.
+impl Drop for MetalBackend {
+    fn drop(&mut self) {
+        if let Err(e) = self.drain_inflight() {
+            tracing::warn!("GPU work outstanding at MetalBackend drop failed: {e}");
+        }
     }
 }

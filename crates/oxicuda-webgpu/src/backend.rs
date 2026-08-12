@@ -11,7 +11,30 @@ use oxicuda_backend::{
 };
 use wgpu;
 
-use crate::{device::WebGpuDevice, memory::WebGpuMemoryManager, shader};
+use crate::{
+    device::WebGpuDevice,
+    memory::WebGpuMemoryManager,
+    planner::{self, Limits},
+    shader,
+};
+
+// GPU dispatch paths for conv2d_forward / attention, plus their CPU-reference
+// oracles — split into a sibling file (mirroring how `tests` below is split
+// into `backend_tests.rs`) purely to keep this file under the 2 000-line
+// refactoring policy.
+#[path = "backend_gpu_ops.rs"]
+mod gpu_ops;
+use gpu_ops::{
+    attention_cpu_reference, attention_gpu_dispatch_grid, conv2d_cpu_reference,
+    conv2d_gpu_dispatch_grid, conv2d_u32_dims,
+};
+
+// Pipeline + bind-group caching — split out for the same 2 000-line-policy
+// reason as `gpu_ops` above. See that file's module doc for the caching
+// design and its safety argument.
+#[path = "backend_cache.rs"]
+mod cache;
+use cache::{BindGroupCache, CachedPipeline};
 
 // ─── Op-mapping helpers ──────────────────────────────────────────────────────
 
@@ -75,12 +98,54 @@ fn packed_gemm_lds(
     (lda, ldb, n)
 }
 
-/// Convert a leading dimension to `u32` for the shader uniform, erroring on
-/// overflow instead of silently wrapping.
-fn lead_dim_u32(name: &str, value: usize) -> BackendResult<u32> {
+/// Convert a `usize` dimension (leading dimension, matrix extent, stride,
+/// batch count, …) to `u32` for a shader uniform, erroring on overflow
+/// instead of silently wrapping.
+///
+/// `context` should read naturally as `"<context>: <name> <value> exceeds …"`,
+/// e.g. `dim_u32("gemm", "m", m)` or `dim_u32("batched_gemm", "batch_count",
+/// batch_count)`.
+fn dim_u32(context: &str, name: &str, value: usize) -> BackendResult<u32> {
     u32::try_from(value).map_err(|_| {
-        BackendError::InvalidArgument(format!("gemm: {name} {value} exceeds u32 range"))
+        BackendError::InvalidArgument(format!("{context}: {name} {value} exceeds u32 range"))
     })
+}
+
+/// The compute-dispatch limits this backend plans against.
+///
+/// `WebGpuDevice::new_async` (`device.rs`) requests `required_limits:
+/// adapter.limits()` (not `wgpu::Limits::default()`), so the *device* itself
+/// may grant more than the WebGPU-guaranteed baseline — e.g. Apple Silicon
+/// adapters typically report up to 1024 invocations per workgroup, well
+/// above the 256-invocation / 16×16-tile / 65 535-workgroups-per-axis
+/// portable floor.
+///
+/// This function nonetheless still deliberately plans against the
+/// conservative [`Limits::portable_default`] rather than those real (often
+/// higher) adapter limits, for two independent reasons:
+///
+/// 1. Every GEMM / batched-GEMM / FP16-GEMM call site passes `preferred_tile
+///    = 16` into [`planner::plan_workgroup_square`], which treats that value
+///    as a *ceiling* — feeding in a more permissive `Limits` cannot grow the
+///    tile past 16 without also raising `preferred_tile` at the call site,
+///    which needs a larger, register-blocked kernel to stay efficient (a
+///    separate perf pass; "16×16, the portable max" was the explicit brief
+///    for this change).
+/// 2. The only other limit this module consults is `max_workgroups_per_dim`
+///    (via [`planner::plan_dispatch_1d`] / `plan_dispatch_2d`), and
+///    under-using a higher real value is safe by construction: it can only
+///    make an extremely large 1-D dispatch (tens of millions of elements and
+///    up) fold into, or get rejected as exceeding, a 2-D grid slightly
+///    sooner than the hardware strictly requires — never accept a dispatch
+///    size the device cannot actually run.
+///
+/// A future pass that raises `preferred_tile` for adapters with more
+/// headroom should replace this with a real `dev.limits()`-derived
+/// `planner::Limits` (see `WebGpuDevice::limits`) — the pipeline-cache keys
+/// already encode `tile_size` (`"gemm:{tile_size}"` etc.), so a per-adapter
+/// tile is safe to cache once that lands.
+fn gpu_limits() -> Limits {
+    Limits::portable_default()
 }
 
 // ─── Backend struct ──────────────────────────────────────────────────────────
@@ -98,11 +163,21 @@ pub struct WebGpuBackend {
     device: Option<Arc<WebGpuDevice>>,
     memory: Option<Arc<WebGpuMemoryManager>>,
     initialized: bool,
-    /// Cache of compiled compute pipelines keyed by a stable `(op, tile/size)`
-    /// string.  WGSL front-end parsing plus backend-ISA compilation is
-    /// heavyweight and depends only on the key, so every hot-path compute op
-    /// reuses its pipeline instead of rebuilding one per invocation.
-    pipeline_cache: Mutex<HashMap<String, wgpu::ComputePipeline>>,
+    /// Cache of compiled compute pipelines (bundled with their group-0
+    /// bind-group layout) keyed by a stable `(op, tile/size)` string.  WGSL
+    /// front-end parsing plus backend-ISA compilation is heavyweight and
+    /// depends only on the key, so every hot-path compute op reuses its
+    /// pipeline instead of rebuilding one per invocation.  See `cache.rs`
+    /// (`WebGpuBackend::cached_pipeline`) for the implementation.
+    pipeline_cache: Mutex<HashMap<String, CachedPipeline>>,
+    /// Cache of bind groups (each backed by its own dedicated, reused
+    /// uniform buffer) keyed by `(pipeline, operand handles)`, so a call
+    /// with the same operand buffers as a recent call — the common case in a
+    /// training/inference loop — reuses both instead of allocating a fresh
+    /// uniform buffer and bind group every single dispatch.  See `cache.rs`
+    /// (`WebGpuBackend::cached_bind_group`) for the implementation and its
+    /// safety argument.
+    bind_group_cache: Mutex<BindGroupCache>,
 }
 
 impl WebGpuBackend {
@@ -113,50 +188,8 @@ impl WebGpuBackend {
             memory: None,
             initialized: false,
             pipeline_cache: Mutex::new(HashMap::new()),
+            bind_group_cache: Mutex::new(BindGroupCache::new()),
         }
-    }
-
-    /// Return a compiled compute pipeline for `key`, building it from the WGSL
-    /// produced by `build` on the first request and caching it for reuse.
-    ///
-    /// `key` must uniquely identify the shader source (e.g. `"gemm:8"`,
-    /// `"unary:relu"`); `label` is the wgpu debug label.
-    fn cached_pipeline(
-        &self,
-        key: &str,
-        label: &str,
-        build: impl FnOnce() -> String,
-    ) -> BackendResult<wgpu::ComputePipeline> {
-        let mut cache = self
-            .pipeline_cache
-            .lock()
-            .map_err(|_| BackendError::DeviceError("pipeline cache mutex poisoned".into()))?;
-
-        if let Some(pipeline) = cache.get(key) {
-            return Ok(pipeline.clone());
-        }
-
-        let dev = self.device()?;
-        let wgsl = build();
-        let shader_mod = dev
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-            });
-        let pipeline = dev
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(label),
-                layout: None,
-                module: &shader_mod,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        cache.insert(key.to_string(), pipeline.clone());
-        Ok(pipeline)
     }
 
     /// Return an error if the backend is not yet initialised.
@@ -176,6 +209,16 @@ impl WebGpuBackend {
     /// Convenience accessor: get the device or return `NotInitialized`.
     fn device(&self) -> BackendResult<&Arc<WebGpuDevice>> {
         self.device.as_ref().ok_or(BackendError::NotInitialized)
+    }
+
+    /// Whether the initialised device enabled the `SHADER_F16` feature, i.e.
+    /// whether [`gemm_f16`](Self::gemm_f16) can run instead of returning
+    /// [`BackendError::Unsupported`].  Returns `false` (never errors) before
+    /// `init()` — callers that want to skip f16-only tests on an
+    /// uninitialised or non-f16 backend can check this directly.
+    #[must_use]
+    pub fn supports_f16(&self) -> bool {
+        self.device.as_ref().is_some_and(|d| d.supports_f16)
     }
 
     /// Multi-dimensional reduce along a single axis.
@@ -218,6 +261,12 @@ impl WebGpuBackend {
         let total = outer.checked_mul(inner).ok_or_else(|| {
             BackendError::InvalidArgument("reduce: outer * inner overflows usize".into())
         })?;
+        let in_elems = outer
+            .checked_mul(dk)
+            .and_then(|v| v.checked_mul(inner))
+            .ok_or_else(|| {
+                BackendError::InvalidArgument("reduce: outer * dk * inner overflows usize".into())
+            })?;
 
         // Strides in elements: row-major (C order) layout.
         let inner_stride: usize = 1;
@@ -226,25 +275,23 @@ impl WebGpuBackend {
             .checked_mul(inner)
             .ok_or_else(|| BackendError::InvalidArgument("reduce: dk * inner overflows".into()))?;
 
-        // Cap each dispatch dimension below the WebGPU 65 535 limit.  We pick
-        // grid_x = min(total, 32 768) so grid_y stays modest for huge tensors.
-        const MAX_GRID_DIM: u32 = 32_768;
-        let total_u32: u32 = total.try_into().map_err(|_| {
-            BackendError::InvalidArgument(format!(
-                "reduce: output element count {total} exceeds u32 range"
-            ))
-        })?;
-        let grid_x: u32 = total_u32.clamp(1, MAX_GRID_DIM);
-        let grid_y: u32 = total_u32.div_ceil(grid_x);
+        // Plan the dispatch grid: one workgroup per output slot, folded into a
+        // 2-D grid if `total` would otherwise exceed the per-axis workgroup
+        // cap (see [`planner::plan_dispatch_1d`]).  `grid_x` is threaded
+        // through the `ReduceNdParams` uniform so the shader can decode
+        // `wgid.y * grid_x + wgid.x` back to a linear slot.
+        let limits = gpu_limits();
+        let (grid, grid_x) = planner::plan_dispatch_1d(&limits, total as u64, 1)
+            .map_err(BackendError::InvalidArgument)?;
 
         let dev = self.device()?;
         let mem = self.memory()?;
         let op_str = map_reduce_op(op);
+        let pipeline_key = format!("reduce_nd:{op_str}");
 
-        let pipeline =
-            self.cached_pipeline(&format!("reduce_nd:{op_str}"), "oxicuda-reduce-nd", || {
-                shader::reduction_nd_wgsl(op_str)
-            })?;
+        let cached = self.cached_pipeline(&pipeline_key, "oxicuda-reduce-nd", || {
+            shader::reduction_nd_wgsl(op_str)
+        })?;
 
         // Build the uniform buffer: 8 × u32 = 32 bytes (16-byte aligned).
         let mut params_bytes = [0u8; 32];
@@ -275,45 +322,23 @@ impl WebGpuBackend {
         params_bytes[24..28].copy_from_slice(&grid_x.to_le_bytes());
         // bytes 28..32 are zero padding.
 
-        let uniform_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oxicuda-reduce-nd-params"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        dev.queue.write_buffer(&uniform_buf, 0, &params_bytes);
-
-        let bgl = pipeline.get_bind_group_layout(0);
-        let bind_group = {
-            let buffers = mem
-                .lock_buffers()
-                .map_err(|e| BackendError::DeviceError(e.to_string()))?;
-            let in_info = buffers.get(&input_ptr).ok_or_else(|| {
-                BackendError::InvalidArgument(format!("unknown handle {input_ptr}"))
-            })?;
-            let out_info = buffers.get(&output_ptr).ok_or_else(|| {
-                BackendError::InvalidArgument(format!("unknown handle {output_ptr}"))
-            })?;
-
-            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("oxicuda-reduce-nd"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: in_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: out_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: uniform_buf.as_entire_binding(),
-                    },
-                ],
-            })
-        };
+        // The shader trusts `shape`/`axis` to describe the buffers it is
+        // bound to; an undersized buffer would otherwise silently drop
+        // writes (WGSL robust access) or read stale/foreign data rather than
+        // error.  `in_elems`/`total` are exactly the element counts the
+        // kernel indexes into `input`/`output`.
+        let need_in = (in_elems as u64) * 4;
+        let need_out = (total as u64) * 4;
+        let bind_group = self.cached_bind_group(
+            dev,
+            mem,
+            &cached.bind_group_layout,
+            &pipeline_key,
+            &[input_ptr, output_ptr],
+            &[need_in, need_out],
+            &params_bytes,
+            "oxicuda-reduce-nd",
+        )?;
 
         let mut encoder = dev
             .device
@@ -325,37 +350,53 @@ impl WebGpuBackend {
                 label: Some("oxicuda-reduce-nd"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&cached.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid_x, grid_y, 1);
+            pass.dispatch_workgroups(grid.x, grid.y, grid.z);
         }
 
         dev.queue.submit(std::iter::once(encoder.finish()));
-        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+        // No per-op poll: wgpu executes queue submissions in FIFO order, so a
+        // later dispatch reading this op's output, or a host readback via
+        // `WebGpuMemoryManager::copy_from_device` / `synchronize()`, is
+        // correctly ordered without a host-side wait here. Polling after
+        // every submit was a full CPU/GPU pipeline stall on every op (see
+        // "wgpu blocks on device.poll(wait_indefinitely()) after EVERY
+        // submit" in the performance audit); `copy_from_device` now waits on
+        // its own precise `SubmissionIndex` and `synchronize()` still waits
+        // for all outstanding work.
 
         Ok(())
     }
 }
 
 impl WebGpuBackend {
-    /// FP16 GEMM: `C = alpha * A * B + beta * C` with half-precision storage.
+    /// FP16 GEMM: `C = alpha * op(A) * op(B) + beta * C` with half-precision
+    /// storage (accumulated in f32).
     ///
     /// This is an inherent method (not on `ComputeBackend`) because FP16
     /// support is WebGPU-specific and requires the `f16` WGSL extension.
     ///
     /// Buffers pointed to by `a_ptr`, `b_ptr`, `c_ptr` must contain `f16`
-    /// elements (2 bytes each).
+    /// elements (2 bytes each).  `lda` / `ldb` / `ldc` and `trans_a` /
+    /// `trans_b` follow exactly the same convention as
+    /// [`gemm`](ComputeBackend::gemm) — see [`shader::gemm_wgsl_f16`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_f16(
         &self,
+        trans_a: BackendTranspose,
+        trans_b: BackendTranspose,
         m: usize,
         n: usize,
         k: usize,
         alpha: f64,
         a_ptr: u64,
+        lda: usize,
         b_ptr: u64,
+        ldb: usize,
         beta: f64,
         c_ptr: u64,
+        ldc: usize,
     ) -> BackendResult<()> {
         self.check_init()?;
         if m == 0 || n == 0 || k == 0 {
@@ -377,66 +418,61 @@ impl WebGpuBackend {
             ));
         }
 
-        let tile_size: u32 = 8;
-        let pipeline = self.cached_pipeline("gemm_f16", "oxicuda-gemm-f16", || {
+        let trans_a_flag: u32 = u32::from(trans_a != BackendTranspose::NoTrans);
+        let trans_b_flag: u32 = u32::from(trans_b != BackendTranspose::NoTrans);
+
+        let (expected_lda, expected_ldb, expected_ldc) = packed_gemm_lds(trans_a, trans_b, m, n, k);
+        if lda < expected_lda || ldb < expected_ldb || ldc < expected_ldc {
+            return Err(BackendError::InvalidArgument(
+                "gemm_f16: leading dimension smaller than matrix extent".into(),
+            ));
+        }
+        let m_u32 = dim_u32("gemm_f16", "m", m)?;
+        let n_u32 = dim_u32("gemm_f16", "n", n)?;
+        let k_u32 = dim_u32("gemm_f16", "k", k)?;
+        let lda_u32 = dim_u32("gemm_f16", "lda", lda)?;
+        let ldb_u32 = dim_u32("gemm_f16", "ldb", ldb)?;
+        let ldc_u32 = dim_u32("gemm_f16", "ldc", ldc)?;
+
+        let limits = gpu_limits();
+        let tile = planner::plan_workgroup_square(&limits, 16);
+        let tile_size = tile.x;
+        // Fail fast on a dispatch grid that would exceed the per-axis
+        // workgroup cap, before creating any pipeline/buffer/bind-group GPU
+        // state for a dispatch that could never legally run.
+        let grid = planner::plan_dispatch_2d(&limits, m_u32, n_u32, tile, 1)
+            .map_err(BackendError::InvalidArgument)?;
+        let pipeline_key = format!("gemm_f16:{tile_size}");
+        let cached = self.cached_pipeline(&pipeline_key, "oxicuda-gemm-f16", || {
             shader::gemm_wgsl_f16(tile_size)
         })?;
 
-        let bgl = pipeline.get_bind_group_layout(0);
-
-        // Build uniform buffer for GemmParams { m, n, k, alpha, beta }.
-        let mut params_bytes = [0u8; 20];
-        params_bytes[0..4].copy_from_slice(&(m as u32).to_le_bytes());
-        params_bytes[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-        params_bytes[8..12].copy_from_slice(&(k as u32).to_le_bytes());
+        // Build uniform buffer for GemmParams { m, n, k, alpha, beta, trans_a,
+        // trans_b, lda, ldb, ldc, _pad0, _pad1 } — 12 × 4 = 48 bytes, mirroring
+        // the f32 `GemmParams` layout in `shader::gemm_wgsl`.
+        let mut params_bytes = [0u8; 48];
+        params_bytes[0..4].copy_from_slice(&m_u32.to_le_bytes());
+        params_bytes[4..8].copy_from_slice(&n_u32.to_le_bytes());
+        params_bytes[8..12].copy_from_slice(&k_u32.to_le_bytes());
         params_bytes[12..16].copy_from_slice(&(alpha as f32).to_le_bytes());
         params_bytes[16..20].copy_from_slice(&(beta as f32).to_le_bytes());
+        params_bytes[20..24].copy_from_slice(&trans_a_flag.to_le_bytes());
+        params_bytes[24..28].copy_from_slice(&trans_b_flag.to_le_bytes());
+        params_bytes[28..32].copy_from_slice(&lda_u32.to_le_bytes());
+        params_bytes[32..36].copy_from_slice(&ldb_u32.to_le_bytes());
+        params_bytes[36..40].copy_from_slice(&ldc_u32.to_le_bytes());
+        // bytes 40..48 are zero padding.
 
-        let uniform_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oxicuda-gemm-f16-params"),
-            size: 20,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        dev.queue.write_buffer(&uniform_buf, 0, &params_bytes);
-
-        let bind_group = {
-            let buffers = mem
-                .lock_buffers()
-                .map_err(|e| BackendError::DeviceError(e.to_string()))?;
-            let a_info = buffers
-                .get(&a_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {a_ptr}")))?;
-            let b_info = buffers
-                .get(&b_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {b_ptr}")))?;
-            let c_info = buffers
-                .get(&c_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {c_ptr}")))?;
-
-            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("oxicuda-gemm-f16"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: a_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: b_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: c_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: uniform_buf.as_entire_binding(),
-                    },
-                ],
-            })
-        };
+        let bind_group = self.cached_bind_group(
+            dev,
+            mem,
+            &cached.bind_group_layout,
+            &pipeline_key,
+            &[a_ptr, b_ptr, c_ptr],
+            &[],
+            &params_bytes,
+            "oxicuda-gemm-f16",
+        )?;
 
         let mut encoder = dev
             .device
@@ -449,15 +485,21 @@ impl WebGpuBackend {
                 label: Some("oxicuda-gemm-f16"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&cached.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let wg_x = (n as u32).div_ceil(tile_size);
-            let wg_y = (m as u32).div_ceil(tile_size);
-            pass.dispatch_workgroups(wg_x, wg_y, 1);
+            pass.dispatch_workgroups(grid.x, grid.y, grid.z);
         }
 
         dev.queue.submit(std::iter::once(encoder.finish()));
-        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+        // No per-op poll: wgpu executes queue submissions in FIFO order, so a
+        // later dispatch reading this op's output, or a host readback via
+        // `WebGpuMemoryManager::copy_from_device` / `synchronize()`, is
+        // correctly ordered without a host-side wait here. Polling after
+        // every submit was a full CPU/GPU pipeline stall on every op (see
+        // "wgpu blocks on device.poll(wait_indefinitely()) after EVERY
+        // submit" in the performance audit); `copy_from_device` now waits on
+        // its own precise `SubmissionIndex` and `synchronize()` still waits
+        // for all outstanding work.
 
         Ok(())
     }
@@ -532,11 +574,25 @@ impl ComputeBackend for WebGpuBackend {
         let dev = self.device()?;
         let mem = self.memory()?;
 
-        let tile_size: u32 = 8;
-        let pipeline =
-            self.cached_pipeline("gemm", "oxicuda-gemm", || shader::gemm_wgsl(tile_size))?;
+        // Mirror the lda/ldb/ldc validation onto every other dimension that
+        // feeds the shader uniform: a value above `u32::MAX` must be a clean
+        // typed error, never a silent wraparound into a small (wrong) count.
+        let m_u32 = dim_u32("gemm", "m", m)?;
+        let n_u32 = dim_u32("gemm", "n", n)?;
+        let k_u32 = dim_u32("gemm", "k", k)?;
 
-        let bgl = pipeline.get_bind_group_layout(0);
+        let limits = gpu_limits();
+        let tile = planner::plan_workgroup_square(&limits, 16);
+        let tile_size = tile.x;
+        // Fail fast on a dispatch grid that would exceed the per-axis
+        // workgroup cap, before creating any pipeline/buffer/bind-group GPU
+        // state for a dispatch that could never legally run.
+        let grid = planner::plan_dispatch_2d(&limits, m_u32, n_u32, tile, 1)
+            .map_err(BackendError::InvalidArgument)?;
+        let pipeline_key = format!("gemm:{tile_size}");
+        let cached = self.cached_pipeline(&pipeline_key, "oxicuda-gemm", || {
+            shader::gemm_wgsl(tile_size)
+        })?;
 
         // The row-major WGSL kernel honours the leading dimensions carried in
         // `GemmParams`; validate they are at least the packed extent (the same
@@ -548,16 +604,16 @@ impl ComputeBackend for WebGpuBackend {
                 "gemm: leading dimension smaller than matrix extent".into(),
             ));
         }
-        let lda_u32 = lead_dim_u32("lda", lda)?;
-        let ldb_u32 = lead_dim_u32("ldb", ldb)?;
-        let ldc_u32 = lead_dim_u32("ldc", ldc)?;
+        let lda_u32 = dim_u32("gemm", "lda", lda)?;
+        let ldb_u32 = dim_u32("gemm", "ldb", ldb)?;
+        let ldc_u32 = dim_u32("gemm", "ldc", ldc)?;
 
         // Build uniform buffer for GemmParams { m, n, k, alpha, beta,
         // trans_a, trans_b, lda, ldb, ldc, _pad } — 12 × 4 = 48 bytes.
         let mut params_bytes = [0u8; 48];
-        params_bytes[0..4].copy_from_slice(&(m as u32).to_le_bytes());
-        params_bytes[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-        params_bytes[8..12].copy_from_slice(&(k as u32).to_le_bytes());
+        params_bytes[0..4].copy_from_slice(&m_u32.to_le_bytes());
+        params_bytes[4..8].copy_from_slice(&n_u32.to_le_bytes());
+        params_bytes[8..12].copy_from_slice(&k_u32.to_le_bytes());
         params_bytes[12..16].copy_from_slice(&(alpha as f32).to_le_bytes());
         params_bytes[16..20].copy_from_slice(&(beta as f32).to_le_bytes());
         params_bytes[20..24].copy_from_slice(&trans_a_flag.to_le_bytes());
@@ -567,52 +623,16 @@ impl ComputeBackend for WebGpuBackend {
         params_bytes[36..40].copy_from_slice(&ldc_u32.to_le_bytes());
         // bytes 40..48 are zero padding.
 
-        let uniform_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oxicuda-gemm-params"),
-            size: 48,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        dev.queue.write_buffer(&uniform_buf, 0, &params_bytes);
-
-        // Create bind group while holding the buffer lock.
-        let bind_group = {
-            let buffers = mem
-                .lock_buffers()
-                .map_err(|e| BackendError::DeviceError(e.to_string()))?;
-            let a_info = buffers
-                .get(&a_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {a_ptr}")))?;
-            let b_info = buffers
-                .get(&b_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {b_ptr}")))?;
-            let c_info = buffers
-                .get(&c_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {c_ptr}")))?;
-
-            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("oxicuda-gemm"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: a_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: b_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: c_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: uniform_buf.as_entire_binding(),
-                    },
-                ],
-            })
-        };
+        let bind_group = self.cached_bind_group(
+            dev,
+            mem,
+            &cached.bind_group_layout,
+            &pipeline_key,
+            &[a_ptr, b_ptr, c_ptr],
+            &[],
+            &params_bytes,
+            "oxicuda-gemm",
+        )?;
 
         let mut encoder = dev
             .device
@@ -625,15 +645,21 @@ impl ComputeBackend for WebGpuBackend {
                 label: Some("oxicuda-gemm"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&cached.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let wg_x = (n as u32).div_ceil(tile_size);
-            let wg_y = (m as u32).div_ceil(tile_size);
-            pass.dispatch_workgroups(wg_x, wg_y, 1);
+            pass.dispatch_workgroups(grid.x, grid.y, grid.z);
         }
 
         dev.queue.submit(std::iter::once(encoder.finish()));
-        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+        // No per-op poll: wgpu executes queue submissions in FIFO order, so a
+        // later dispatch reading this op's output, or a host readback via
+        // `WebGpuMemoryManager::copy_from_device` / `synchronize()`, is
+        // correctly ordered without a host-side wait here. Polling after
+        // every submit was a full CPU/GPU pipeline stall on every op (see
+        // "wgpu blocks on device.poll(wait_indefinitely()) after EVERY
+        // submit" in the performance audit); `copy_from_device` now waits on
+        // its own precise `SubmissionIndex` and `synchronize()` still waits
+        // for all outstanding work.
 
         Ok(())
     }
@@ -674,12 +700,35 @@ impl ComputeBackend for WebGpuBackend {
         let dev = self.device()?;
         let mem = self.memory()?;
 
-        let tile_size: u32 = 8;
-        let pipeline = self.cached_pipeline("batched_gemm", "oxicuda-batched-gemm", || {
+        // Mirror the lda/ldb/ldc validation onto every other dimension that
+        // feeds the shader uniform or the dispatch grid.  Previously these
+        // were cast with a bare `as u32`: a `stride_*` above `u32::MAX` wrapped
+        // to a small value and the kernel silently read the wrong batch slice,
+        // and `batch_count` fed the Z dispatch dimension completely unchecked
+        // against the 65 535-per-axis limit (an oversized batch triggered a
+        // fatal wgpu validation error with no uncaptured-error handler
+        // installed).  `plan_dispatch_2d` below turns that overflow into a
+        // clean typed `Err` instead.
+        let m_u32 = dim_u32("batched_gemm", "m", m)?;
+        let n_u32 = dim_u32("batched_gemm", "n", n)?;
+        let k_u32 = dim_u32("batched_gemm", "k", k)?;
+        let batch_u32 = dim_u32("batched_gemm", "batch_count", batch_count)?;
+        let stride_a_u32 = dim_u32("batched_gemm", "stride_a", stride_a)?;
+        let stride_b_u32 = dim_u32("batched_gemm", "stride_b", stride_b)?;
+        let stride_c_u32 = dim_u32("batched_gemm", "stride_c", stride_c)?;
+
+        let limits = gpu_limits();
+        let tile = planner::plan_workgroup_square(&limits, 16);
+        let tile_size = tile.x;
+        // Fail fast — including the `batch_count > 65 535` case this
+        // validation exists for — before creating any pipeline/buffer/
+        // bind-group GPU state for a dispatch that could never legally run.
+        let grid = planner::plan_dispatch_2d(&limits, m_u32, n_u32, tile, batch_u32)
+            .map_err(BackendError::InvalidArgument)?;
+        let pipeline_key = format!("batched_gemm:{tile_size}");
+        let cached = self.cached_pipeline(&pipeline_key, "oxicuda-batched-gemm", || {
             shader::batched_gemm_wgsl(tile_size)
         })?;
-
-        let bgl = pipeline.get_bind_group_layout(0);
 
         // Validate leading dimensions against the packed extents (per-batch row
         // strides) before threading them into the uniform.
@@ -689,23 +738,23 @@ impl ComputeBackend for WebGpuBackend {
                 "batched_gemm: leading dimension smaller than matrix extent".into(),
             ));
         }
-        let lda_u32 = lead_dim_u32("lda", lda)?;
-        let ldb_u32 = lead_dim_u32("ldb", ldb)?;
-        let ldc_u32 = lead_dim_u32("ldc", ldc)?;
+        let lda_u32 = dim_u32("batched_gemm", "lda", lda)?;
+        let ldb_u32 = dim_u32("batched_gemm", "ldb", ldb)?;
+        let ldc_u32 = dim_u32("batched_gemm", "ldc", ldc)?;
 
         // BatchedGemmParams: m, n, k, alpha, beta, batch_count, stride_a,
         // stride_b, stride_c, trans_a, trans_b, lda, ldb, ldc — 14 × 4 = 56
         // bytes.  Uniform buffers need 16-byte alignment, so 56 rounds up to 64.
         let mut params_bytes = [0u8; 64];
-        params_bytes[0..4].copy_from_slice(&(m as u32).to_le_bytes());
-        params_bytes[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-        params_bytes[8..12].copy_from_slice(&(k as u32).to_le_bytes());
+        params_bytes[0..4].copy_from_slice(&m_u32.to_le_bytes());
+        params_bytes[4..8].copy_from_slice(&n_u32.to_le_bytes());
+        params_bytes[8..12].copy_from_slice(&k_u32.to_le_bytes());
         params_bytes[12..16].copy_from_slice(&(alpha as f32).to_le_bytes());
         params_bytes[16..20].copy_from_slice(&(beta as f32).to_le_bytes());
-        params_bytes[20..24].copy_from_slice(&(batch_count as u32).to_le_bytes());
-        params_bytes[24..28].copy_from_slice(&(stride_a as u32).to_le_bytes());
-        params_bytes[28..32].copy_from_slice(&(stride_b as u32).to_le_bytes());
-        params_bytes[32..36].copy_from_slice(&(stride_c as u32).to_le_bytes());
+        params_bytes[20..24].copy_from_slice(&batch_u32.to_le_bytes());
+        params_bytes[24..28].copy_from_slice(&stride_a_u32.to_le_bytes());
+        params_bytes[28..32].copy_from_slice(&stride_b_u32.to_le_bytes());
+        params_bytes[32..36].copy_from_slice(&stride_c_u32.to_le_bytes());
         params_bytes[36..40].copy_from_slice(&trans_a_flag.to_le_bytes());
         params_bytes[40..44].copy_from_slice(&trans_b_flag.to_le_bytes());
         params_bytes[44..48].copy_from_slice(&lda_u32.to_le_bytes());
@@ -713,51 +762,16 @@ impl ComputeBackend for WebGpuBackend {
         params_bytes[52..56].copy_from_slice(&ldc_u32.to_le_bytes());
         // bytes 56..64 are padding zeros
 
-        let uniform_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("oxicuda-batched-gemm-params"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        dev.queue.write_buffer(&uniform_buf, 0, &params_bytes);
-
-        let bind_group = {
-            let buffers = mem
-                .lock_buffers()
-                .map_err(|e| BackendError::DeviceError(e.to_string()))?;
-            let a_info = buffers
-                .get(&a_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {a_ptr}")))?;
-            let b_info = buffers
-                .get(&b_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {b_ptr}")))?;
-            let c_info = buffers
-                .get(&c_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {c_ptr}")))?;
-
-            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("oxicuda-batched-gemm"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: a_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: b_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: c_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: uniform_buf.as_entire_binding(),
-                    },
-                ],
-            })
-        };
+        let bind_group = self.cached_bind_group(
+            dev,
+            mem,
+            &cached.bind_group_layout,
+            &pipeline_key,
+            &[a_ptr, b_ptr, c_ptr],
+            &[],
+            &params_bytes,
+            "oxicuda-batched-gemm",
+        )?;
 
         let mut encoder = dev
             .device
@@ -770,15 +784,21 @@ impl ComputeBackend for WebGpuBackend {
                 label: Some("oxicuda-batched-gemm"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&cached.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let wg_x = (n as u32).div_ceil(tile_size);
-            let wg_y = (m as u32).div_ceil(tile_size);
-            pass.dispatch_workgroups(wg_x, wg_y, batch_count as u32);
+            pass.dispatch_workgroups(grid.x, grid.y, grid.z);
         }
 
         dev.queue.submit(std::iter::once(encoder.finish()));
-        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+        // No per-op poll: wgpu executes queue submissions in FIFO order, so a
+        // later dispatch reading this op's output, or a host readback via
+        // `WebGpuMemoryManager::copy_from_device` / `synchronize()`, is
+        // correctly ordered without a host-side wait here. Polling after
+        // every submit was a full CPU/GPU pipeline stall on every op (see
+        // "wgpu blocks on device.poll(wait_indefinitely()) after EVERY
+        // submit" in the performance audit); `copy_from_device` now waits on
+        // its own precise `SubmissionIndex` and `synchronize()` still waits
+        // for all outstanding work.
 
         Ok(())
     }
@@ -822,8 +842,6 @@ impl ComputeBackend for WebGpuBackend {
             ));
         }
 
-        let mem = self.memory()?;
-
         let batch = input_shape[0];
         let c_in = input_shape[1];
         let h_in = input_shape[2];
@@ -842,7 +860,21 @@ impl ComputeBackend for WebGpuBackend {
         let f_elems: usize = filter_shape.iter().product();
         let o_elems: usize = output_shape.iter().product();
 
+        // Prefer the GPU dispatch path; fall back to the CPU reference only
+        // for configurations `shader::conv2d_wgsl`'s fixed 2-D dispatch
+        // cannot address (see `conv2d_gpu_dispatch_grid`).
+        if let Some((wg_x, wg_y)) = conv2d_gpu_dispatch_grid(batch, k_out, oh, ow) {
+            if let Some(dims) = conv2d_u32_dims(
+                batch, c_in, h_in, w_in, k_out, fh, fw, oh, ow, sh, sw, ph, pw,
+            ) {
+                return self.conv2d_forward_gpu(
+                    input_ptr, filter_ptr, output_ptr, dims, in_elems, f_elems, o_elems, wg_x, wg_y,
+                );
+            }
+        }
+
         // CPU fallback: download input + filter, compute, upload output.
+        let mem = self.memory()?;
         let mut in_bytes = vec![0u8; in_elems * 4];
         let mut f_bytes = vec![0u8; f_elems * 4];
         mem.copy_from_device(&mut in_bytes, input_ptr)
@@ -852,36 +884,9 @@ impl ComputeBackend for WebGpuBackend {
 
         let in_f32 = bytes_to_f32_vec(&in_bytes);
         let f_f32 = bytes_to_f32_vec(&f_bytes);
-        let mut out_f32 = vec![0.0f32; o_elems];
-
-        for b in 0..batch {
-            for kf in 0..k_out {
-                for oy in 0..oh {
-                    for ox in 0..ow {
-                        let mut acc = 0.0f32;
-                        for ci in 0..c_in {
-                            for fy in 0..fh {
-                                for fx in 0..fw {
-                                    let iy = (oy * sh + fy) as isize - ph as isize;
-                                    let ix = (ox * sw + fx) as isize - pw as isize;
-                                    if iy >= 0
-                                        && (iy as usize) < h_in
-                                        && ix >= 0
-                                        && (ix as usize) < w_in
-                                    {
-                                        let in_idx = ((b * c_in + ci) * h_in + iy as usize) * w_in
-                                            + ix as usize;
-                                        let f_idx = ((kf * c_in + ci) * fh + fy) * fw + fx;
-                                        acc += in_f32[in_idx] * f_f32[f_idx];
-                                    }
-                                }
-                            }
-                        }
-                        out_f32[((b * k_out + kf) * oh + oy) * ow + ox] = acc;
-                    }
-                }
-            }
-        }
+        let out_f32 = conv2d_cpu_reference(
+            &in_f32, &f_f32, batch, c_in, h_in, w_in, k_out, fh, fw, oh, ow, sh, sw, ph, pw,
+        );
 
         let out_bytes = f32_slice_to_bytes(&out_f32);
         mem.copy_to_device(output_ptr, &out_bytes)
@@ -917,14 +922,43 @@ impl ComputeBackend for WebGpuBackend {
             )));
         }
 
-        let mem = self.memory()?;
-
         let batch_heads = batch * heads;
         let q_elems = batch_heads * seq_q * head_dim;
         let kv_elems = batch_heads * seq_kv * head_dim;
         let o_elems = q_elems;
+        let scale_f32 = scale as f32;
+
+        // Prefer the GPU dispatch path; fall back to the CPU reference only
+        // for configurations `shader::attention_wgsl`'s fixed 1-D dispatch
+        // cannot address, or whose shape overflows u32 (the shader bakes
+        // every dimension as a literal).
+        if let (Some(wg), Some(bh_u32), Some(seq_q_u32), Some(seq_kv_u32), Some(head_dim_u32)) = (
+            attention_gpu_dispatch_grid(batch_heads, seq_q),
+            u32::try_from(batch_heads).ok(),
+            u32::try_from(seq_q).ok(),
+            u32::try_from(seq_kv).ok(),
+            u32::try_from(head_dim).ok(),
+        ) {
+            return self.attention_gpu(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                o_ptr,
+                bh_u32,
+                seq_q_u32,
+                seq_kv_u32,
+                head_dim_u32,
+                scale_f32,
+                causal,
+                q_elems,
+                kv_elems,
+                o_elems,
+                wg,
+            );
+        }
 
         // CPU fallback: download Q, K, V, compute attention, upload O.
+        let mem = self.memory()?;
         let mut q_bytes = vec![0u8; q_elems * 4];
         let mut k_bytes = vec![0u8; kv_elems * 4];
         let mut v_bytes = vec![0u8; kv_elems * 4];
@@ -939,57 +973,17 @@ impl ComputeBackend for WebGpuBackend {
         let q_f32 = bytes_to_f32_vec(&q_bytes);
         let k_f32 = bytes_to_f32_vec(&k_bytes);
         let v_f32 = bytes_to_f32_vec(&v_bytes);
-        let mut o_f32 = vec![0.0f32; o_elems];
-
-        let scale_f32 = scale as f32;
-
-        for bh in 0..batch_heads {
-            let q_off = bh * seq_q * head_dim;
-            let k_off = bh * seq_kv * head_dim;
-            let v_off = k_off;
-
-            for sq in 0..seq_q {
-                let kv_limit = if causal { (sq + 1).min(seq_kv) } else { seq_kv };
-
-                // Pass 1: find max score for numerical stability
-                let mut max_score = f32::NEG_INFINITY;
-                for sk in 0..kv_limit {
-                    let mut dot = 0.0f32;
-                    for dd in 0..head_dim {
-                        dot +=
-                            q_f32[q_off + sq * head_dim + dd] * k_f32[k_off + sk * head_dim + dd];
-                    }
-                    let s = dot * scale_f32;
-                    if s > max_score {
-                        max_score = s;
-                    }
-                }
-
-                // Pass 2: exp(score - max), accumulate weighted V
-                let mut sum_exp = 0.0f32;
-                let mut acc = vec![0.0f32; head_dim];
-                for sk in 0..kv_limit {
-                    let mut dot = 0.0f32;
-                    for dd in 0..head_dim {
-                        dot +=
-                            q_f32[q_off + sq * head_dim + dd] * k_f32[k_off + sk * head_dim + dd];
-                    }
-                    let w = (dot * scale_f32 - max_score).exp();
-                    sum_exp += w;
-                    for dd in 0..head_dim {
-                        acc[dd] += w * v_f32[v_off + sk * head_dim + dd];
-                    }
-                }
-
-                // Normalise
-                let o_base = q_off + sq * head_dim;
-                if sum_exp > 0.0 {
-                    for dd in 0..head_dim {
-                        o_f32[o_base + dd] = acc[dd] / sum_exp;
-                    }
-                }
-            }
-        }
+        let o_f32 = attention_cpu_reference(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            batch_heads,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale_f32,
+            causal,
+        );
 
         let o_bytes = f32_slice_to_bytes(&o_f32);
         mem.copy_to_device(o_ptr, &o_bytes)
@@ -1037,9 +1031,25 @@ impl ComputeBackend for WebGpuBackend {
         let op_str = map_reduce_op(op);
 
         // ── Pass 1: per-workgroup reduction ─────────────────────────────────
-        let wg_count = (n_elements as u32).div_ceil(256);
+        // `reduction_wgsl`'s `@workgroup_size(256)` kernel decodes only
+        // `global_invocation_id.x` (no 2-D dispatch fold, unlike
+        // `reduction_nd_wgsl`), so `wg_count` must itself fit in one dispatch
+        // axis.  `plan_dispatch_1d` both computes it and turns an
+        // over-capacity `n_elements` into a clean typed error instead of an
+        // invalid `dispatch_workgroups` call.
+        let limits = gpu_limits();
+        let (wg_grid, _) = planner::plan_dispatch_1d(&limits, n_elements as u64, 256)
+            .map_err(BackendError::InvalidArgument)?;
+        if wg_grid.y != 1 {
+            return Err(BackendError::InvalidArgument(format!(
+                "reduce: {n_elements} elements need {} workgroups, which exceeds the \
+                 single-axis dispatch capacity of this 1-D reduction kernel",
+                wg_grid.x as u64 * wg_grid.y as u64
+            )));
+        }
+        let wg_count = wg_grid.x;
 
-        let pass1_pipeline = self.cached_pipeline(
+        let pass1_cached = self.cached_pipeline(
             &format!("reduce_pass1:{op_str}"),
             "oxicuda-reduce-pass1",
             || shader::reduction_wgsl(op_str),
@@ -1066,7 +1076,7 @@ impl ComputeBackend for WebGpuBackend {
         });
         dev.queue.write_buffer(&p1_uniform, 0, &p1_params);
 
-        let bgl1 = pass1_pipeline.get_bind_group_layout(0);
+        let bgl1 = &pass1_cached.bind_group_layout;
 
         let bg1 = {
             let buffers = mem
@@ -1076,9 +1086,17 @@ impl ComputeBackend for WebGpuBackend {
                 BackendError::InvalidArgument(format!("unknown handle {input_ptr}"))
             })?;
 
+            let need_in = (n_elements as u64) * 4;
+            if in_info.size < need_in {
+                return Err(BackendError::InvalidArgument(format!(
+                    "reduce: input buffer holds {} bytes, need {need_in} for {n_elements} f32 elements",
+                    in_info.size
+                )));
+            }
+
             dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("oxicuda-reduce-pass1"),
-                layout: &bgl1,
+                layout: bgl1,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1097,7 +1115,7 @@ impl ComputeBackend for WebGpuBackend {
         };
 
         // ── Pass 2: final reduction of partial sums ─────────────────────────
-        let pass2_pipeline = self.cached_pipeline(
+        let pass2_cached = self.cached_pipeline(
             &format!("reduce_pass2:{op_str}"),
             "oxicuda-reduce-pass2",
             || shader::reduction_final_wgsl(op_str),
@@ -1114,7 +1132,7 @@ impl ComputeBackend for WebGpuBackend {
         });
         dev.queue.write_buffer(&p2_uniform, 0, &p2_params);
 
-        let bgl2 = pass2_pipeline.get_bind_group_layout(0);
+        let bgl2 = &pass2_cached.bind_group_layout;
 
         let bg2 = {
             let buffers = mem
@@ -1124,9 +1142,17 @@ impl ComputeBackend for WebGpuBackend {
                 BackendError::InvalidArgument(format!("unknown handle {output_ptr}"))
             })?;
 
+            // The scalar output slot is a single f32.
+            if out_info.size < 4 {
+                return Err(BackendError::InvalidArgument(format!(
+                    "reduce: output buffer holds {} bytes, need 4 for the scalar result",
+                    out_info.size
+                )));
+            }
+
             dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("oxicuda-reduce-pass2"),
-                layout: &bgl2,
+                layout: bgl2,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1156,7 +1182,7 @@ impl ComputeBackend for WebGpuBackend {
                 label: Some("oxicuda-reduce-pass1"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pass1_pipeline);
+            pass.set_pipeline(&pass1_cached.pipeline);
             pass.set_bind_group(0, &bg1, &[]);
             pass.dispatch_workgroups(wg_count, 1, 1);
         }
@@ -1165,13 +1191,21 @@ impl ComputeBackend for WebGpuBackend {
                 label: Some("oxicuda-reduce-pass2"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pass2_pipeline);
+            pass.set_pipeline(&pass2_cached.pipeline);
             pass.set_bind_group(0, &bg2, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
 
         dev.queue.submit(std::iter::once(encoder.finish()));
-        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+        // No per-op poll: wgpu executes queue submissions in FIFO order, so a
+        // later dispatch reading this op's output, or a host readback via
+        // `WebGpuMemoryManager::copy_from_device` / `synchronize()`, is
+        // correctly ordered without a host-side wait here. Polling after
+        // every submit was a full CPU/GPU pipeline stall on every op (see
+        // "wgpu blocks on device.poll(wait_indefinitely()) after EVERY
+        // submit" in the performance audit); `copy_from_device` now waits on
+        // its own precise `SubmissionIndex` and `synchronize()` still waits
+        // for all outstanding work.
 
         // For "mean", divide the result by N on the host side.
         if op == ReduceOp::Mean && n_elements > 1 {
@@ -1192,43 +1226,57 @@ impl ComputeBackend for WebGpuBackend {
         if n == 0 {
             return Ok(());
         }
+        // `elementwise_wgsl`'s bind group declares `input` (binding 0) as
+        // `read` and `output` (binding 1) as `read_write`; if the two
+        // handles are the same buffer, wgpu's usage-scope validation rejects
+        // the dispatch outright ("conflicting usages: STORAGE_READ_ONLY vs
+        // STORAGE_READ_WRITE"). Reject it here with a typed, attributable
+        // error instead of letting it surface later — as a generic
+        // `DeviceError` from an unrelated caller's `alloc`/`copy_*`/
+        // `synchronize()`, whichever happens to be the next call that drains
+        // the recorded uncaptured error — which is what happened before this
+        // check existed.
+        if input_ptr == output_ptr {
+            return Err(BackendError::InvalidArgument(
+                "unary: input_ptr and output_ptr must not alias (wgpu rejects binding the \
+                 same buffer as both `read` and `read_write` within one dispatch); allocate \
+                 a separate output buffer"
+                    .into(),
+            ));
+        }
 
         let dev = self.device()?;
         let mem = self.memory()?;
 
+        // `elementwise_wgsl`'s `@workgroup_size(256)` kernel decodes only
+        // `global_invocation_id.x` (no 2-D dispatch fold), so `n` must map to
+        // a workgroup count that fits a single dispatch axis.
+        let (wg_grid, _) = planner::plan_dispatch_1d(&gpu_limits(), n as u64, 256)
+            .map_err(BackendError::InvalidArgument)?;
+        if wg_grid.y != 1 {
+            return Err(BackendError::InvalidArgument(format!(
+                "unary: {n} elements exceed the single-axis dispatch capacity of this kernel"
+            )));
+        }
+
         let op_str = map_unary_op(op);
-        let pipeline = self.cached_pipeline(&format!("unary:{op_str}"), "oxicuda-unary", || {
+        let pipeline_key = format!("unary:{op_str}");
+        let cached = self.cached_pipeline(&pipeline_key, "oxicuda-unary", || {
             shader::elementwise_wgsl(op_str)
         })?;
 
-        let bgl = pipeline.get_bind_group_layout(0);
-
-        let bind_group = {
-            let buffers = mem
-                .lock_buffers()
-                .map_err(|e| BackendError::DeviceError(e.to_string()))?;
-            let in_info = buffers.get(&input_ptr).ok_or_else(|| {
-                BackendError::InvalidArgument(format!("unknown handle {input_ptr}"))
-            })?;
-            let out_info = buffers.get(&output_ptr).ok_or_else(|| {
-                BackendError::InvalidArgument(format!("unknown handle {output_ptr}"))
-            })?;
-
-            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("oxicuda-unary"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: in_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: out_info.buffer.as_entire_binding(),
-                    },
-                ],
-            })
-        };
+        // `elementwise_wgsl` has no uniform binding at all — `n` is derived
+        // in-shader via `arrayLength`, so `uniform_bytes` is empty.
+        let bind_group = self.cached_bind_group(
+            dev,
+            mem,
+            &cached.bind_group_layout,
+            &pipeline_key,
+            &[input_ptr, output_ptr],
+            &[],
+            &[],
+            "oxicuda-unary",
+        )?;
 
         let mut encoder = dev
             .device
@@ -1241,14 +1289,21 @@ impl ComputeBackend for WebGpuBackend {
                 label: Some("oxicuda-unary"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&cached.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = (n as u32).div_ceil(256);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(wg_grid.x, 1, 1);
         }
 
         dev.queue.submit(std::iter::once(encoder.finish()));
-        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+        // No per-op poll: wgpu executes queue submissions in FIFO order, so a
+        // later dispatch reading this op's output, or a host readback via
+        // `WebGpuMemoryManager::copy_from_device` / `synchronize()`, is
+        // correctly ordered without a host-side wait here. Polling after
+        // every submit was a full CPU/GPU pipeline stall on every op (see
+        // "wgpu blocks on device.poll(wait_indefinitely()) after EVERY
+        // submit" in the performance audit); `copy_from_device` now waits on
+        // its own precise `SubmissionIndex` and `synchronize()` still waits
+        // for all outstanding work.
 
         Ok(())
     }
@@ -1265,51 +1320,49 @@ impl ComputeBackend for WebGpuBackend {
         if n == 0 {
             return Ok(());
         }
+        // Same usage-scope hazard as `unary` (see the comment there):
+        // `binary_wgsl` binds `lhs`/`rhs` (0/1) `read` and `output` (2)
+        // `read_write`. `a_ptr == b_ptr` (both inputs aliased to each other)
+        // is fine — two `read` usages of the same buffer do not conflict —
+        // only the output aliasing either input is rejected.
+        if a_ptr == output_ptr || b_ptr == output_ptr {
+            return Err(BackendError::InvalidArgument(
+                "binary: a_ptr/b_ptr must not alias output_ptr (wgpu rejects binding the \
+                 same buffer as both `read` and `read_write` within one dispatch); allocate \
+                 a separate output buffer"
+                    .into(),
+            ));
+        }
 
         let dev = self.device()?;
         let mem = self.memory()?;
 
+        // Same single-axis dispatch constraint as `unary` (see comment there).
+        let (wg_grid, _) = planner::plan_dispatch_1d(&gpu_limits(), n as u64, 256)
+            .map_err(BackendError::InvalidArgument)?;
+        if wg_grid.y != 1 {
+            return Err(BackendError::InvalidArgument(format!(
+                "binary: {n} elements exceed the single-axis dispatch capacity of this kernel"
+            )));
+        }
+
         let op_str = map_binary_op(op);
-        let pipeline =
-            self.cached_pipeline(&format!("binary:{op_str}"), "oxicuda-binary", || {
-                shader::binary_wgsl(op_str)
-            })?;
+        let pipeline_key = format!("binary:{op_str}");
+        let cached = self.cached_pipeline(&pipeline_key, "oxicuda-binary", || {
+            shader::binary_wgsl(op_str)
+        })?;
 
-        let bgl = pipeline.get_bind_group_layout(0);
-
-        let bind_group = {
-            let buffers = mem
-                .lock_buffers()
-                .map_err(|e| BackendError::DeviceError(e.to_string()))?;
-            let a_info = buffers
-                .get(&a_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {a_ptr}")))?;
-            let b_info = buffers
-                .get(&b_ptr)
-                .ok_or_else(|| BackendError::InvalidArgument(format!("unknown handle {b_ptr}")))?;
-            let out_info = buffers.get(&output_ptr).ok_or_else(|| {
-                BackendError::InvalidArgument(format!("unknown handle {output_ptr}"))
-            })?;
-
-            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("oxicuda-binary"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: a_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: b_info.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: out_info.buffer.as_entire_binding(),
-                    },
-                ],
-            })
-        };
+        // `binary_wgsl` has no uniform binding either (see `unary` above).
+        let bind_group = self.cached_bind_group(
+            dev,
+            mem,
+            &cached.bind_group_layout,
+            &pipeline_key,
+            &[a_ptr, b_ptr, output_ptr],
+            &[],
+            &[],
+            "oxicuda-binary",
+        )?;
 
         let mut encoder = dev
             .device
@@ -1322,14 +1375,21 @@ impl ComputeBackend for WebGpuBackend {
                 label: Some("oxicuda-binary"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&cached.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = (n as u32).div_ceil(256);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(wg_grid.x, 1, 1);
         }
 
         dev.queue.submit(std::iter::once(encoder.finish()));
-        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+        // No per-op poll: wgpu executes queue submissions in FIFO order, so a
+        // later dispatch reading this op's output, or a host readback via
+        // `WebGpuMemoryManager::copy_from_device` / `synchronize()`, is
+        // correctly ordered without a host-side wait here. Polling after
+        // every submit was a full CPU/GPU pipeline stall on every op (see
+        // "wgpu blocks on device.poll(wait_indefinitely()) after EVERY
+        // submit" in the performance audit); `copy_from_device` now waits on
+        // its own precise `SubmissionIndex` and `synchronize()` still waits
+        // for all outstanding work.
 
         Ok(())
     }
@@ -1339,7 +1399,31 @@ impl ComputeBackend for WebGpuBackend {
     fn synchronize(&self) -> BackendResult<()> {
         self.check_init()?;
         if let Some(dev) = &self.device {
-            let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+            // This is now the *only* completion signal for a caller that
+            // issues pure compute dispatches (`gemm`, `unary`, …) and skips
+            // `copy_dtoh` — those ops no longer poll themselves (see the
+            // comment on every `dev.queue.submit(...)` call site: wgpu's
+            // queue-FIFO ordering makes a per-op poll unnecessary). A bare
+            // `let _ = dev.device.poll(...)` would silently discard a
+            // `PollError` (device hung or lost) exactly where a caller is
+            // relying on this call to be the wait; propagate it as a typed
+            // error instead, reusing the same mapping `copy_from_device`
+            // uses for its own indexed wait.
+            crate::memory::poll_result_to_webgpu_result(
+                dev.device.poll(wgpu::PollType::wait_indefinitely()),
+            )
+            .map_err(BackendError::from)?;
+
+            // Drain any uncaptured wgpu error recorded by the work this wait
+            // just observed completing (validation / OOM / internal errors
+            // wgpu's non-fatal handler captured instead of aborting the
+            // process — see `WebGpuDevice::poll_error`) so it reaches the
+            // caller instead of being silently lost.
+            if let Some(msg) = dev.poll_error() {
+                return Err(BackendError::from(
+                    crate::error::WebGpuError::UncapturedError(msg),
+                ));
+            }
         }
         Ok(())
     }
@@ -1358,6 +1442,13 @@ impl ComputeBackend for WebGpuBackend {
 
     fn free(&self, ptr: u64) -> BackendResult<()> {
         self.check_init()?;
+        // Evict any cached bind group that still points at `ptr` *before*
+        // actually freeing it: a cached `wgpu::BindGroup` retains a strong
+        // reference to every buffer it binds, so leaving a stale entry in
+        // place would keep this handle's GPU memory alive indefinitely
+        // despite `free()` having (logically) released it. See `cache.rs`'s
+        // module doc, "Freed-buffer memory".
+        self.evict_bind_group_cache(ptr)?;
         self.memory()?.free(ptr).map_err(BackendError::from)
     }
 

@@ -34,7 +34,11 @@ driver symbols — no CUDA SDK, no `nvcc`, no C toolchain required at compile ti
 
 - **Supply-chain safety**: All library code is auditable Rust. No opaque C/Fortran blobs.
 - **Cross-platform compilation**: Builds on any platform (macOS, Linux, Windows) even without a
-  GPU installed; GPU operations return `UnsupportedPlatform` at runtime on non-NVIDIA systems.
+  GPU installed; the CUDA driver layer returns a typed `CudaError::NotInitialized` at runtime
+  (rather than failing to compile) when no usable NVIDIA driver is found, including on macOS,
+  where no NVIDIA driver exists at all (see [Platform Behavior](#platform-behavior)). macOS
+  additionally has a genuine GPU compute path outside the CUDA driver: the Metal backend
+  (`oxicuda-metal`, feature `metal`).
 - **Fearless concurrency**: Rust's ownership and lifetime system enforces correct stream
   ordering and prevents data races on device memory at compile time.
 - **No-unwrap contract**: Every fallible operation returns `Result<T, E>`. The entire
@@ -249,11 +253,17 @@ The platform name resolution tries the following paths in order:
 |----------|---------|----------|
 | Linux | `libcuda.so.1` | `libcuda.so` |
 | Windows | `nvcuda.dll` | — |
-| macOS | returns `UnsupportedPlatform` immediately | — |
+| macOS | `DriverApi::load()` returns `DriverLoadError::UnsupportedPlatform` immediately | — |
 
-On macOS the library still compiles cleanly and all tests run (returning the error
-`CudaError::UnsupportedPlatform`), which makes it possible to develop and unit-test
-on Apple hardware without any GPU.
+On macOS the library still compiles cleanly and all tests run. `CudaError` itself has **no**
+`UnsupportedPlatform` variant — only the lower-level `DriverLoadError` (returned by
+`DriverApi::load()`) does. The public entry point everything else calls, `try_driver()`
+(`oxicuda-driver/src/loader.rs`), flattens that `DriverLoadError::UnsupportedPlatform` down to
+`CudaError::NotInitialized` — the same error a Linux or Windows machine with no CUDA driver
+installed gets. Call `oxicuda_driver::loader::driver_load_error()` after a failed `try_driver()`
+call to recover the underlying `DriverLoadError` (including `UnsupportedPlatform`) for a precise
+diagnostic. This is what makes it possible to develop and unit-test on Apple hardware without any
+GPU.
 
 ### Context and Stream Hierarchy
 
@@ -878,9 +888,9 @@ libcudart.a) at compile time. OxiCUDA eliminates this dependency entirely:
 |----------|--------------|----------|
 | Linux + NVIDIA GPU + driver ≥ 525 | Yes | Full GPU operation |
 | Windows + NVIDIA GPU + driver ≥ 525 | Yes | Full GPU operation |
-| Linux / Windows, no GPU | No | `CudaError::NoDevicesFound` at runtime |
-| macOS (any) | No (MPS not used) | `CudaError::UnsupportedPlatform` at runtime |
-| Any platform (Metal feature) | macOS only | `oxicuda-metal` uses Apple Metal directly |
+| Linux / Windows, no GPU | No | `CudaError::NoDevice` at runtime |
+| macOS (any), CUDA driver path | No | `CudaError::NotInitialized` at runtime — driver load fails with the underlying `DriverLoadError::UnsupportedPlatform` (see [Runtime Loading](#runtime-loading)); `CudaError` itself has no `UnsupportedPlatform` variant |
+| Any platform (Metal feature) | macOS only | `oxicuda-metal` uses Apple Metal directly — genuine GPU compute, independent of the CUDA driver row above |
 | Any platform (WebGPU feature) | Any | `oxicuda-webgpu` uses `wgpu` cross-platform |
 
 ---
@@ -905,8 +915,10 @@ The vast majority of OxiCUDA's 5,139 tests run without any GPU hardware:
   parameter validation.
 - **Error handling tests**: every `CudaError` variant, proper `Drop` on resource handles
   (verified to not call real GPU APIs via the mock driver).
-- **macOS CI**: the full test suite runs on Ubuntu GitHub Actions workers; macOS tests
-  additionally exercise the `UnsupportedPlatform` error paths.
+- **macOS CI**: the full test suite runs on Ubuntu GitHub Actions workers; macOS-only tests
+  (`oxicuda-driver/tests/macos_stub.rs`) additionally exercise the driver-unavailable error
+  paths (`DriverLoadError::UnsupportedPlatform` from `DriverApi::load()`, flattened to
+  `CudaError::NotInitialized` by `try_driver()`).
 
 ### GPU-Gated Tests (`#[cfg(feature = "gpu-tests")]`)
 

@@ -14,30 +14,46 @@
 //! 3. **Dispatch hints** — `AneDispatchHint` tells the caller whether to route
 //!    an operation to ANE (via CoreML) or keep it on the GPU Metal path.
 //!
-//! # Note
+//! # Honesty note — nothing in this module runs on the ANE
 //!
-//! ANE offload requires the `coremltools` / `coreml` Objective-C bridge to be
-//! invoked at the application layer. This crate provides the *decision layer*
-//! only; the actual ANE execution is outside the scope of `oxicuda-metal`.
+//! The Apple Neural Engine has **no Metal-visible dispatch path**: there is
+//! no `MTLDevice`, command queue, or compute pipeline that targets it, so
+//! nothing in `oxicuda-metal` — this module included — can execute a kernel
+//! on the ANE. Every type here ([`AneDetector`], [`AneScheduler`],
+//! [`AneDispatchHint`]) is **heuristic scheduling metadata**: a name-based
+//! generation guess plus a size/op-based recommendation for *where an
+//! application-level CoreML or MPS Graph call* should route work. Acting on
+//! an [`AneDispatchHint::PreferAne`] result requires the caller to separately
+//! invoke the `coremltools` / CoreML Objective-C bridge (or MPS Graph) at the
+//! application layer — outside the scope of this crate, which stays
+//! Metal-only. Treat every method in this module as advisory, not as
+//! evidence that ANE execution has occurred.
 
 use std::fmt;
 
 // ─── AneGeneration ────────────────────────────────────────────────────────────
 
 /// Apple Neural Engine generation, tied to chip family.
+///
+/// This mapping is deliberately kept in lock-step with [`AneDetector::detect`]
+/// and this type's `Display` impl — the doc comments below, the `Display`
+/// strings, and `detect()` must never disagree (they once did; see the
+/// `display_generation_matches_detector_mapping` test in this module, which
+/// pins the correspondence for the Gen3/Gen4/Gen5 boundary chips).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AneGeneration {
     /// ANE not present (Intel Mac, simulator).
     None,
     /// First-generation ANE (A11–A12, limited ML ops).
     Gen1,
-    /// Second-generation ANE (A13–A15, improved throughput).
+    /// Second-generation ANE (A13 only, improved throughput).
     Gen2,
-    /// A16 / A17 and M1 series (16 TOPS).
+    /// Third-generation ANE (M1 / A14 / A15, ~15.8 TOPS class).
     Gen3,
-    /// M2 / A15 Pro / A16 class (enhanced inter-op fusion).
+    /// Fourth-generation ANE (M2 / A16, enhanced inter-op fusion).
     Gen4,
-    /// M3 and later (hardware ray tracing + ML fusion).
+    /// Fifth-generation ANE (M3 and later / A17 and later, hardware ray
+    /// tracing + ML fusion).
     Gen5,
 }
 
@@ -72,10 +88,10 @@ impl fmt::Display for AneGeneration {
         let s = match self {
             Self::None => "No ANE",
             Self::Gen1 => "ANE Gen1 (A11-A12)",
-            Self::Gen2 => "ANE Gen2 (A13-A15)",
-            Self::Gen3 => "ANE Gen3 (M1/A16)",
-            Self::Gen4 => "ANE Gen4 (M2/A17)",
-            Self::Gen5 => "ANE Gen5 (M3+)",
+            Self::Gen2 => "ANE Gen2 (A13)",
+            Self::Gen3 => "ANE Gen3 (M1/A14/A15)",
+            Self::Gen4 => "ANE Gen4 (M2/A16)",
+            Self::Gen5 => "ANE Gen5 (M3+/A17+)",
         };
         f.write_str(s)
     }
@@ -113,8 +129,18 @@ impl AneDetector {
         if name.contains("a11") || name.contains("a12") {
             return AneGeneration::Gen1;
         }
-        // arm64 without version → assume at least Gen3 (modern Apple Silicon)
+        // Any other Apple-branded or bare "arm64" name this table doesn't
+        // specifically recognise — including chips newer than this list,
+        // e.g. a future "Apple M5" — is conservatively clamped to Gen3
+        // rather than guessed as the newest generation. This under-states
+        // throughput for genuinely newer silicon but never over-promises ANE
+        // capability (which would push more work than the hardware can
+        // actually take toward `AneDispatchHint::PreferAne`).
         if name.contains("apple") || name.contains("arm64") {
+            tracing::debug!(
+                chip_name = %chip_name,
+                "unrecognized Apple silicon name; conservatively assuming ANE Gen3"
+            );
             return AneGeneration::Gen3;
         }
 
@@ -350,7 +376,7 @@ mod tests {
 
     #[test]
     fn display_generation() {
-        assert!(AneGeneration::Gen3.to_string().contains("M1/A16"));
+        assert!(AneGeneration::Gen3.to_string().contains("M1/A14/A15"));
         assert!(AneGeneration::None.to_string().contains("No ANE"));
     }
 
@@ -358,5 +384,42 @@ mod tests {
     fn ane_ordering() {
         assert!(AneGeneration::Gen5 > AneGeneration::Gen1);
         assert!(AneGeneration::Gen1 < AneGeneration::Gen3);
+    }
+
+    // Regression tests for the doc/detector/Display divergence: `Gen3`
+    // previously claimed "M1/A16" while `detect("A16")` actually returned
+    // `Gen4`, and `Gen4` claimed "M2/A17" while `detect("A17")` returned
+    // `Gen5`. These pin `detect()`'s boundary chips against the `Display`
+    // strings so the two can never silently drift apart again.
+    #[test]
+    fn detect_a16() {
+        assert_eq!(AneDetector::detect("Apple A16 Bionic"), AneGeneration::Gen4);
+    }
+
+    #[test]
+    fn detect_a15() {
+        assert_eq!(AneDetector::detect("Apple A15 Bionic"), AneGeneration::Gen3);
+    }
+
+    #[test]
+    fn display_generation_matches_detector_mapping() {
+        // Gen3 = M1 / A14 / A15
+        assert!(AneGeneration::Gen3.to_string().contains("A15"));
+        assert_eq!(AneDetector::detect("Apple A15 Bionic"), AneGeneration::Gen3);
+        // Gen4 = M2 / A16
+        assert!(AneGeneration::Gen4.to_string().contains("A16"));
+        assert_eq!(AneDetector::detect("Apple A16 Bionic"), AneGeneration::Gen4);
+        // Gen5 = M3+ / A17+
+        assert!(AneGeneration::Gen5.to_string().contains("A17"));
+        assert_eq!(AneDetector::detect("A17 Pro"), AneGeneration::Gen5);
+    }
+
+    #[test]
+    fn unrecognized_apple_silicon_conservatively_clamped_to_gen3() {
+        // Future/unmodeled Apple chip names (e.g. a hypothetical "Apple M5")
+        // are not matched by any specific rule and are deliberately treated
+        // as the oldest generation this module still models as "modern",
+        // rather than being over-estimated as the newest.
+        assert_eq!(AneDetector::detect("Apple M5"), AneGeneration::Gen3);
     }
 }

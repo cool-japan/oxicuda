@@ -13,6 +13,19 @@
 use crate::device_family::MetalDeviceCapabilities;
 use crate::error::{MetalError, MetalResult};
 
+/// Narrow a grid extent to the `u32` Metal's dispatch descriptors use, failing
+/// loudly instead of wrapping.
+///
+/// An unchecked `as u32` turns a grid of more than `2^32` threadgroups into a
+/// small number, silently launching a fraction of the requested work.
+fn grid_extent(value: u64, what: &str) -> MetalResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        MetalError::InvalidArgument(format!(
+            "{what} = {value} exceeds the u32 grid extent a Metal dispatch accepts"
+        ))
+    })
+}
+
 /// A planned dispatch: threadgroup shape and grid (threadgroups-per-grid) shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchPlan {
@@ -84,7 +97,7 @@ impl DispatchPlanner {
             ));
         }
         let tg = self.pick_1d_threadgroup(n);
-        let groups = (n as u64).div_ceil(u64::from(tg)) as u32;
+        let groups = grid_extent((n as u64).div_ceil(u64::from(tg)), "1-D threadgroup count")?;
         Ok(DispatchPlan {
             threads_per_threadgroup: [tg, 1, 1],
             threadgroups_per_grid: [groups, 1, 1],
@@ -107,8 +120,8 @@ impl DispatchPlanner {
         while (tile * 2) * (tile * 2) <= self.max_threads && tile < MAX_TILE {
             tile *= 2;
         }
-        let gx = (cols as u64).div_ceil(u64::from(tile)) as u32;
-        let gy = (rows as u64).div_ceil(u64::from(tile)) as u32;
+        let gx = grid_extent((cols as u64).div_ceil(u64::from(tile)), "2-D grid width")?;
+        let gy = grid_extent((rows as u64).div_ceil(u64::from(tile)), "2-D grid height")?;
         Ok(DispatchPlan {
             threads_per_threadgroup: [tile, tile, 1],
             threadgroups_per_grid: [gx, gy, 1],
@@ -129,7 +142,7 @@ impl DispatchPlanner {
             ));
         }
         let mut plan = self.plan_2d(rows, cols)?;
-        plan.threadgroups_per_grid[2] = batch as u32;
+        plan.threadgroups_per_grid[2] = grid_extent(batch as u64, "batch grid depth")?;
         Ok(plan)
     }
 
@@ -140,8 +153,10 @@ impl DispatchPlanner {
         while tg * 2 <= self.max_threads && (tg * 2) as usize <= n {
             tg *= 2;
         }
-        // Never launch a group wider than the work itself.
-        tg.min(n as u32).max(1)
+        // Never launch a group wider than the work itself. `n` can exceed
+        // `u32::MAX`, where a bare `n as u32` would truncate to an arbitrarily
+        // small width; saturate instead so the loop's choice stands.
+        tg.min(u32::try_from(n).unwrap_or(u32::MAX)).max(1)
     }
 
     /// Bytes of threadgroup scratch required for `elements` of `elem_size`,
@@ -242,6 +257,29 @@ mod tests {
         assert_eq!(p.threadgroup_scratch_bytes(256, 4).expect("ok"), 1024);
         // Exceeding the budget errors.
         assert!(p.threadgroup_scratch_bytes(100_000, 4).is_err());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn oversized_extents_error_instead_of_truncating() {
+        let p = planner();
+        // 2^63 elements at a 1024-wide threadgroup needs 2^53 threadgroups —
+        // `as u32` used to wrap this to 0 and launch nothing.
+        assert!(matches!(
+            p.plan_1d(1usize << 63),
+            Err(MetalError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            p.plan_2d(1usize << 40, 4),
+            Err(MetalError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            p.plan_batched_2d(4, 4, 1usize << 40),
+            Err(MetalError::InvalidArgument(_))
+        ));
+        // A huge-but-representable extent still yields a sane threadgroup width.
+        let plan = p.plan_1d(u32::MAX as usize).expect("plan");
+        assert_eq!(plan.threads_per_threadgroup[0], 1024);
     }
 
     #[test]

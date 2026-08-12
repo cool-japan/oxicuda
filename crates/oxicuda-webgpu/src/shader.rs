@@ -220,30 +220,48 @@ fn main(
     )
 }
 
-/// Generate WGSL source for a tiled GEMM kernel using FP16 storage.
+/// Generate WGSL source for a tiled GEMM kernel using FP16 storage:
+/// `C = alpha * op(A) * op(B) + beta * C`.
 ///
-/// Uses `enable f16;` WGSL extension. Storage buffers use `array<f16>`,
-/// but accumulation is done in f32 for precision.
+/// Uses `enable f16;` WGSL extension and `tile_size × tile_size` workgroup
+/// tiles with shared-memory staging — the same tiling structure as
+/// [`gemm_wgsl`], with two differences: the storage buffers *and* the
+/// `var<workgroup>` tiles hold `f16` (halving both global- and
+/// workgroup-memory traffic relative to staging `f32`), while the inner
+/// accumulate loop widens each tile element to `f32` before multiplying, so
+/// accumulation is still done in f32 for precision. `lda` / `ldb` / `ldc`
+/// (physical row strides) and the `trans_a` / `trans_b` transpose flags are
+/// runtime uniforms honoured via the same `load_a` / `load_b` indexing
+/// convention as [`gemm_wgsl`] — see that function's doc for the exact
+/// row-major / column-major index forms.
 ///
 /// Requires the device to have enabled the `SHADER_F16` feature; otherwise the
 /// module fails validation for the missing capability.
 ///
 /// # Arguments
 ///
-/// * `tile_size` — workgroup tile dimension.  `tile_size * tile_size` must not
-///   exceed WebGPU's baseline `maxComputeInvocationsPerWorkgroup` of 256, so 16
-///   is the portable maximum (e.g. 8 or 16).
+/// * `tile_size` — workgroup tile dimension.  Because the workgroup is
+///   `tile_size × tile_size`, `tile_size * tile_size` must not exceed WebGPU's
+///   baseline `maxComputeInvocationsPerWorkgroup` of 256, so 16 is the
+///   portable maximum (e.g. 8 or 16).
 pub fn gemm_wgsl_f16(tile_size: u32) -> String {
     format!(
         r#"
 enable f16;
 
 struct GemmParams {{
-    m:     u32,
-    n:     u32,
-    k:     u32,
-    alpha: f32,
-    beta:  f32,
+    m:       u32,
+    n:       u32,
+    k:       u32,
+    alpha:   f32,
+    beta:    f32,
+    trans_a: u32,
+    trans_b: u32,
+    lda:     u32,
+    ldb:     u32,
+    ldc:     u32,
+    _pad0:   u32,
+    _pad1:   u32,
 }}
 
 @group(0) @binding(0) var<storage, read>       a:      array<f16>;
@@ -251,18 +269,62 @@ struct GemmParams {{
 @group(0) @binding(2) var<storage, read_write> c:      array<f16>;
 @group(0) @binding(3) var<uniform>             params: GemmParams;
 
+var<workgroup> tile_a: array<array<f16, {ts}>, {ts}>;
+var<workgroup> tile_b: array<array<f16, {ts}>, {ts}>;
+
+// op(A)[r, i] — logical m×k left operand.  `lda` is the physical row stride of
+// the stored buffer (>= the packed width), supporting padded / sub-matrix
+// views. The `r`/`i` bounds guard is required here — unlike a per-thread
+// dot-product loop that only ever indexes `i < params.k` — because the tiled
+// staging loop below reads `t * {ts}u + lc` / `t * {ts}u + lr`, which
+// routinely exceeds `params.k` / `params.m` on the last (partial) tile; an
+// unguarded read would silently pull in a neighbouring row/column via WGSL's
+// robust-access semantics instead of contributing a proper zero pad.
+fn load_a(r: u32, i: u32) -> f16 {{
+    if (r >= params.m || i >= params.k) {{ return 0.0h; }}
+    if (params.trans_a == 0u) {{
+        return a[r * params.lda + i];
+    }}
+    return a[i * params.lda + r];
+}}
+
+// op(B)[i, col] — logical k×n right operand.  `ldb` is the physical row
+// stride.  Same last-tile bounds guard as `load_a`.
+fn load_b(i: u32, col: u32) -> f16 {{
+    if (i >= params.k || col >= params.n) {{ return 0.0h; }}
+    if (params.trans_b == 0u) {{
+        return b[i * params.ldb + col];
+    }}
+    return b[col * params.ldb + i];
+}}
+
 @compute @workgroup_size({ts}, {ts})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id)  lid: vec3<u32>,
+) {{
     let row = gid.y;
     let col = gid.x;
-    if (row >= params.m || col >= params.n) {{ return; }}
+    let lr  = lid.y;
+    let lc  = lid.x;
 
     var acc: f32 = 0.0;
-    for (var i: u32 = 0u; i < params.k; i = i + 1u) {{
-        acc += f32(a[row * params.k + i]) * f32(b[i * params.n + col]);
+    let num_tiles = (params.k + {ts}u - 1u) / {ts}u;
+    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {{
+        let a_col = t * {ts}u + lc;
+        let b_row = t * {ts}u + lr;
+        tile_a[lr][lc] = load_a(row, a_col);
+        tile_b[lr][lc] = load_b(b_row, col);
+        workgroupBarrier();
+
+        for (var e: u32 = 0u; e < {ts}u; e = e + 1u) {{
+            acc += f32(tile_a[lr][e]) * f32(tile_b[e][lc]);
+        }}
+        workgroupBarrier();
     }}
 
-    let idx = row * params.n + col;
+    if (row >= params.m || col >= params.n) {{ return; }}
+    let idx = row * params.ldc + col;
     let prev = f32(c[idx]);
     c[idx] = f16(params.alpha * acc + params.beta * prev);
 }}
@@ -363,10 +425,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 ///   like `"sum"` in the shader; the CPU is responsible for dividing by N.
 ///   Unknown ops fall back to `"sum"`.
 pub fn reduction_wgsl(op: &str) -> String {
-    // Neutral elements and combine expressions for each operation.
+    // Neutral elements and combine expressions for each operation.  `max` /
+    // `min` use the exact IEEE-754 infinities (`bitcast<f32>` from the
+    // sign+all-ones-exponent+zero-mantissa bit pattern) rather than an
+    // arbitrary finite `±1e38` sentinel, so a true extremum below/above that
+    // magnitude is never masked by the neutral element.
     let (neutral, combine) = match op {
-        "max" => ("f32(-1e38)", "max(acc, val)"),
-        "min" => ("f32(1e38)", "min(acc, val)"),
+        "max" => ("bitcast<f32>(0xFF800000u)", "max(acc, val)"),
+        "min" => ("bitcast<f32>(0x7F800000u)", "min(acc, val)"),
         // "sum" and "mean" use the same reduction body.
         _ => ("f32(0.0)", "acc + val"),
     };
@@ -543,8 +609,18 @@ pub fn attention_wgsl(
     scale: f32,
     causal: bool,
 ) -> String {
+    // True IEEE-754 negative infinity (naga-validated: `bitcast<f32>` from a
+    // sign+all-ones-exponent+zero-mantissa u32 pattern), not an arbitrary
+    // finite `-1e38` sentinel.  This makes the causal mask exact: a masked
+    // score is genuinely unreachable by `max`, and if every key were somehow
+    // masked (impossible today — `sk == 0` is never masked — but the shader
+    // does not assume that invariant), `masked_score - max_score` becomes
+    // `-inf - (-inf) == NaN`, and `NaN > 0.0` is `false`, so pass 3's `else`
+    // branch (zero-fill) is a genuine backstop, not dead defensive code.
+    let neg_inf = "bitcast<f32>(0xFF800000u)";
+
     let causal_check = if causal {
-        "if (sk > sq) { score = f32(-1e38); } else {"
+        "if (sk > sq) { score = bitcast<f32>(0xFF800000u); } else {"
     } else {
         "{"
     };
@@ -572,9 +648,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let sq = linear % {seq_q}u;
 
     let q_base = (bh * {seq_q}u + sq) * {head_dim}u;
+    // Q and O share the same [batch_heads, seq_q, head_dim] shape/strides.
+    let o_base = q_base;
+
+    // Zero-initialise this thread's output row *before* accumulating below.
+    // Pass 2 does a read-modify-write (`o_buf[..] += ..`) so a reused
+    // (non-fresh) output buffer must not leak stale contents into the sum.
+    for (var d: u32 = 0u; d < {head_dim}u; d = d + 1u) {{
+        o_buf[o_base + d] = 0.0;
+    }}
 
     // Pass 1: find max score for numerical stability
-    var max_score: f32 = f32(-1e38);
+    var max_score: f32 = {neg_inf};
     for (var sk: u32 = 0u; sk < {seq_kv}u; sk = sk + 1u) {{
         var score: f32 = 0.0;
         {causal_check}
@@ -601,18 +686,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let w = exp(score - max_score);
         sum_exp += w;
         let v_base = (bh * {seq_kv}u + sk) * {head_dim}u;
-        let o_base = (bh * {seq_q}u + sq) * {head_dim}u;
         for (var d: u32 = 0u; d < {head_dim}u; d = d + 1u) {{
             // Accumulate in-place (we normalise after the loop).
             o_buf[o_base + d] += w * v_buf[v_base + d];
         }}
     }}
 
-    // Pass 3: normalise
+    // Pass 3: normalise, or write zeros if no key contributed (`sum_exp` is
+    // `0.0` or `NaN`; `sum_exp > 0.0` is false for both, so this else branch
+    // catches both without a separate NaN check).
     if (sum_exp > 0.0) {{
-        let o_base = (bh * {seq_q}u + sq) * {head_dim}u;
         for (var d: u32 = 0u; d < {head_dim}u; d = d + 1u) {{
             o_buf[o_base + d] /= sum_exp;
+        }}
+    }} else {{
+        for (var d: u32 = 0u; d < {head_dim}u; d = d + 1u) {{
+            o_buf[o_base + d] = 0.0;
         }}
     }}
 }}
@@ -624,6 +713,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         scale = scale,
         causal = causal,
         causal_check = causal_check,
+        neg_inf = neg_inf,
     )
 }
 
@@ -656,8 +746,16 @@ pub fn reduction_nd_wgsl(op: &str) -> String {
     // reduction).  Listing both explicitly is more robust than string-
     // substitution for future ops.
     let (neutral, combine, combine_alias) = match op {
-        "max" => ("f32(-1e38)", "max(acc, val)", "max(acc2, val)"),
-        "min" => ("f32(1e38)", "min(acc, val)", "min(acc2, val)"),
+        "max" => (
+            "bitcast<f32>(0xFF800000u)",
+            "max(acc, val)",
+            "max(acc2, val)",
+        ),
+        "min" => (
+            "bitcast<f32>(0x7F800000u)",
+            "min(acc, val)",
+            "min(acc2, val)",
+        ),
         // "sum" and "mean" use the same combine; "mean" divides at the end.
         _ => ("f32(0.0)", "acc + val", "acc2 + val"),
     };
@@ -752,8 +850,8 @@ fn main(
 /// per-thread accumulators are combined with a shared-memory tree reduction.
 pub fn reduction_final_wgsl(op: &str) -> String {
     let (neutral, combine) = match op {
-        "max" => ("f32(-1e38)", "max(acc, val)"),
-        "min" => ("f32(1e38)", "min(acc, val)"),
+        "max" => ("bitcast<f32>(0xFF800000u)", "max(acc, val)"),
+        "min" => ("bitcast<f32>(0x7F800000u)", "min(acc, val)"),
         _ => ("f32(0.0)", "acc + val"),
     };
 
@@ -1171,8 +1269,36 @@ mod tests {
     fn wgsl_gemm_f16_accumulates_in_f32() {
         let src = gemm_wgsl_f16(16);
         assert!(src.contains("var acc: f32 = 0.0;"));
-        assert!(src.contains("f32(a["));
-        assert!(src.contains("f32(b["));
+        // The f16-typed tiles are widened to f32 at the point they are
+        // multiplied — accumulation itself is f32, but the intermediate
+        // shared-memory staging holds f16 (see `wgsl_gemm_f16_uses_shared_memory_tiling`).
+        assert!(src.contains("f32(tile_a["));
+        assert!(src.contains("f32(tile_b["));
+    }
+
+    #[test]
+    fn wgsl_gemm_f16_uses_shared_memory_tiling() {
+        let src = gemm_wgsl_f16(16);
+        assert!(src.contains("var<workgroup> tile_a"));
+        assert!(src.contains("var<workgroup> tile_b"));
+        assert!(src.contains("workgroupBarrier"));
+        // The tile itself is f16 (halves workgroup memory vs. staging f32),
+        // and the tile dimension is embedded in the array declaration.
+        assert!(src.contains("array<array<f16, 16>, 16>"));
+    }
+
+    #[test]
+    fn wgsl_gemm_f16_load_helpers_guard_last_partial_tile() {
+        // Regression: a per-thread dot-product loop only ever indexes
+        // `i < params.k`, so the original (untiled) `load_a`/`load_b` had no
+        // bounds guard. The tiled staging loop reads `t * ts + lc` /
+        // `t * ts + lr`, which routinely exceeds `params.k` / `params.m` on
+        // the last (partial) tile — an unguarded read would silently pull in
+        // a neighbouring row/column instead of contributing a zero pad,
+        // corrupting the result rather than erroring.
+        let src = gemm_wgsl_f16(16);
+        assert!(src.contains("if (r >= params.m || i >= params.k) { return 0.0h; }"));
+        assert!(src.contains("if (i >= params.k || col >= params.n) { return 0.0h; }"));
     }
 
     #[test]
@@ -1180,6 +1306,28 @@ mod tests {
         let src = gemm_wgsl_f16(8);
         assert!(src.contains("@compute @workgroup_size(8, 8)"));
         assert!(src.contains("GemmParams"));
+    }
+
+    #[test]
+    fn wgsl_gemm_f16_has_transpose_flags() {
+        let src = gemm_wgsl_f16(8);
+        // Transpose flags and leading dimensions live in the uniform struct,
+        // mirroring gemm_wgsl (see wgsl_gemm_has_transpose_flags).
+        assert!(src.contains("trans_a: u32"));
+        assert!(src.contains("trans_b: u32"));
+        assert!(src.contains("lda:     u32"));
+        assert!(src.contains("ldb:     u32"));
+        assert!(src.contains("ldc:     u32"));
+        // Both row-major and column-major index forms. `load_a`/`load_b`
+        // return raw `f16` (the tiled staging loop stores them into an
+        // f16-typed workgroup tile); the f16 -> f32 widening happens later,
+        // at the point a tile element is multiplied — see
+        // `wgsl_gemm_f16_accumulates_in_f32`.
+        assert!(src.contains("return a[r * params.lda + i];"));
+        assert!(src.contains("return a[i * params.lda + r];"));
+        assert!(src.contains("return b[i * params.ldb + col];"));
+        assert!(src.contains("return b[col * params.ldb + i];"));
+        assert!(src.contains("row * params.ldc + col"));
     }
 
     #[test]

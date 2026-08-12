@@ -44,6 +44,21 @@ pub enum WebGpuError {
     /// An async operation timed out waiting for the adapter.
     #[error("adapter timeout")]
     Timeout,
+
+    /// A wgpu validation, out-of-memory, or internal error was captured by
+    /// the non-fatal `on_uncaptured_error` handler installed in
+    /// [`crate::device::WebGpuDevice::new`], instead of aborting the process
+    /// (wgpu's default handler is fatal). See
+    /// [`crate::device::WebGpuDevice::poll_error`].
+    #[error("uncaptured wgpu error: {0}")]
+    UncapturedError(String),
+
+    /// The device was reported lost (GPU reset, driver failure, or an
+    /// external `Device::destroy()` call) by the callback installed via
+    /// `Device::set_device_lost_callback` in
+    /// [`crate::device::WebGpuDevice::new`].
+    #[error("device lost: {0}")]
+    DeviceLost(String),
 }
 
 /// Convenience result alias for WebGPU operations.
@@ -70,6 +85,12 @@ impl From<WebGpuError> for BackendError {
                 BackendError::DeviceError(format!("buffer mapping failed: {msg}"))
             }
             WebGpuError::Timeout => BackendError::DeviceError("adapter timeout".into()),
+            WebGpuError::UncapturedError(msg) => {
+                BackendError::DeviceError(format!("uncaptured wgpu error: {msg}"))
+            }
+            WebGpuError::DeviceLost(msg) => {
+                BackendError::DeviceError(format!("device lost: {msg}"))
+            }
         }
     }
 }
@@ -111,6 +132,14 @@ mod tests {
             "buffer mapping failed: lock poisoned"
         );
         assert_eq!(WebGpuError::Timeout.to_string(), "adapter timeout");
+        assert_eq!(
+            WebGpuError::UncapturedError("oom".into()).to_string(),
+            "uncaptured wgpu error: oom"
+        );
+        assert_eq!(
+            WebGpuError::DeviceLost("reset".into()).to_string(),
+            "device lost: reset"
+        );
     }
 
     #[test]
@@ -138,6 +167,12 @@ mod tests {
         assert!(matches!(e, BackendError::DeviceError(_)));
 
         let e = BackendError::from(WebGpuError::Timeout);
+        assert!(matches!(e, BackendError::DeviceError(_)));
+
+        let e = BackendError::from(WebGpuError::UncapturedError("oom".into()));
+        assert!(matches!(e, BackendError::DeviceError(_)));
+
+        let e = BackendError::from(WebGpuError::DeviceLost("reset".into()));
         assert!(matches!(e, BackendError::DeviceError(_)));
     }
 }

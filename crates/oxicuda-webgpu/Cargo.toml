@@ -26,6 +26,7 @@ js-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 naga = { workspace = true }
+half = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

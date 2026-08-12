@@ -164,9 +164,13 @@ C compiler, no Fortran runtime, no CUDA SDK, no `nvcc`, no `pkg-config`.
 | `half` | FP16/BF16 types (optional) | Pure Rust |
 | `serde` / `serde_json` | Autotune result DB (optional) | Pure Rust |
 
-The only runtime requirement is the NVIDIA GPU driver (`libcuda.so` on Linux,
-`nvcuda.dll` on Windows). On macOS the crate compiles but returns
-`UnsupportedPlatform` at runtime.
+The only runtime requirement for the CUDA driver path is the NVIDIA GPU driver
+(`libcuda.so` on Linux, `nvcuda.dll` on Windows). On macOS there is no NVIDIA
+driver to load: the crate still compiles, but `oxicuda::init()` and every raw
+`oxicuda-driver` call return `Err(CudaError::NotInitialized)` at runtime
+(`CudaError` has no `UnsupportedPlatform` variant). macOS does have a genuine
+GPU compute path outside the CUDA driver — see
+[Using OxiCUDA on macOS](#using-oxicuda-on-macos) below.
 
 ## Quick Start
 
@@ -403,7 +407,62 @@ fn main() -> Result<(), oxicuda::Error> {
 |----------|--------|-------|
 | Linux x86_64 | Full support | Primary development target |
 | Windows x86_64 | Full support | nvcuda.dll loaded at runtime |
-| macOS (ARM/x86) | Compile-only | Returns `UnsupportedPlatform` at runtime |
+| macOS — CUDA driver API | Unavailable | `Err(CudaError::NotInitialized)` at runtime — there is no NVIDIA driver on macOS (not `UnsupportedPlatform`; `CudaError` has no such variant) |
+| macOS — Metal backend (`features = ["metal"]`) | GPU compute | `gemm`, `batched_gemm`, unary/binary elementwise, and axis `reduce` run on the Apple GPU; see below |
+| macOS — WebGPU backend (`features = ["webgpu"]`) | GPU compute | Cross-platform via `wgpu` (Metal / Vulkan / D3D12 / browser WebGPU) |
+| macOS — CPU fallback | Full support | Always available, no feature flag needed (`oxicuda::backend::CpuBackend`) |
+
+### Using OxiCUDA on macOS
+
+The CUDA driver API does not exist on macOS by design (there is no NVIDIA driver
+to load there), so the `Quick Start` example above does not apply. The supported
+way to compute on a Mac's GPU is the portable `ComputeBackend` trait, backed by
+the Metal backend:
+
+```toml
+[dependencies]
+oxicuda = { version = "0.5", features = ["metal"] }
+```
+
+```rust
+use oxicuda::backend::{ComputeBackend, MetalBackend};
+
+fn main() -> oxicuda::backend::BackendResult<()> {
+    let mut backend = MetalBackend::new();
+    backend.init()?;
+
+    let ptr = backend.alloc(1024)?;
+    backend.free(ptr)?;
+    Ok(())
+}
+```
+
+Or let `oxicuda::compute::default_backend()` probe the machine and hand back
+the best backend already initialized — Metal on a Mac with the `metal` feature
+enabled, otherwise the always-available, pure-Rust `CpuBackend`, never an error:
+
+```rust
+let backend = oxicuda::compute::default_backend()?;
+println!("computing on the {} backend", backend.name());
+```
+
+Honest scope of the Metal backend today (see
+[`crates/oxicuda-metal/README.md`](crates/oxicuda-metal/README.md#op-coverage)
+for the full table):
+
+- **GPU-executed via Metal**: `gemm`, `batched_gemm`, the element-wise
+  `unary`/`binary` ops, and axis `reduce`.
+- **Not GPU-accelerated yet**: `conv2d_forward` and `attention` currently run
+  on the host CPU inside the Metal backend (round-tripping through device
+  buffers); `softmax`, `gather`, `scatter`, `gemm_mixed_precision`, and the
+  `conv2d` backward passes return `BackendError::Unsupported`.
+- **Not reachable from Metal at all**: the `blas`, `dnn`, `fft`, `sparse`,
+  `solver`, and `rand` features are built on the CUDA driver path only, so
+  they still fail with `NotInitialized` on macOS — use the `ComputeBackend`
+  API above for GPU work on a Mac instead of those features.
+
+Without the `metal` feature nothing breaks — backend selection simply falls
+through to the CPU backend, which computes correctly everywhere.
 
 ## Building
 

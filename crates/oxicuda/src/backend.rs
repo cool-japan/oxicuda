@@ -1,5 +1,27 @@
 //! Abstract compute backend for GPU-accelerated operations.
-//! Re-exports the [`ComputeBackend`](crate::backend::ComputeBackend) trait and supporting types from `oxicuda-backend`.
+//!
+//! This module is the facade's single entry point to the compute-backend
+//! abstraction. It re-exports the whole surface of `oxicuda-backend` — the
+//! [`ComputeBackend`] trait, the always-available [`CpuBackend`], the
+//! [`BackendRegistry`] control plane and its [`Capabilities`] types — and adds
+//! [`CudaBackend`], the CUDA implementation built on `oxicuda-driver`.
+//!
+//! # Concrete backends
+//!
+//! | Type | Availability |
+//! |------|--------------|
+//! | [`CpuBackend`] | always (pure-Rust host reference path) |
+//! | [`NullBackend`] | always (refuses every op; for dispatch tests) |
+//! | [`CudaBackend`] | always compiled; usable where `libcuda` loads |
+//! | `MetalBackend` | feature `metal` (works on macOS) |
+//! | `WebGpuBackend` | feature `webgpu` |
+//! | `VulkanBackend` | feature `vulkan` |
+//! | `RocmBackend` | feature `rocm` |
+//! | `LevelZeroBackend` | feature `level-zero` |
+//!
+//! Rather than picking one by hand, prefer [`crate::compute::default_backend`],
+//! which probes what this machine actually has and returns the best one already
+//! initialised.
 
 use std::sync::Mutex;
 
@@ -9,8 +31,33 @@ use oxicuda_driver::loader::try_driver;
 use oxicuda_driver::primary_context::PrimaryContext;
 
 pub use oxicuda_backend::{
-    BackendError, BackendResult, BackendTranspose, BinaryOp, ComputeBackend, ReduceOp, UnaryOp,
+    BackendEntry, BackendError, BackendKind, BackendRegistry, BackendResult, BackendTranspose,
+    BinaryOp, Capabilities, ComputeBackend, CpuBackend, DeviceInfo, MemoryKind, MixedPrecision,
+    NullBackend, OpClass, ReduceOp, SelectionRequest, TileShape, UnaryOp, default_tile_for,
 };
+
+/// Apple Metal compute backend (`oxicuda-metal`).
+///
+/// Compiled in with the `metal` feature; genuinely executes on the GPU on
+/// macOS and returns [`BackendError::DeviceError`] elsewhere.
+#[cfg(feature = "metal")]
+pub use oxicuda_metal::MetalBackend;
+
+/// WebGPU compute backend (`oxicuda-webgpu`), portable via `wgpu`.
+#[cfg(feature = "webgpu")]
+pub use oxicuda_webgpu::WebGpuBackend;
+
+/// Vulkan compute backend (`oxicuda-vulkan`).
+#[cfg(feature = "vulkan")]
+pub use oxicuda_vulkan::VulkanBackend;
+
+/// AMD ROCm/HIP compute backend (`oxicuda-rocm`).
+#[cfg(feature = "rocm")]
+pub use oxicuda_rocm::RocmBackend;
+
+/// Intel Level Zero compute backend (`oxicuda-levelzero`).
+#[cfg(feature = "level-zero")]
+pub use oxicuda_levelzero::LevelZeroBackend;
 
 #[cfg(feature = "ptx")]
 mod ptx_ops;

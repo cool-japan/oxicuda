@@ -35,8 +35,18 @@
 //! cannot be added as dev-dependencies here without introducing a crate cycle.
 //! The tests for those crates' call sites test the lowest driver-level
 //! entrypoint in this crate that corresponds to the same loading path.
+//!
+//! **Feature-gating note:** this file itself requires no Cargo feature —
+//! only `target_os = "macos"`. Every test below asserts an *error* path
+//! (the driver failing to load), so none of them touch a GPU; gating the
+//! whole file behind `gpu-tests` (whose stated purpose is real-hardware
+//! testing on Linux/Windows with an NVIDIA driver) meant a plain `cargo
+//! test`/`cargo nextest run` on macOS never ran the only tests that pin the
+//! macOS contract. If a test that genuinely needs a GPU is ever added to
+//! this file, gate that individual `#[test]` fn behind `feature =
+//! "gpu-tests"` rather than re-gating the whole file.
 
-#![cfg(all(target_os = "macos", feature = "gpu-tests"))]
+#![cfg(target_os = "macos")]
 
 use oxicuda_driver::error::CudaError;
 use oxicuda_driver::loader::try_driver;

@@ -28,6 +28,66 @@
 //!
 //! The [`WasmMemoryManager`] provides async-friendly buffer staging suited to the
 //! browser event loop.
+//!
+//! # Known limitation: `WasmBackend` does not actually use `WasmMemoryManager`
+//!
+//! Despite the name, **every [`WasmBackend`] compute and memory operation
+//! forwards to [`WebGpuBackend`]**, which is backed by
+//! [`WebGpuMemoryManager`](crate::memory::WebGpuMemoryManager) — not by
+//! [`WasmMemoryManager`] in this module.  `WasmMemoryManager` (and
+//! [`WasmGpuDevice`]) exist, are async-safe, and are unit-tested, but nothing
+//! in `WasmBackend` constructs or calls them.  This matters because:
+//!
+//! * `WebGpuBackend`'s compute methods end in a **blocking**
+//!   `Device::poll(PollType::wait_indefinitely())` (see `backend.rs`), and
+//!   `WebGpuMemoryManager::copy_from_device`'s readback blocks on an
+//!   `mpsc::channel` `recv()` that only resolves once that same poll drives
+//!   the `map_async` callback to completion. On the single-threaded browser
+//!   main thread, `Device::poll` cannot make progress without yielding back
+//!   to the event loop that would deliver that callback — so this **would
+//!   deadlock the tab**, exactly the failure `WasmMemoryManager::copy_dtoh`'s
+//!   own `#[cfg(target_arch = "wasm32")]` guard (in this file) already exists
+//!   to prevent, just on the wrong type.
+//! * Fixing this by swapping `WasmBackend`'s memory calls (`alloc`,
+//!   `copy_htod`, `copy_dtoh`) over to `WasmMemoryManager` while leaving the
+//!   compute calls (`gemm`, `unary`, …) on `self.inner: WebGpuBackend` is
+//!   **not a valid partial fix**: the two memory managers keep independent
+//!   `HashMap<u64, Buffer>` handle tables, each with its own
+//!   `next_handle`/`AtomicU64` counter starting at 1. A buffer allocated
+//!   through `WasmMemoryManager` would not exist in
+//!   `WebGpuMemoryManager`'s map (or worse, its handle number would collide
+//!   with an unrelated `WebGpuMemoryManager` buffer), so every compute call
+//!   would either fail with "unknown handle" or silently operate on the
+//!   wrong buffer.  Correctly fixing this requires `WasmBackend` to own one
+//!   coherent device + buffer table end-to-end and give every compute
+//!   dispatch (not just readback) an async, non-blocking form — a genuine
+//!   rework of this module and `backend.rs` together, out of scope here.
+//!
+//! Until that rework lands: `WasmBackend` is appropriate for **native
+//! testing** of the WASM code paths (via the `wasm` feature, where blocking
+//! is safe) and for **non-browser wasm32 hosts** (e.g. a WASI runtime driving
+//! its own event loop outside a browser tab). On an actual browser main
+//! thread, treat every `WasmBackend` compute/readback call as unsafe to call
+//! synchronously; [`WasmMemoryManager::copy_dtoh_async`] is the
+//! already-implemented pattern a real async rework would extend to the rest
+//! of the surface.
+//!
+//! # Deeper pre-existing gap: this crate does not compile for `wasm32-unknown-unknown` at all
+//!
+//! `cargo check -p oxicuda-webgpu --target wasm32-unknown-unknown` fails
+//! today (independent of anything in this module): `oxicuda_backend::
+//! ComputeBackend` requires `Send + Sync`, but on the real `wasm32` target
+//! `wgpu`'s WebGPU backend represents `Device`/`Buffer` using `Rc`/`RefCell`
+//! internally (browser JS handles are not thread-safe), which makes
+//! `WebGpuDevice`/`WebGpuBufferInfo` — and therefore `WebGpuBackend`, which
+//! every `WasmBackend` method forwards to — not `Send`. So `WasmBackend`
+//! (and `WebGpuBackend`) cannot implement `ComputeBackend` on that target
+//! today at all; this is a compile error, not a runtime one, so nothing in
+//! this crate has ever actually run compiled-for-wasm32. Fixing it needs
+//! either a `?Send` carve-out on `ComputeBackend` for wasm32 (a change to
+//! `oxicuda-backend`, out of scope for this crate) or a non-`ComputeBackend`
+//! wasm32-native entry point built directly on `WasmGpuDevice`; both are
+//! part of the same async rework noted above.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -378,16 +438,17 @@ impl std::fmt::Debug for WasmMemoryManager {
 /// WebGPU compute backend for WASM (browser) targets.
 ///
 /// Wraps [`WebGpuBackend`] and adds browser-specific initialisation paths.
-/// Implements [`ComputeBackend`] by delegating all compute operations to the
-/// inner [`WebGpuBackend`], which already supports WASM via `wgpu`'s web-sys
-/// backend.
+/// Implements [`ComputeBackend`] by delegating **every** operation —
+/// compute, allocation, and readback — to the inner [`WebGpuBackend`].
 ///
 /// # Notes
 ///
-/// Synchronous [`ComputeBackend`] trait methods use `pollster::block_on` to
-/// bridge async wgpu calls. In production browser deployments, prefer using
-/// the async initialisation helpers directly and scheduling GPU work on web
-/// workers where blocking is acceptable.
+/// See the [module-level documentation](self) for why this delegation makes
+/// every blocking call (readback, and every compute op via its trailing
+/// `Device::poll`) unsafe to call synchronously from a real browser main
+/// thread today, why `WasmMemoryManager` cannot simply be swapped in as a
+/// partial fix (it would split the buffer-handle table in two), and what a
+/// correct fix requires.
 #[derive(Debug)]
 pub struct WasmBackend {
     inner: WebGpuBackend,
@@ -464,6 +525,63 @@ impl ComputeBackend for WasmBackend {
     ) -> BackendResult<()> {
         self.inner.gemm(
             trans_a, trans_b, m, n, k, alpha, a_ptr, lda, b_ptr, ldb, beta, c_ptr, ldc,
+        )
+    }
+
+    // `batched_gemm` MUST be forwarded explicitly (finding webgpu-7): without
+    // this override, `WasmBackend` inherits `ComputeBackend`'s default
+    // `batched_gemm` (`oxicuda-backend/src/lib.rs`), which loops calling
+    // `self.gemm(...)` with `a_ptr + b * stride_a * elem_bytes`-style pointer
+    // *arithmetic* on `a_ptr`/`b_ptr`/`c_ptr`.  Those are not addresses here —
+    // `WebGpuMemoryManager::alloc` (this backend's memory manager) hands out
+    // opaque monotonic `u64` handles from a `HashMap<u64, Buffer>`, so adding
+    // a stride offset to one either misses the map entirely (`batch_count >=
+    // 2` fails with "unknown handle") or, worse, silently collides with an
+    // unrelated live handle and multiplies the wrong buffers.  `batch_count
+    // == 1` happens to work by accident (offset 0), which is why this is easy
+    // to miss in ad hoc testing.  `WebGpuBackend::batched_gemm` (this
+    // backend's `self.inner`) already implements the real batched-strided
+    // dispatch correctly; this is purely a missing delegation, mirroring
+    // every other method in this `impl` block.
+    #[allow(clippy::too_many_arguments)]
+    fn batched_gemm(
+        &self,
+        trans_a: BackendTranspose,
+        trans_b: BackendTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a_ptr: u64,
+        lda: usize,
+        stride_a: usize,
+        b_ptr: u64,
+        ldb: usize,
+        stride_b: usize,
+        beta: f64,
+        c_ptr: u64,
+        ldc: usize,
+        stride_c: usize,
+        batch_count: usize,
+    ) -> BackendResult<()> {
+        self.inner.batched_gemm(
+            trans_a,
+            trans_b,
+            m,
+            n,
+            k,
+            alpha,
+            a_ptr,
+            lda,
+            stride_a,
+            b_ptr,
+            ldb,
+            stride_b,
+            beta,
+            c_ptr,
+            ldc,
+            stride_c,
+            batch_count,
         )
     }
 
@@ -667,5 +785,71 @@ mod tests {
         let err = mm.copy_dtoh(&mut dst, h).unwrap_err();
         assert!(matches!(err, WebGpuError::InvalidArgument(_)));
         mm.free(h).expect("free");
+    }
+
+    /// Try to build an initialised `WasmBackend`; returns `None` when no GPU
+    /// is available so device-backed tests skip gracefully.
+    fn try_init_wasm_backend() -> Option<WasmBackend> {
+        let mut b = WasmBackend::new();
+        b.init().ok()?;
+        Some(b)
+    }
+
+    /// Regression for finding webgpu-7: before `batched_gemm` was forwarded
+    /// explicitly, `WasmBackend` inherited `ComputeBackend`'s default
+    /// implementation, which does pointer arithmetic
+    /// (`a_ptr + batch * stride_a * elem_bytes`) on what this backend's
+    /// memory manager hands out as *opaque* monotonic handles — not
+    /// addresses.  `batch_count == 1` (offset 0) happened to work by
+    /// accident; `batch_count >= 2` did not (either "unknown handle" or,
+    /// worse, a silent collision with a different live buffer).  Drive
+    /// `batch_count = 2` end-to-end through `WasmBackend` itself and check
+    /// the numeric result, proving the override is wired and correct — not
+    /// merely present.
+    #[test]
+    fn wasm_backend_batched_gemm_matches_reference() {
+        let Some(wasm_b) = try_init_wasm_backend() else {
+            return;
+        };
+
+        // 2 batches of 2×2 identity multiply, matching
+        // `backend_tests.rs::batched_gemm_identity_2x2`.
+        let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let eye = [1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let c_init = [0.0f32; 8];
+        let to_bytes = |d: &[f32]| -> Vec<u8> { d.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+        let a_h = wasm_b.alloc(32).expect("alloc a");
+        let b_h = wasm_b.alloc(32).expect("alloc b");
+        let c_h = wasm_b.alloc(32).expect("alloc c");
+        wasm_b.copy_htod(a_h, &to_bytes(&a)).expect("htod a");
+        wasm_b.copy_htod(b_h, &to_bytes(&eye)).expect("htod b");
+        wasm_b.copy_htod(c_h, &to_bytes(&c_init)).expect("htod c");
+
+        let nt = BackendTranspose::NoTrans;
+        wasm_b
+            .batched_gemm(
+                nt, nt, 2, 2, 2, 1.0, a_h, 2, 4, b_h, 2, 4, 0.0, c_h, 2, 4,
+                2, // batch_count >= 2 — the case the missing override broke.
+            )
+            .expect("wasm batched_gemm");
+
+        let mut result_bytes = vec![0u8; 32];
+        wasm_b
+            .copy_dtoh(&mut result_bytes, c_h)
+            .expect("dtoh result");
+        let result: Vec<f32> = result_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // C = A * I = A for both batches.
+        for (r, e) in result.iter().zip(a.iter()) {
+            assert!((r - e).abs() < 1e-5, "got {r}, expected {e}");
+        }
+
+        wasm_b.free(a_h).expect("free");
+        wasm_b.free(b_h).expect("free");
+        wasm_b.free(c_h).expect("free");
     }
 }

@@ -127,6 +127,43 @@ impl SelectionRequest {
         r
     }
 
+    /// Narrow this request to the CPU reference backend when the workload is
+    /// too small to pay for a GPU dispatch.
+    ///
+    /// A GPU dispatch costs a host→device copy, a command submission and a
+    /// synchronisation; below some byte count that overhead dominates the
+    /// kernel and the host path finishes first. This helper expresses that
+    /// policy *at selection time* — i.e. before any memory is allocated — so
+    /// that the whole workload (allocations included) lands on one backend.
+    /// Per-operation routing is deliberately **not** offered: a device pointer
+    /// belongs to the backend that allocated it, so a per-op switch would
+    /// require duplicating every buffer.
+    ///
+    /// The request is returned unchanged when the caller has already expressed
+    /// an explicit preference ([`require_gpu`](Self::require_gpu) or a
+    /// [`pin`](Self::pin)), or when `workload_bytes >= gpu_threshold_bytes`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oxicuda_backend::{BackendKind, SelectionRequest};
+    ///
+    /// // 1 KiB with a 64 KiB threshold → pinned to the host backend.
+    /// let small = SelectionRequest::any().for_workload(1024, 64 * 1024);
+    /// assert_eq!(small.pin, Some(BackendKind::Cpu));
+    ///
+    /// // 1 MiB → unchanged, so the GPU can win the selection.
+    /// let large = SelectionRequest::any().for_workload(1024 * 1024, 64 * 1024);
+    /// assert_eq!(large, SelectionRequest::any());
+    /// ```
+    #[must_use]
+    pub const fn for_workload(mut self, workload_bytes: usize, gpu_threshold_bytes: usize) -> Self {
+        if !self.require_gpu && self.pin.is_none() && workload_bytes < gpu_threshold_bytes {
+            self.pin = Some(BackendKind::Cpu);
+        }
+        self
+    }
+
     /// Returns `true` if `entry` satisfies every constraint in this request.
     #[must_use]
     pub fn is_satisfied_by(&self, entry: &BackendEntry) -> bool {
@@ -327,6 +364,28 @@ impl BackendRegistry {
     /// preferring a GPU but accepting the CPU fallback.
     pub fn select_best(&self) -> BackendResult<BackendKind> {
         self.select(&SelectionRequest::any())
+    }
+
+    /// Select the best backend for a workload of `workload_bytes`, sending
+    /// workloads smaller than `gpu_threshold_bytes` to the CPU reference
+    /// backend (see [`SelectionRequest::for_workload`] for why this is a
+    /// selection-time and not a per-operation decision).
+    ///
+    /// If the narrowed request finds nothing — e.g. a small workload on a
+    /// registry with no CPU entry — the unnarrowed `req` is retried, so this
+    /// never fails where [`select`](Self::select) would have succeeded.
+    pub fn select_for_workload(
+        &self,
+        req: &SelectionRequest,
+        workload_bytes: usize,
+        gpu_threshold_bytes: usize,
+    ) -> BackendResult<BackendKind> {
+        let narrowed = req.for_workload(workload_bytes, gpu_threshold_bytes);
+        match self.select(&narrowed) {
+            Ok(kind) => Ok(kind),
+            Err(_) if narrowed != *req => self.select(req),
+            Err(e) => Err(e),
+        }
     }
 
     /// The ordered fallback chain for `req`: every satisfying backend, most-
@@ -561,6 +620,76 @@ mod tests {
         assert!(!OpClass::Elementwise.prefers_tensor_cores());
         assert!(!OpClass::Memory.prefers_tensor_cores());
         assert_eq!(OpClass::ALL.len(), 6);
+    }
+
+    // ── Workload-size-aware selection ────────────────────────────────────────
+
+    /// 64 KiB, mirroring `oxicuda::AUTO_SELECT_THRESHOLD_BYTES`.
+    const THRESHOLD: usize = 64 * 1024;
+
+    #[test]
+    fn for_workload_pins_cpu_below_threshold_only() {
+        let below = SelectionRequest::any().for_workload(THRESHOLD - 1, THRESHOLD);
+        assert_eq!(below.pin, Some(BackendKind::Cpu));
+        // Exactly at the threshold is *not* below it → GPU still eligible.
+        let at = SelectionRequest::any().for_workload(THRESHOLD, THRESHOLD);
+        assert_eq!(at, SelectionRequest::any());
+        let above = SelectionRequest::any().for_workload(THRESHOLD + 1, THRESHOLD);
+        assert_eq!(above, SelectionRequest::any());
+    }
+
+    #[test]
+    fn for_workload_respects_explicit_preferences() {
+        // An explicit require_gpu is never downgraded to the host backend.
+        let gpu = SelectionRequest::require_gpu().for_workload(16, THRESHOLD);
+        assert_eq!(gpu.pin, None);
+        assert!(gpu.require_gpu);
+        // An explicit pin is never overwritten.
+        let pinned = SelectionRequest::pinned(BackendKind::Metal).for_workload(16, THRESHOLD);
+        assert_eq!(pinned.pin, Some(BackendKind::Metal));
+    }
+
+    #[test]
+    fn select_for_workload_routes_small_to_cpu_and_large_to_gpu() {
+        let reg = three_backend_registry();
+        let any = SelectionRequest::any();
+        assert_eq!(
+            reg.select_for_workload(&any, 1024, THRESHOLD)
+                .expect("small workload must select a backend"),
+            BackendKind::Cpu,
+            "a 1 KiB workload must stay on the host"
+        );
+        assert_eq!(
+            reg.select_for_workload(&any, 1024 * 1024, THRESHOLD)
+                .expect("large workload must select a backend"),
+            BackendKind::Cuda,
+            "a 1 MiB workload must reach the highest-priority GPU"
+        );
+    }
+
+    #[test]
+    fn select_for_workload_falls_back_when_no_cpu_entry() {
+        let mut reg = BackendRegistry::new();
+        reg.register(BackendEntry::new(BackendKind::Cuda, true));
+        // No CPU entry at all: the narrowed (CPU-pinned) request cannot be
+        // satisfied, so the original request must still be honoured.
+        assert_eq!(
+            reg.select_for_workload(&SelectionRequest::any(), 16, THRESHOLD)
+                .expect("must fall back to the unnarrowed request"),
+            BackendKind::Cuda
+        );
+    }
+
+    #[test]
+    fn select_for_workload_still_fails_when_nothing_qualifies() {
+        let mut reg = three_backend_registry();
+        for kind in BackendKind::ALL {
+            reg.set_available(kind, false);
+        }
+        assert!(
+            reg.select_for_workload(&SelectionRequest::any(), 16, THRESHOLD)
+                .is_err()
+        );
     }
 
     #[test]

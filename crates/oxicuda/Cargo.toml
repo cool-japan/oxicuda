@@ -41,6 +41,8 @@ default = ["driver", "memory", "launch"]
 driver = []
 memory = []
 launch = []
+# No-op, kept for compatibility: `oxicuda-backend` is a mandatory dependency,
+# so the `backend` and `compute` modules are always compiled in.
 backend = []
 nvrtc = ["dep:oxicuda-nvrtc"]
 ptx = ["dep:oxicuda-ptx"]
@@ -60,7 +62,9 @@ level-zero = ["dep:oxicuda-levelzero"]
 onnx-backend = []
 tensor-backend = []
 transformer-backend = []
-wasm-backend = ["dep:oxicuda-webgpu", "dep:wasm-bindgen", "dep:js-sys"]
+# Enables the `webgpu` feature (not just the dependency) so the WebGPU backend
+# is also registered by `compute::default_backend`.
+wasm-backend = ["webgpu", "dep:wasm-bindgen", "dep:js-sys"]
 pool = ["oxicuda-memory/pool"]
 gpu-tests = ["oxicuda-driver/gpu-tests"]
 full = ["backend", "ptx", "autotune", "blas", "dnn", "fft", "sparse", "solver", "rand", "primitives", "pool", "onnx-backend", "tensor-backend", "transformer-backend", "vulkan", "metal", "webgpu", "rocm", "level-zero", "wasm-backend"]
