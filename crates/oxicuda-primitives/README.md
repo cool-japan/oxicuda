@@ -23,7 +23,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-primitives = "0.5.5"
+oxicuda-primitives = "0.5.4"
 ```
 
 ```rust
@@ -42,7 +42,7 @@ assert!(pass1_ptx.contains("device_reduce_pass1_sum_f32"));
 
 ## Status
 
-- **Version**: 0.5.5 (2026-08-12)
+- **Version**: 0.5.4 (2026-08-11)
 - **Tests**: 271 passing
 
 ## License
