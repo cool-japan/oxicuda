@@ -68,7 +68,7 @@ impl Conv1x1 {
     /// the instruction stream as immediates (they drive the group routing and
     /// the filter row stride), so two problems that differ only in channel
     /// count produce *different* PTX. The name is the compiled-module cache key
-    /// (see [`crate::kernel_cache`]), so leaving them out would let one
+    /// (see `crate::kernel_cache`), so leaving them out would let one
     /// problem's module be handed to another shape — a silent wrong-results
     /// bug, not a compile error. Encoding them here keeps the key faithful and
     /// makes the emitted PTX self-describing.
@@ -170,7 +170,7 @@ impl Conv1x1 {
     /// both PTX generation and the `cuModuleLoadData` JIT. The launch geometry
     /// comes from an occupancy query against the compiled function rather than
     /// a hard-coded block size; the grid still covers every output element
-    /// (see [`CachedKernel::launch_1d`](crate::kernel_cache::CachedKernel::launch_1d)).
+    /// (see `CachedKernel::launch_1d`).
     ///
     /// # Errors
     ///

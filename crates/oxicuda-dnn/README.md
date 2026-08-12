@@ -156,9 +156,9 @@ Tri Dao kernel at sequence lengths 512--8192.
 
 | Item | Value |
 |------|-------|
-| Version | 0.4.1 |
-| Release date | 2026-07-01 |
-| Tests | 1,075 passing |
+| Version | 0.5.5 |
+| Release date | 2026-08-13 |
+| Tests | 1,291 passing |
 | Warnings | 0 (clippy clean) |
 | `unwrap()` | 0 (production code) |
 

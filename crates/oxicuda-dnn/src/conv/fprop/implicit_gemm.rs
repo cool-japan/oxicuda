@@ -83,7 +83,7 @@ impl ImplicitGemmConv {
     /// # Cache-key contract
     ///
     /// This name is the compiled-module cache key (see
-    /// [`crate::kernel_cache`]), so it must discriminate everything
+    /// `crate::kernel_cache`), so it must discriminate everything
     /// [`Self::generate_ptx`] bakes into the instruction stream:
     ///
     /// | Code-gen constant | Encoded as |

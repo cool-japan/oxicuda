@@ -2,7 +2,7 @@
 //!
 //! [`DnnHandle`] is the central object for all DNN operations, analogous to
 //! `cudnnHandle_t` in cuDNN.  It owns a CUDA stream, a [`BlasHandle`] for
-//! matrix operations, a [`KernelCache`] of JIT-compiled kernels, a
+//! matrix operations, a `KernelCache` of JIT-compiled kernels, a
 //! [`PtxCache`] of generated PTX text on disk, and an optional workspace
 //! buffer.
 //!
@@ -246,13 +246,13 @@ impl DnnHandle {
     /// Blocks until every operation queued on *either* of this handle's two
     /// streams has completed: [`Self::stream`] (used by DNN kernels launched
     /// directly against this handle) **and** [`BlasHandle::stream`] on
-    /// [`Self::blas`] (a separate stream — see [`Self::build`] — used by GEMM
+    /// [`Self::blas`] (a separate stream — see `Self::build` — used by GEMM
     /// launches routed through [`Self::blas`]).
     ///
     /// # Why this exists
     ///
     /// `DnnHandle` deliberately gives its BLAS sub-handle its own stream so
-    /// BLAS and DNN launches can be overlapped (see [`Self::build`]'s doc
+    /// BLAS and DNN launches can be overlapped (see `Self::build`'s doc
     /// comment). That is exactly what makes synchronizing only
     /// [`Self::stream`] *look* correct while actually racing: a caller that
     /// dispatches work through [`Self::blas`] and then calls
@@ -429,7 +429,7 @@ impl DnnHandle {
     /// the previous staged transfer left behind and are uploaded as-is.
     ///
     /// Ordered after work on **both** of this handle's streams (see
-    /// [`join_blas_stream`](Self::join_blas_stream)), and returns only once the
+    /// `join_blas_stream`), and returns only once the
     /// upload has landed.
     ///
     /// # Errors

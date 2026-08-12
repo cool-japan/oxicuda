@@ -105,7 +105,7 @@ impl ComputeBackend for MetalBackend {
     /// This deliberately matches `oxicuda_webgpu`'s `gemm` **exactly**, so the
     /// two GPU backends accept the same argument space and produce the same
     /// numbers. It does **not** match the
-    /// [`ComputeBackend::gemm`](oxicuda_backend::ComputeBackend::gemm) trait
+    /// [`ComputeBackend::gemm`] trait
     /// doc's "column-major `f64`" wording, which describes
     /// `oxicuda_backend::CpuBackend` — the reference implementation — and not
     /// the GPU backends. (The trait is inconsistent with itself here: its own

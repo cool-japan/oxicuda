@@ -183,7 +183,7 @@ impl FusedConvBnAct {
     /// kernel launches and synchronises fault-free but performs **no
     /// convolution, no load, and no store**: `output` is left completely
     /// untouched. This is exercised deliberately as a "load/launch-only
-    /// fragment" canary in `gpu_tests::conv_fprop::fused_conv_bn_relu_f32_launches`,
+    /// fragment" canary in `gpu_tests::conv_fused::fused_conv_bn_relu_f32_launches`,
     /// which asserts the untouched-buffer behaviour rather than a (currently
     /// impossible) numeric result.
     ///

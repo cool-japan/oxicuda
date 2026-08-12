@@ -1,10 +1,10 @@
 //! One-call compute-backend selection: "give me something that computes here".
 //!
-//! [`crate::backend`] exposes the [`ComputeBackend`] trait and every concrete
+//! [`crate::backend`] exposes the [`ComputeBackend`](crate::backend::ComputeBackend) trait and every concrete
 //! implementation, but picking one by hand means knowing which GPU stack this
 //! machine has, whether its driver loads, and which feature flags the build
 //! turned on. This module does that for you: it probes the backends compiled
-//! into the build, ranks them with the [`BackendRegistry`] control plane, and
+//! into the build, ranks them with the [`BackendRegistry`](crate::backend::BackendRegistry) control plane, and
 //! hands back the best one **already initialised**.
 //!
 //! ```no_run
@@ -21,15 +21,15 @@
 //!
 //! | Kind | Constructed when | Considered available when |
 //! |------|------------------|---------------------------|
-//! | [`BackendKind::Cuda`] | always | `libcuda` loads **and** reports ≥ 1 device |
-//! | [`BackendKind::Rocm`] | feature `rocm` | `RocmDevice::new()` succeeds |
-//! | [`BackendKind::Metal`] | feature `metal` | `MetalDevice` opens (macOS) |
-//! | [`BackendKind::LevelZero`] | feature `level-zero` | Level Zero driver opens |
-//! | [`BackendKind::Vulkan`] | feature `vulkan` | a Vulkan device opens |
-//! | [`BackendKind::WebGpu`] | feature `webgpu` | `wgpu` finds an adapter |
-//! | [`BackendKind::Cpu`] | always | always — the guaranteed fallback |
+//! | [`BackendKind::Cuda`](crate::backend::BackendKind::Cuda) | always | `libcuda` loads **and** reports ≥ 1 device |
+//! | [`BackendKind::Rocm`](crate::backend::BackendKind::Rocm) | feature `rocm` | `RocmDevice::new()` succeeds |
+//! | [`BackendKind::Metal`](crate::backend::BackendKind::Metal) | feature `metal` | `MetalDevice` opens (macOS) |
+//! | [`BackendKind::LevelZero`](crate::backend::BackendKind::LevelZero) | feature `level-zero` | Level Zero driver opens |
+//! | [`BackendKind::Vulkan`](crate::backend::BackendKind::Vulkan) | feature `vulkan` | a Vulkan device opens |
+//! | [`BackendKind::WebGpu`](crate::backend::BackendKind::WebGpu) | feature `webgpu` | `wgpu` finds an adapter |
+//! | [`BackendKind::Cpu`](crate::backend::BackendKind::Cpu) | always | always — the guaranteed fallback |
 //!
-//! Ordering follows [`BackendKind::default_priority`], so a native GPU stack
+//! Ordering follows [`BackendKind::default_priority`](crate::backend::BackendKind::default_priority), so a native GPU stack
 //! wins over a portable one and the host path is always last. The CUDA entry
 //! is special-cased: [`CudaBackend::init`](crate::backend::CudaBackend) succeeds
 //! even with no NVIDIA GPU present, so availability is decided by an explicit
@@ -39,7 +39,7 @@
 //!
 //! With the `metal` feature this returns a `MetalBackend` running on the Apple
 //! GPU; without it — or on a Mac where the Metal device cannot be opened — it
-//! returns the [`CpuBackend`], never an error. The CUDA driver path is not
+//! returns the [`CpuBackend`](crate::backend::CpuBackend), never an error. The CUDA driver path is not
 //! available on macOS at all, so [`crate::init`] there returns
 //! `Err(CudaError::NotInitialized)` while this module keeps working.
 //!
@@ -50,8 +50,8 @@
 //!
 //! Metal covers `gemm`/`batched_gemm`, the element-wise unary and binary ops
 //! and the axis reductions; ops it does not implement return
-//! [`BackendError::Unsupported`] rather than falling back silently, so a
-//! consumer that needs them should keep a [`CpuBackend`] alongside.
+//! [`BackendError::Unsupported`](crate::backend::BackendError::Unsupported) rather than falling back silently, so a
+//! consumer that needs them should keep a [`CpuBackend`](crate::backend::CpuBackend) alongside.
 
 use std::ops::{Deref, DerefMut};
 

@@ -100,6 +100,7 @@ crate's rustdoc for `WarpVec` for a worked example.
 
 | Version | Date       | Tests        |
 |---------|------------|--------------|
+| 0.5.5   | 2026-08-13 | 1064 passing |
 | 0.5.4   | 2026-08-11 | 1061 passing |
 | 0.5.2   | 2026-07-27 | 1035 passing |
 | 0.3.0   | 2026-06-25 | 1006 passing |

@@ -357,7 +357,7 @@ kernel void gemm_f16(
 /// silent failure mode (a typo becomes a no-op copy rather than an error) and it
 /// is retained here only because the behaviour is frozen; use
 /// [`elementwise_msl_v2`], which returns
-/// [`MetalError::Unsupported`](crate::error::MetalError::Unsupported) instead.
+/// [`MetalError::Unsupported`] instead.
 pub fn elementwise_msl(op: &str) -> String {
     let op_expr = unary_op_expr(op).unwrap_or("x"); // identity fallback (frozen)
     format!(
@@ -464,7 +464,7 @@ fn binary_op_expr(op: &str) -> Option<&'static str> {
 /// for an unknown op, so a typo — or a newly added `UnaryOp` variant that nobody
 /// wired into the string table — compiles, runs, and silently copies the input.
 /// This variant returns
-/// [`MetalError::Unsupported`](crate::error::MetalError::Unsupported) instead,
+/// [`MetalError::Unsupported`] instead,
 /// matching how [`reduction_msl`] already signals an unknown op.
 ///
 /// `gelu` and `silu`, previously advertised but absent, are implemented here and
@@ -1018,7 +1018,7 @@ kernel void attention_f32(
 ///
 /// Rejects a non-finite or non-positive `scale` (`1/sqrt(head_dim)` is the usual
 /// value, and a zero/negative scale is never meaningful) and any zero shape,
-/// with [`MetalError::InvalidArgument`](crate::error::MetalError::InvalidArgument),
+/// with [`MetalError::InvalidArgument`],
 /// instead of deferring the failure to an opaque shader-compile error or
 /// producing a kernel that returns immediately.
 #[allow(clippy::too_many_arguments)]

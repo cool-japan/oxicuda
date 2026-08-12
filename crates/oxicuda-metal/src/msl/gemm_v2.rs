@@ -120,10 +120,10 @@ pub fn batched_gemm_v2_function_name(dtype: GemmDtype) -> &'static str {
 /// `C := alpha * op(A) * op(B) + beta * C`, where `op(X)` is `X` or `Xᵀ`
 /// selected per operand at dispatch time.
 ///
-/// This is the replacement for [`gemm_msl`], which is a one-thread-per-output
+/// This is the replacement for [`gemm_msl`](super::gemm_msl), which is a one-thread-per-output
 /// global-memory loop that bakes `lda = k`, `ldb = n`, `ldc = n` and no
 /// transpose into the indexing — so it silently computes the wrong answer for a
-/// transposed or padded operand.  Nothing about [`gemm_msl`] changes; new
+/// transposed or padded operand.  Nothing about [`gemm_msl`](super::gemm_msl) changes; new
 /// dispatchers should bind this kernel instead.
 ///
 /// # Parameter buffer `[[buffer(3)]]` — exact byte layout
@@ -157,7 +157,7 @@ pub fn batched_gemm_v2_function_name(dtype: GemmDtype) -> &'static str {
 /// * `C` is always stored `m × ldc` (`ldc >= n`), `C(r, c) = c[r*ldc + c]`.
 ///
 /// Passing `lda = k`, `ldb = n`, `ldc = n` with both transpose flags zero
-/// reproduces [`gemm_msl`]'s behaviour bit-for-bit up to FP association.
+/// reproduces [`gemm_msl`](super::gemm_msl)'s behaviour bit-for-bit up to FP association.
 ///
 /// # Dispatch contract
 ///

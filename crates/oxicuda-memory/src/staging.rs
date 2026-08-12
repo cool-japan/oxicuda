@@ -295,7 +295,7 @@ impl StagingBuffer {
     /// Grow-only: a request smaller than the current capacity is a no-op, so a
     /// pipeline cycling through several tensor shapes settles at the high-water
     /// mark and never re-pins again. Growth rounds up to
-    /// [`CAPACITY_GRANULARITY`].
+    /// `CAPACITY_GRANULARITY`.
     ///
     /// Any previously staged contents are discarded when the buffer grows.
     ///

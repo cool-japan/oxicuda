@@ -5,7 +5,7 @@
 [![CI](https://github.com/cool-japan/oxicuda/workflows/CI/badge.svg)](https://github.com/cool-japan/oxicuda/actions)
 [![License](https://img.shields.io/crates/l/oxicuda.svg)](LICENSE)
 
-**Pure Rust CUDA replacement -- cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSOLVER, cuRAND and beyond in ~1.30M SLoC of safe Rust across 74 crates.**
+**Pure Rust CUDA replacement -- cuBLAS, cuDNN, cuFFT, cuSPARSE, cuSOLVER, cuRAND and beyond in ~1.31M SLoC of safe Rust across 74 crates.**
 
 OxiCUDA replaces the entire NVIDIA CUDA Toolkit software stack with type-safe,
 memory-safe Rust code. The only runtime dependency is the NVIDIA driver
@@ -218,18 +218,18 @@ fn main() -> Result<(), oxicuda::Error> {
 | Crate | CUDA Equivalent | Description | SLoC | Tests |
 |-------|-----------------|-------------|------|-------|
 | **Vol.1 -- Foundation** | | | | |
-| `oxicuda-driver` | Driver API | FFI, device/context/stream/event/module | 16,160 | 461 |
-| `oxicuda-memory` | cuMemAlloc | DeviceBuffer, PinnedBuffer, unified, pool | 6,812 | 301 |
+| `oxicuda-driver` | Driver API | FFI, device/context/stream/event/module | 18,518 | 461 |
+| `oxicuda-memory` | cuMemAlloc | DeviceBuffer, PinnedBuffer, unified, pool | 9,281 | 324 |
 | `oxicuda-launch` | cuLaunchKernel | Dim3, LaunchParams, `launch!` macro | 5,585 | 233 |
 | `oxicuda-runtime` | CUDA Runtime | High-level cudaRT API layer | 4,955 | 126 |
 | `oxicuda-nvrtc` | NVRTC | Runtime CUDA-C to PTX JIT, dlopen'd libnvrtc | 642 | 20 |
 | **Vol.2 -- PTX Codegen & Autotuner** | | | | |
-| `oxicuda-ptx` | nvcc / CUTLASS | PTX IR, codegen DSL, Tensor Core gen | 37,287 | 1,061 |
-| `oxicuda-autotune` | -- | Search space, benchmark, tuning DB | 16,500 | 472 |
+| `oxicuda-ptx` | nvcc / CUTLASS | PTX IR, codegen DSL, Tensor Core gen | 44,246 | 1,064 |
+| `oxicuda-autotune` | -- | Search space, benchmark, tuning DB | 20,792 | 479 |
 | **Vol.3 -- Linear Algebra** | | | | |
-| `oxicuda-blas` | cuBLAS | BLAS L1/L2/L3, GEMM, batched, elementwise | 33,597 | 990 |
+| `oxicuda-blas` | cuBLAS | BLAS L1/L2/L3, GEMM, batched, elementwise | 41,611 | 1,001 |
 | **Vol.4 -- Deep Learning** | | | | |
-| `oxicuda-dnn` | cuDNN | Conv, attention, MoE, norm, pool, quantize | 47,562 | 1,262 |
+| `oxicuda-dnn` | cuDNN | Conv, attention, MoE, norm, pool, quantize | 60,035 | 1,291 |
 | **Vol.5 -- Scientific Computing** | | | | |
 | `oxicuda-fft` | cuFFT | Stockham, radix-2/4/8, Bluestein, 1D/2D/3D | 15,182 | 437 |
 | `oxicuda-sparse` | cuSPARSE | CSR/CSC/COO/BSR/ELL, SpMV, SpMM, SpGEMM | 17,851 | 463 |
@@ -249,11 +249,11 @@ fn main() -> Result<(), oxicuda::Error> {
 | **Vol.10 -- Reinforcement Learning** | | | | |
 | `oxicuda-rl` | -- | Replay buffers, policy dists, PPO/DQN/SAC/TD3 | 12,473 | 453 |
 | **Backends** | | | | |
-| `oxicuda-backend` | -- | Backend trait abstraction | 4,038 | 101 |
+| `oxicuda-backend` | -- | Backend trait abstraction | 4,718 | 106 |
 | `oxicuda-primitives` | CUB | GPU scan, reduce, sort, histogram | 10,712 | 271 |
-| `oxicuda-metal` | -- | Metal compute backend (macOS) | 7,456 | 262 |
+| `oxicuda-metal` | -- | Metal compute backend (macOS) | 15,153 | 401 |
 | `oxicuda-vulkan` | -- | Vulkan Compute backend | 7,493 | 151 |
-| `oxicuda-webgpu` | -- | WebGPU backend | 5,736 | 226 |
+| `oxicuda-webgpu` | -- | WebGPU backend | 9,412 | 293 |
 | `oxicuda-rocm` | -- | AMD ROCm backend | 6,755 | 217 |
 | `oxicuda-levelzero` | -- | Intel oneAPI / LevelZero backend | 8,290 | 155 |
 | **Vol.17 -- Generative AI** | | | | |
@@ -347,8 +347,8 @@ fn main() -> Result<(), oxicuda::Error> {
 | **Vol.61 -- 2D Computational Geometry** | | | | |
 | `oxicuda-geom2d` | -- | Delaunay/Voronoi/convex-hull/sweep-line | 11,071 | 301 |
 | **Umbrella** | | | | |
-| `oxicuda` | -- | Umbrella re-export crate | 21,496 | 526 |
-| | | **Total** | **~1,299,146** | **38,689** |
+| `oxicuda` | -- | Umbrella re-export crate | 25,907 | 540 |
+| | | **Total** | **~1,312,651** | **38,987** |
 
 ## Feature Flags
 
@@ -592,6 +592,14 @@ cargo nextest run --all-features
 - `oxicuda-launch`: new `rustc_ptx_interop` gpu-tests launch PTX compiled by upstream nightly `rustc`'s NVPTX backend (not `oxicuda-ptx`'s own generator) directly through the driver stack, proving the driver/launch stack hosts foreign-compiler PTX -- including a `core::simd` (portable-SIMD) kernel
 - Fixed a latent `Instruction::Redux` bug: bitwise warp reductions (`and`/`or`/`xor`) were emitted as `.u32` when the PTX ISA requires `.b32`, which `ptxas` rejected
 - Test suite expanded to 38,689 passing tests (`--all-features`; 37,346 with default features), up from 38,675/37,320 at 0.5.3
+
+**Released (v0.5.5) -- 2026-08-13** *(38,987 tests passing, ~1.31M SLoC, 74 crates)*
+- `oxicuda-metal`: alt-GPU-backend audit found `conv2d_forward` and `attention` were false completions -- pure-CPU scalar loops despite finished MSL kernels sitting unused in the same crate -- and `softmax` fell back to the trait's `Unsupported` default despite a complete shader shipping alongside it; all three now dispatch real GPU kernels, alongside command-buffer status checking, buffer-alloc validation, and simdgroup-GEMM/FFT threadgroup-sizing fixes across the backend
+- `oxicuda-webgpu`: the same audit found a device-limits bug capping every allocation/dispatch at the WebGPU conformance baseline regardless of the real GPU, a process-fatal default error handler, and integer-overflow/out-of-bounds-write bugs in `batched_gemm`/`scan_wgsl` shaders -- plus a pipeline/bind-group cache extension for repeated-dispatch performance
+- `oxicuda-dnn`/`oxicuda-blas`: a downstream GEMM/convolution investigation traced from an `oxiface` face-swap CLI performance report -- verified end to end on a real RTX A4000 -- found a split-K GEMM path that was implemented and tested but never wired into the dispatcher (~17.6x once fixed, on the exact ArcFace shape), a Winograd/fused-conv-BN-activation false completion where comment-only PTX skeletons silently left output untouched, and a cross-stream readback hazard between `DnnHandle`'s BLAS and DNN streams that had produced wrong reads in downstream `oxionnx-cuda` call sites
+- `oxicuda-ptx`: fixed an Sm86 (Ampere GA10x -- RTX A4000/A5000/A6000/3080/3090) hardware-constant bug that grouped it with datacenter-class Sm80 (GA100), overstating threads-per-SM (2048 vs. the real 1536) and shared-memory-per-block (163,840 vs. the real 101,376 bytes) -- live-verified against a real RTX A4000 and corroborated by `oxicuda-launch`'s independently-maintained table
+- `oxicuda-dnn`/`oxicuda-memory`: new infrastructure built in the course of that investigation -- a JIT `kernel_cache` (wired into every kernel-generating module in `oxicuda-dnn`, replacing a fresh `cuModuleLoadData` compile with a hash lookup on repeated calls) and a reusable pinned `StagingBuffer` for hot-path H2D/D2H transfers (measured 1.55x-1.75x H2D / 1.77x-2.67x D2H over `DeviceBuffer::copy_from_host`/`copy_to_host` on an RTX A4000)
+- `oxicuda-autotune`: two macOS "fake success instead of honest failure" fixes -- `HardwareFingerprint` now reads real Apple Silicon identity via `sysctl` instead of returning an identical synthetic fingerprint for every Mac, and `NvidiaSmiMonitor::read_power` now honestly errors instead of returning a hardcoded fake power/temp/clock reading
 
 **Next**
 - Published documentation on docs.rs

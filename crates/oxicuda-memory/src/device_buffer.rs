@@ -168,7 +168,7 @@ impl<T: Copy> DeviceBuffer<T> {
     /// the pending zero-fill.
     ///
     /// The wait is scoped to the legacy default stream alone (see
-    /// [`sync_legacy_stream`]), so unrelated work in flight on other streams is
+    /// `sync_legacy_stream`), so unrelated work in flight on other streams is
     /// **not** waited on.
     ///
     /// # Errors
@@ -274,7 +274,7 @@ impl<T: Copy> DeviceBuffer<T> {
     ///
     /// The upload is **fully landed on the device before this function
     /// returns**, and the wait is scoped to the legacy default stream alone
-    /// (see [`sync_legacy_stream`]) rather than to the whole context.
+    /// (see `sync_legacy_stream`) rather than to the whole context.
     ///
     /// # Performance
     ///

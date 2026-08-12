@@ -14,7 +14,7 @@
 //! sequence sizes.
 //!
 //! The host implementations that used to *be* these ops survive only as
-//! [`attention_host`] — the genuine fallback for a configuration the GPU kernel
+//! `attention_host` — the genuine fallback for a configuration the GPU kernel
 //! cannot express (an attention head whose accumulator exceeds the device's
 //! threadgroup-memory budget).
 

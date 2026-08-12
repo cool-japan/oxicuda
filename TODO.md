@@ -3,12 +3,12 @@
 Pure Rust CUDA replacement for the COOLJAPAN ecosystem.
 (C) 2026 COOLJAPAN OU (Team KitaSan)
 
-## Project Status (v0.5.5 — 2026-08-12)
+## Project Status (v0.5.5 — 2026-08-13)
 
 - **Crates**: 74 workspace members (73 library crates + 1 umbrella)
-- **Files**: 4,486 Rust source files
-- **Code**: ~1,299,146 SLoC (Rust)
-- **Tests**: 38,924 passing (workspace-wide, `--all-features`), 37,593 with default features, 2 skipped (GPU-only on macOS); plus 686 under `--features gpu-tests` on real Apple M3 hardware and 17 doc tests across `oxicuda-metal`/`oxicuda-webgpu`/`oxicuda` (all measured 2026-08-12)
+- **Files**: 4,521 Rust source files
+- **Code**: ~1,312,651 SLoC (Rust)
+- **Tests**: 38,987 passing (workspace-wide, `--all-features`), 37,629 with default features, 2 skipped (GPU-only on macOS), plus 272 doc tests passing workspace-wide (18 ignored, 74/74 crates — 17 of those in `oxicuda`, 4 in `oxicuda-metal`, 1 in `oxicuda-webgpu`) (all measured 2026-08-13); separately, 686 under `--features gpu-tests` on real Apple M3 hardware (measured 2026-08-12, not re-run this pass)
 - **Warnings**: 0 (clippy + rustc, `-D warnings`)
 - **unwrap() calls**: 0 (no-unwrap policy in library code)
 - **New in 0.5.1**: `oxicuda-nvrtc` — pure-Rust runtime loader for NVIDIA's NVRTC (CUDA-C → PTX JIT) via `libloading` (zero SDK dependency, graceful degradation when absent); exposed from the umbrella behind the `nvrtc` feature. Brings the workspace to 74 members.

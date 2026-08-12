@@ -91,8 +91,8 @@ Most users should reach this crate through the `oxicuda` facade's `webgpu` featu
 
 ## Status
 
-- **Version**: 0.5.5 (2026-08-12)
-- **Tests**: 293 of 293 passing, clippy-clean (measured 2026-08-12, `--all-features`, real Apple M3 hardware running the Metal-backed `wgpu` path). Concurrent work in this crate means this count moves quickly — re-run `cargo nextest run -p oxicuda-webgpu --all-features` for the current figure.
+- **Version**: 0.5.5 (2026-08-13)
+- **Tests**: 293 of 293 passing, clippy-clean (measured 2026-08-13, `--all-features`, real Apple M3 hardware running the Metal-backed `wgpu` path). Concurrent work in this crate means this count moves quickly — re-run `cargo nextest run -p oxicuda-webgpu --all-features` for the current figure.
 
 ## License
 

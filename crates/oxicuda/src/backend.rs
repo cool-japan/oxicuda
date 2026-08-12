@@ -2,17 +2,17 @@
 //!
 //! This module is the facade's single entry point to the compute-backend
 //! abstraction. It re-exports the whole surface of `oxicuda-backend` — the
-//! [`ComputeBackend`] trait, the always-available [`CpuBackend`], the
-//! [`BackendRegistry`] control plane and its [`Capabilities`] types — and adds
-//! [`CudaBackend`], the CUDA implementation built on `oxicuda-driver`.
+//! [`ComputeBackend`](crate::backend::ComputeBackend) trait, the always-available [`CpuBackend`](crate::backend::CpuBackend), the
+//! [`BackendRegistry`](crate::backend::BackendRegistry) control plane and its [`Capabilities`](crate::backend::Capabilities) types — and adds
+//! [`CudaBackend`](crate::backend::CudaBackend), the CUDA implementation built on `oxicuda-driver`.
 //!
 //! # Concrete backends
 //!
 //! | Type | Availability |
 //! |------|--------------|
-//! | [`CpuBackend`] | always (pure-Rust host reference path) |
-//! | [`NullBackend`] | always (refuses every op; for dispatch tests) |
-//! | [`CudaBackend`] | always compiled; usable where `libcuda` loads |
+//! | [`CpuBackend`](crate::backend::CpuBackend) | always (pure-Rust host reference path) |
+//! | [`NullBackend`](crate::backend::NullBackend) | always (refuses every op; for dispatch tests) |
+//! | [`CudaBackend`](crate::backend::CudaBackend) | always compiled; usable where `libcuda` loads |
 //! | `MetalBackend` | feature `metal` (works on macOS) |
 //! | `WebGpuBackend` | feature `webgpu` |
 //! | `VulkanBackend` | feature `vulkan` |

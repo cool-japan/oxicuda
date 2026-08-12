@@ -35,6 +35,7 @@ use crate::handle::DnnHandle;
 // Subsystem submodules (one per discovery cluster).
 mod attn;
 mod conv_fprop;
+mod conv_fused;
 mod conv_other;
 mod handle_sync;
 mod moe_linear;

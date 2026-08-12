@@ -64,7 +64,7 @@ use crate::msl::{GemmDtype, MslMathMode, with_math_mode};
 /// The row maximum is seeded with `-INFINITY` and the normalisation relies on
 /// `exp(x - max) <= 1`; neither is guaranteed under Metal's default fast math.
 /// Use [`softmax_msl_with_mode`] with
-/// [`MslMathMode::Precise`](crate::msl::MslMathMode::Precise) when that matters.
+/// [`MslMathMode::Precise`] when that matters.
 pub fn softmax_msl() -> &'static str {
     r#"
 #include <metal_stdlib>
@@ -185,7 +185,7 @@ pub fn softmax_msl_for_threadgroup(
 ///
 /// The mean/variance sums must not be reassociated for the two-pass variance to
 /// stay accurate; use [`layernorm_msl_with_mode`] with
-/// [`MslMathMode::Precise`](crate::msl::MslMathMode::Precise) when that matters.
+/// [`MslMathMode::Precise`] when that matters.
 pub fn layernorm_msl() -> &'static str {
     r#"
 #include <metal_stdlib>

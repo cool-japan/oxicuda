@@ -6,7 +6,7 @@ Part of the [OxiCUDA](https://github.com/cool-japan/oxicuda) project.
 
 ## Overview
 
-**Version:** 0.5.5 — 2026-08-12 — see [Status](#status) below for test counts
+**Version:** 0.5.5 — 2026-08-13 — see [Status](#status) below for test counts
 
 `oxicuda` is the umbrella crate that re-exports all OxiCUDA sub-crates behind
 feature flags. It provides a single dependency entry point for applications that
@@ -145,8 +145,8 @@ the [`oxicuda-metal`](../oxicuda-metal/README.md#op-coverage) /
 
 ## Status
 
-- **Version**: 0.5.5 (2026-08-12)
-- **Tests**: 164 passing with `--features metal,webgpu,nvrtc` (the macOS-relevant feature set; measured 2026-08-12 on real Apple M3 hardware). This crate's full `--all-features` count (covering every CUDA-only subsystem too) is tracked in the root [README](../../README.md#crate-overview)'s crate table rather than duplicated here, to avoid two figures drifting apart.
+- **Version**: 0.5.5 (2026-08-13)
+- **Tests**: 164 passing with `--features metal,webgpu,nvrtc` (the macOS-relevant feature set; measured 2026-08-13 on real Apple M3 hardware). This crate's full `--all-features` count (covering every CUDA-only subsystem too) is tracked in the root [README](../../README.md#crate-overview)'s crate table rather than duplicated here, to avoid two figures drifting apart.
 
 ## License
 
