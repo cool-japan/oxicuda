@@ -67,16 +67,47 @@ fn create_stream_in_ctx(
 ///
 /// The stream holds an [`Arc<Context>`] to ensure the parent context
 /// outlives the stream.
+///
+/// # A `Stream` is a shared handle, not a unique owner
+///
+/// Cloning yields a second handle to the **same** queue — [`Stream::raw`]
+/// returns the same `CUstream` — and the queue is destroyed once the last
+/// handle drops. That is what lets two subsystems which each want to hold
+/// "their" stream be collapsed onto one queue: `oxicuda-dnn`'s `DnnHandle` and
+/// the `BlasHandle` nested inside it now share one, so a convolution's output
+/// is ordered before a GEMM that reads it by stream semantics alone — no
+/// event choreography, no host rendezvous, and a capture of the pair is a
+/// linear chain rather than a fork/join.
+///
+/// `Clone` is written out rather than derived so the doc comment can say what
+/// it means: this is another reference to one queue, not a copy of it.
 pub struct Stream {
+    /// The driver-owned queue, destroyed when the last handle drops.
+    inner: Arc<StreamInner>,
+}
+
+impl Clone for Stream {
+    /// Another handle to the same queue. See the type docs.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// The driver-owned half of a [`Stream`]: destroyed exactly once, when the
+/// last handle to the queue drops.
+struct StreamInner {
     /// Raw CUDA stream handle.
     raw: CUstream,
     /// Keeps the parent context alive for the lifetime of the stream.
     ctx: Arc<Context>,
 }
 
-// `Stream` is `Send + Sync` by auto-derivation from its fields: a `CUstream`
-// handle and an `Arc<Context>` (and `Context` is itself `Send + Sync`). The
-// CUDA Driver API is thread-safe, so no manual `unsafe impl` is required.
+// `Stream` is `Send + Sync` by auto-derivation from its fields: an
+// `Arc<StreamInner>` over a `CUstream` handle and an `Arc<Context>` (and
+// `Context` is itself `Send + Sync`). The CUDA Driver API is thread-safe, so
+// no manual `unsafe impl` is required.
 
 impl Stream {
     /// Creates a new stream with [`CU_STREAM_NON_BLOCKING`] flag.
@@ -97,8 +128,10 @@ impl Stream {
             (api.cu_stream_create)(raw, CU_STREAM_NON_BLOCKING)
         })?;
         Ok(Self {
-            raw,
-            ctx: Arc::clone(ctx),
+            inner: Arc::new(StreamInner {
+                raw,
+                ctx: Arc::clone(ctx),
+            }),
         })
     }
 
@@ -119,8 +152,10 @@ impl Stream {
             (api.cu_stream_create_with_priority)(raw, CU_STREAM_NON_BLOCKING, priority)
         })?;
         Ok(Self {
-            raw,
-            ctx: Arc::clone(ctx),
+            inner: Arc::new(StreamInner {
+                raw,
+                ctx: Arc::clone(ctx),
+            }),
         })
     }
 
@@ -133,7 +168,7 @@ impl Stream {
     /// operation failed or the driver reports an error.
     pub fn synchronize(&self) -> CudaResult<()> {
         let api = try_driver()?;
-        crate::cuda_call!((api.cu_stream_synchronize)(self.raw))
+        crate::cuda_call!((api.cu_stream_synchronize)(self.inner.raw))
     }
 
     /// Makes all future work submitted to this stream wait until
@@ -150,7 +185,7 @@ impl Stream {
     pub fn wait_event(&self, event: &Event) -> CudaResult<()> {
         let api = try_driver()?;
         // flags = 0 is the only documented value.
-        crate::cuda_call!((api.cu_stream_wait_event)(self.raw, event.raw(), 0))
+        crate::cuda_call!((api.cu_stream_wait_event)(self.inner.raw, event.raw(), 0))
     }
 
     /// Returns the raw [`CUstream`] handle.
@@ -161,17 +196,30 @@ impl Stream {
     /// while this `Stream` is still alive.
     #[inline]
     pub fn raw(&self) -> CUstream {
-        self.raw
+        self.inner.raw
+    }
+
+    /// Whether `self` and `other` are handles to the **same** driver queue.
+    ///
+    /// The question a caller asks before deciding that stream order alone
+    /// sequences two pieces of work: on one queue it does, on two it does not
+    /// and an event is required. Compares the driver handle rather than the
+    /// `Arc`, so a queue reached through two independently-built handles (were
+    /// that ever possible) still answers truthfully.
+    #[inline]
+    #[must_use]
+    pub fn is_same_queue(&self, other: &Self) -> bool {
+        self.inner.raw == other.inner.raw
     }
 
     /// Returns a reference to the parent [`Context`].
     #[inline]
     pub fn context(&self) -> &Arc<Context> {
-        &self.ctx
+        &self.inner.ctx
     }
 }
 
-impl Drop for Stream {
+impl Drop for StreamInner {
     fn drop(&mut self) {
         if let Ok(api) = try_driver() {
             let rc = unsafe { (api.cu_stream_destroy_v2)(self.raw) };

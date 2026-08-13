@@ -106,7 +106,7 @@ impl DnnHandle {
     /// Returns [`DnnError::Io`] if the PTX cache directory cannot be created.
     pub fn new(ctx: &Arc<Context>) -> DnnResult<Self> {
         let stream = Stream::new(ctx)?;
-        Self::build(ctx, stream)
+        Self::with_stream(ctx, stream)
     }
 
     /// Creates a new DNN handle bound to an existing stream.
@@ -118,11 +118,57 @@ impl DnnHandle {
     ///
     /// Same as [`new`](Self::new) except stream creation cannot fail.
     pub fn with_stream(ctx: &Arc<Context>, stream: Stream) -> DnnResult<Self> {
-        Self::build(ctx, stream)
+        // The BLAS sub-handle shares it — see [`Self::build`].
+        let blas_handle = BlasHandle::with_stream(ctx, stream.clone())?;
+        Self::build(ctx, stream, blas_handle)
+    }
+
+    /// Creates a DNN handle whose BLAS sub-handle launches on a **second,
+    /// independent** stream.
+    ///
+    /// The pre-collapse construction, kept for a caller that genuinely wants
+    /// BLAS/DNN overlap and is prepared to pay for the ordering: every handoff
+    /// between the two families then needs an event join (which is what
+    /// [`Self::upload_staged_with`] and friends perform internally) rather than
+    /// stream order. See [`Self::build`] for why the shared-stream form is the
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new), plus the second stream's creation.
+    pub fn with_split_blas_stream(ctx: &Arc<Context>) -> DnnResult<Self> {
+        let stream = Stream::new(ctx)?;
+        let blas_handle = BlasHandle::with_stream(ctx, Stream::new(ctx)?)?;
+        Self::build(ctx, stream, blas_handle)
     }
 
     /// Shared construction logic.
-    fn build(ctx: &Arc<Context>, stream: Stream) -> DnnResult<Self> {
+    ///
+    /// # One queue for both families
+    ///
+    /// The BLAS sub-handle used to get a stream of its own so BLAS and DNN
+    /// launches *could* overlap. No caller in this workspace ever exploited
+    /// that: `oxionnx-cuda` dispatches one ONNX node at a time, and a node's
+    /// convolution and the GEMM that consumes its output are strictly
+    /// dependent, so the two streams only ever ran in sequence — while making
+    /// that sequence *correct* required either an event join or, as the ONNX
+    /// execution provider did, a blocking `stream.synchronize()` per node.
+    /// 237 of those per frame, measured across the three face-pipeline models.
+    ///
+    /// Sharing one queue removes the whole class:
+    ///
+    /// * a `Conv` → `Gemm` handoff is ordered by stream semantics alone, with
+    ///   no event and no host rendezvous — which is what lets an execution
+    ///   provider keep activations on the device across node boundaries;
+    /// * a device buffer released by one family and picked straight up by the
+    ///   other cannot change stream, so stream order keeps protecting it;
+    /// * a captured graph spanning the pair is a linear chain, not a fork/join.
+    ///
+    /// [`Self::with_split_blas_stream`] still builds the two-stream form, and
+    /// every event-join path in this file stays live for it — including
+    /// [`Self::join_blas_stream`], which is a no-op only when the two handles
+    /// really are on one queue.
+    fn build(ctx: &Arc<Context>, stream: Stream, blas_handle: BlasHandle) -> DnnResult<Self> {
         let device = ctx.device();
         let (major, minor) = device.compute_capability()?;
         let sm_version = SmVersion::from_compute_capability(major, minor).ok_or_else(|| {
@@ -131,10 +177,6 @@ impl DnnHandle {
             ))
         })?;
 
-        // Create a separate stream for the internal BLAS handle so that
-        // BLAS and DNN launches can be overlapped when appropriate.
-        let blas_stream = Stream::new(ctx)?;
-        let blas_handle = BlasHandle::with_stream(ctx, blas_stream)?;
         let ptx_cache = PtxCache::new()?;
 
         // Timing is disabled: this event is only ever used to express a
@@ -408,10 +450,32 @@ impl DnnHandle {
     /// the launch stream wait on it expresses the same ordering as a device-side
     /// dependency — the host does not block at all, and the DMA still cannot
     /// start before the GEMM finishes.
+    /// When the two handles share one queue — the default since
+    /// [`Self::build`]'s collapse — there is nothing to join: stream order
+    /// already sequences the GEMM ahead of anything enqueued after it. The
+    /// event pair is skipped rather than issued redundantly, so the shared
+    /// case pays neither a `cuEventRecord` nor a `cuStreamWaitEvent`.
     fn join_blas_stream(&self) -> DnnResult<()> {
+        if self.streams_unified() {
+            return Ok(());
+        }
         self.join_event.record(self.blas_handle.stream())?;
         self.stream.wait_event(&self.join_event)?;
         Ok(())
+    }
+
+    /// Whether [`Self::stream`] and [`Self::blas`]'s stream are the **same**
+    /// driver queue.
+    ///
+    /// `true` for every handle built by [`Self::new`] / [`Self::with_stream`],
+    /// `false` for [`Self::with_split_blas_stream`]. A caller that wants to
+    /// drop a host rendezvous between a DNN launch and a BLAS one — or to
+    /// recycle a device buffer between the two families without a fence — must
+    /// check this first: on one queue stream order is the guarantee, on two it
+    /// is not.
+    #[must_use]
+    pub fn streams_unified(&self) -> bool {
+        self.stream.is_same_queue(self.blas_handle.stream())
     }
 
     /// Uploads `n` elements into `dst`, letting `fill` write them **directly

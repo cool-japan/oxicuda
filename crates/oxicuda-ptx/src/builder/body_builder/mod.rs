@@ -1788,6 +1788,16 @@ pub(super) mod tensor_core_ops;
 // f64 math primitives + synthesized transcendentals (exp/log/erf/tanh).
 pub(super) mod math_f64;
 
+// Vectorized shared-memory load/store (`ld`/`st.shared.v4.f32`), the
+// global-store counterpart of `load_global_f32x4`, and TF32 rounding
+// (`cvt.rna.tf32.f32`).
+pub(super) mod vector_mem_ops;
+
+// On-device numeric coverage for `vector_mem_ops` (gpu-tests gated).
+#[cfg(all(test, feature = "gpu-tests"))]
+#[path = "vector_mem_ops_gpu_tests.rs"]
+mod vector_mem_ops_gpu_tests;
+
 // Warp shuffle / vote / lane-query emission (`shfl.sync`, `vote.sync`).
 pub mod warp_ops;
 

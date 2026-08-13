@@ -15,10 +15,27 @@ categories = ["development-tools", "hardware-support"]
 oxicuda-driver.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# Only used by the `gpu-tests`-gated on-device numeric tests in
+# `builder::body_builder::vector_mem_ops_gpu_tests` to JIT-compile and
+# launch the tiny probe kernels built with this crate's own DSL, and to
+# allocate/copy the device buffers they read from and write to. `oxicuda-
+# launch` depends on `oxicuda-ptx` as a normal dependency; this is the
+# reverse edge, but only in `[dev-dependencies]` (used solely to build this
+# crate's own test binary), which Cargo permits without forming a build
+# cycle -- `oxicuda-launch`'s and `oxicuda-memory`'s *library* targets build
+# from oxicuda-ptx's library alone, before this crate's tests are compiled.
+oxicuda-launch.workspace = true
+oxicuda-memory.workspace = true
+
 [features]
 default = []
 # On-device sanity checks that query a real GPU (via oxicuda-driver) and
-# compare live hardware attributes against the constants in `arch::SmVersion`.
+# compare live hardware attributes against the constants in `arch::SmVersion`,
+# plus (see `builder::body_builder::vector_mem_ops_gpu_tests`) on-device
+# numeric checks of the vectorized shared-memory / TF32-rounding DSL
+# additions: JIT-compile a small probe kernel, launch it on the real device,
+# copy results back, and compare against a CPU reference.
 # Requires a CUDA driver + device at runtime; every such test skips
 # gracefully when none is present. See `arch::gpu_tests`.
 gpu-tests = ["oxicuda-driver/gpu-tests"]

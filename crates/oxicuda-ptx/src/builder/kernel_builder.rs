@@ -60,8 +60,10 @@ pub struct KernelBuilder {
     params: Vec<(String, PtxType)>,
     /// Body closure that populates instructions via `BodyBuilder`.
     body_fn: Option<BodyFn>,
-    /// Static shared memory declarations: (name, `element_type`, `element_count`).
-    shared_mem_declarations: Vec<(String, PtxType, usize)>,
+    /// Static shared memory declarations: (name, `element_type`, `element_count`,
+    /// optional explicit byte alignment overriding the `max(elem_size, 4)`
+    /// default -- see [`shared_mem_aligned`](Self::shared_mem_aligned)).
+    shared_mem_declarations: Vec<(String, PtxType, usize, Option<u32>)>,
     /// Optional `.maxntid` directive (maximum threads per block).
     max_threads: Option<u32>,
 }
@@ -110,11 +112,42 @@ impl KernelBuilder {
     /// Declares a static shared memory allocation.
     ///
     /// This generates a `.shared .align` declaration at the top of the
-    /// kernel body. The total size is `count * ty.size_bytes()` bytes.
+    /// kernel body. The total size is `count * ty.size_bytes()` bytes. The
+    /// alignment defaults to `max(ty.size_bytes(), 4)` -- correct for scalar
+    /// (`.f32`, `.f64`, ...) shared-memory accesses, but **not** for
+    /// vectorized `ld.shared.v4`/`st.shared.v4` accesses against this
+    /// allocation, which require 16-byte alignment regardless of the
+    /// element type (a `.f32` array's natural alignment is only 4 bytes).
+    /// Use [`shared_mem_aligned`](Self::shared_mem_aligned) when the kernel
+    /// body issues vectorized shared-memory loads/stores against this array.
     #[must_use]
     pub fn shared_mem(mut self, name: &str, ty: PtxType, count: usize) -> Self {
         self.shared_mem_declarations
-            .push((name.to_string(), ty, count));
+            .push((name.to_string(), ty, count, None));
+        self
+    }
+
+    /// Declares a static shared memory allocation with an explicit byte
+    /// alignment, overriding the `max(ty.size_bytes(), 4)` default that
+    /// [`shared_mem`](Self::shared_mem) uses.
+    ///
+    /// Needed whenever the kernel body issues vectorized shared-memory
+    /// accesses (e.g. [`BodyBuilder::load_shared_f32x4`](super::body_builder::BodyBuilder::load_shared_f32x4) /
+    /// [`store_shared_f32x4`](super::body_builder::BodyBuilder::store_shared_f32x4),
+    /// which lower to `ld.shared.v4.f32`/`st.shared.v4.f32`): those require
+    /// the base address to be 16-byte aligned, but a plain `f32` array's
+    /// default alignment is only 4 bytes (its element size), which `ptxas`
+    /// accepts syntactically yet the vectorized access then reads/writes
+    /// across the true (unaligned) allocation boundary.
+    ///
+    /// `align` must be a power of two, per the PTX ISA `.align` directive;
+    /// `ptxas` rejects the module otherwise. Common values: `8` for `.v2`
+    /// double-word accesses, `16` for `.v4` word / `.v2` double-word-pair
+    /// accesses.
+    #[must_use]
+    pub fn shared_mem_aligned(mut self, name: &str, ty: PtxType, count: usize, align: u32) -> Self {
+        self.shared_mem_declarations
+            .push((name.to_string(), ty, count, Some(align)));
         self
     }
 
@@ -204,8 +237,8 @@ impl KernelBuilder {
         }
 
         // Shared memory declarations.
-        for (sname, sty, count) in &self.shared_mem_declarations {
-            let align = sty.size_bytes().max(4);
+        for (sname, sty, count, explicit_align) in &self.shared_mem_declarations {
+            let align = explicit_align.map_or_else(|| sty.size_bytes().max(4), |a| a as usize);
             let total_bytes = sty.size_bytes() * count;
             writeln!(
                 ptx,
@@ -302,6 +335,11 @@ mod tests {
 
     #[test]
     fn build_with_shared_mem() {
+        // Pins the *default* (no explicit alignment) path only: a plain
+        // `f32` array aligns to its own element size, `max(4, 4) == 4`. This
+        // is correct for scalar `ld.shared.f32`/`st.shared.f32` accesses but
+        // NOT sufficient for vectorized `.v4` accesses -- see
+        // `build_with_shared_mem_aligned` below for that path.
         let ptx = KernelBuilder::new("smem_kernel")
             .target(SmVersion::Sm80)
             .shared_mem("tile_a", PtxType::F32, 1024)
@@ -312,6 +350,43 @@ mod tests {
             .expect("build should succeed");
 
         assert!(ptx.contains(".shared .align 4 .b8 tile_a[4096];"));
+    }
+
+    #[test]
+    fn build_with_shared_mem_aligned() {
+        // A `f32` array explicitly aligned to 16 bytes -- the alignment
+        // `ld.shared.v4.f32`/`st.shared.v4.f32` require -- even though the
+        // element type's own natural alignment (4 bytes) is unchanged and
+        // the declared byte count is identical to the unaligned case.
+        let ptx = KernelBuilder::new("smem_v4_kernel")
+            .target(SmVersion::Sm80)
+            .shared_mem_aligned("tile_a", PtxType::F32, 1024, 16)
+            .body(|b| {
+                b.ret();
+            })
+            .build()
+            .expect("build should succeed");
+
+        assert!(ptx.contains(".shared .align 16 .b8 tile_a[4096];"));
+        assert!(!ptx.contains(".align 4 .b8 tile_a"));
+    }
+
+    #[test]
+    fn shared_mem_aligned_independent_of_shared_mem_default() {
+        // Two allocations in the same kernel, one via each method: the
+        // explicit alignment on one must not perturb the other's default.
+        let ptx = KernelBuilder::new("mixed_smem_kernel")
+            .target(SmVersion::Sm80)
+            .shared_mem("scalar_tile", PtxType::F32, 256)
+            .shared_mem_aligned("vector_tile", PtxType::F32, 256, 16)
+            .body(|b| {
+                b.ret();
+            })
+            .build()
+            .expect("build should succeed");
+
+        assert!(ptx.contains(".shared .align 4 .b8 scalar_tile[1024];"));
+        assert!(ptx.contains(".shared .align 16 .b8 vector_tile[1024];"));
     }
 
     #[test]

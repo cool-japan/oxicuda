@@ -68,6 +68,10 @@ harness = false
 name = "winograd_vs_implicit_gemm"
 harness = false
 
+[[bench]]
+name = "conv_engine_gflops_regression"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

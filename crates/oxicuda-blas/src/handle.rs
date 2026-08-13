@@ -104,13 +104,34 @@ impl BlasHandle {
             ))
         })?;
 
+        // The real, live streaming-multiprocessor count for *this* device --
+        // compute capability alone cannot give it (see
+        // `GemmDispatcher::sm_count`'s doc comment: sm_86 alone spans GPUs
+        // from 46 SMs to 84+), so it is queried here rather than looked up
+        // from an architecture table. A query failure (or an implausible
+        // non-positive count) falls back to `GemmDispatcher::new`'s
+        // architecture-typical default rather than failing handle
+        // construction over what is ultimately a launch-tuning detail: an
+        // approximate count still produces a *correct* GEMM launch, only a
+        // less precisely occupancy-tuned one.
+        let gemm_dispatcher = match device
+            .multiprocessor_count()
+            .ok()
+            .and_then(|count| u32::try_from(count).ok())
+        {
+            Some(sm_count) if sm_count > 0 => {
+                GemmDispatcher::new_with_sm_count(sm_version, sm_count)
+            }
+            _ => GemmDispatcher::new(sm_version),
+        };
+
         Ok(Self {
             context: Arc::clone(ctx),
             stream,
             math_mode: MathMode::Default,
             pointer_mode: PointerMode::Host,
             sm_version,
-            gemm_dispatcher: GemmDispatcher::new(sm_version),
+            gemm_dispatcher,
             module_cache: RwLock::new(HashMap::new()),
         })
     }
