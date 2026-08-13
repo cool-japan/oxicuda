@@ -10,77 +10,113 @@
 //! 1. **1x1 kernels** with unit stride/dilation -> [`Direct`](ConvAlgorithm::Direct)
 //!    (reduces to plain GEMM)
 //! 2. **Depthwise convolutions** -> [`Direct`](ConvAlgorithm::Direct) (specialised kernel)
-//! 3. **3x3 kernels** with unit stride/dilation and FP32 on large inputs
-//!    -> [`Winograd`](ConvAlgorithm::Winograd) (2.25x multiplication reduction),
-//!    **gated behind [`winograd_forward_implemented`]**. `WinogradConv`'s
-//!    forward kernels are currently load/launch-only skeletons that perform
-//!    no numeric work (see that engine's module docs and the "Honesty
-//!    contract" in `gpu_tests/conv_fprop.rs`), so this rule always falls
-//!    through to rule 4/5/6 today rather than silently handing the caller
-//!    an untouched output buffer.
+//! 3. **3x3 NCHW FP32 kernels** with unit stride/dilation, `groups == 1` and
+//!    padding <= 1, above [`WINOGRAD_FLOP_THRESHOLD`]
+//!    -> [`Winograd`](ConvAlgorithm::Winograd). Eligibility is
+//!    [`WinogradConv::supports`] verbatim (via [`is_winograd_eligible`]), so
+//!    this rule can never select an engine that would then refuse the
+//!    problem; profitability is the separate FLOP test, calibrated from the
+//!    measurements quoted on [`WINOGRAD_FLOP_THRESHOLD`].
 //! 4. **Large kernels** (7x7+) -> [`FftConv`](ConvAlgorithm::FftConv)
 //! 5. **Ampere+ with NHWC** -> [`ImplicitGemm`](ConvAlgorithm::ImplicitGemm)
 //! 6. **Default** -> [`Im2colGemm`](ConvAlgorithm::Im2colGemm)
 
 use oxicuda_ptx::arch::SmVersion;
-use oxicuda_ptx::ir::PtxType;
 
 use crate::types::ConvAlgorithm;
 
 use super::descriptor::ConvProblem;
 
-/// Minimum GEMM FLOP count for Winograd to be profitable.
+/// Minimum [`estimate_gemm_flops`] count for Winograd to be profitable.
 ///
-/// Below this threshold the Winograd transform overhead dominates the
-/// multiplication savings, so we fall back to implicit GEMM or im2col.
-const WINOGRAD_FLOP_THRESHOLD: u64 = 1_000_000_000;
+/// # Calibration
+///
+/// Measured on an RTX A4000 (sm_86, driver 550.144.03) with
+/// `benches/winograd_vs_implicit_gemm.rs` — `WinogradConv` against
+/// `ImplicitGemmConv`, same buffers, kernel cache warm, one
+/// `stream().synchronize()` per sample. Median times:
+///
+/// ```text
+///   est. FLOPs   shape           winograd   implicit   speedup
+///    7.373e+04   c8_8x8            12.1 us     7.9 us     0.65x
+///    1.180e+06   c16_16x16         12.2 us    10.1 us     0.83x
+///    4.719e+06   c16_32x32         13.1 us    11.7 us     0.89x
+///    1.887e+07   c32_32x32         17.2 us    29.1 us     1.69x
+///    1.887e+07   c64_16x16         18.1 us    29.4 us     1.62x
+///    7.550e+07   c256_8x8          55.0 us   101.8 us     1.85x
+///    3.020e+08   c512_8x8         176.0 us   434.5 us     2.47x
+///    3.020e+08   c64_64x64        127.6 us   355.5 us     2.79x
+///    1.208e+09   c512_16x16       450.6 us  1527.8 us     3.39x
+///    4.832e+09   c128_128x128    1542.9 us  5959.9 us     3.86x
+///    4.832e+09   c256_64x64      1482.5 us  5489.6 us     3.70x
+///    4.832e+09   c512_32x32      1513.8 us  5591.4 us     3.69x
+///    4.832e+09   c64_256x256     2019.4 us  6900.9 us     3.42x
+/// ```
+///
+/// The GPU is shared, so these are medians from a warm device; the sub-30 us
+/// rows — the ones that actually set the threshold — were re-measured across
+/// three separate runs and agree to within 2%.
+///
+/// Below ~5e6 FLOPs every configuration is launch-bound — Winograd issues
+/// four kernels where implicit GEMM issues one, and no amount of saved
+/// multiplies pays for three extra launches. Above ~1.9e7 Winograd wins by
+/// 1.5x or more, and the margin grows monotonically with problem size. The
+/// threshold sits between the two measured brackets, slightly above the
+/// interpolated break-even (~8e6) so the un-measured band is conservative.
+///
+/// Note that the two 1.887e7-FLOP points trade channels against spatial
+/// extent (`c32_32x32` vs `c64_16x16`) and land within 10% of each other,
+/// which is what justifies expressing the threshold in FLOPs at all rather
+/// than in any single dimension.
+const WINOGRAD_FLOP_THRESHOLD: u64 = 10_000_000;
 
 /// Minimum filter spatial size to consider FFT-based convolution.
 const FFT_FILTER_MIN: u32 = 7;
 
-/// Capability gate: `true` once [`WinogradConv`](super::fprop::winograd::WinogradConv)'s
-/// forward kernels compute a real numeric result.
+/// Capability gate: whether [`select_algorithm`] and [`candidate_algorithms`]
+/// may return [`ConvAlgorithm::Winograd`].
 ///
-/// # Why this exists
+/// # History
 ///
-/// `WinogradConv::execute` currently launches three stages and returns
-/// `Ok(())`, but none of them do any real work:
+/// This started life as a *correctness* gate. `WinogradConv`'s three stages
+/// used to be comment-only PTX skeletons and a `launch_winograd_gemm` that was
+/// literally `let _ = handle; Ok(())`, so a convolution routed there returned
+/// `Ok(())` with the output buffer **completely untouched** — not wrong, never
+/// written. The gate existed to keep ordinary mid-size 3x3 layers out of that
+/// path.
 ///
-/// - `generate_input_transform_ptx`'s body emits only `comment()` calls
-///   narrating steps 1-4, then `ret` -- no load, transform, or store.
-/// - `launch_winograd_gemm` is literally `let _ = handle; Ok(())` -- it
-///   launches no kernel at all.
-/// - `generate_output_transform_ptx` is the same comment-only skeleton --
-///   the output pointer is never touched.
+/// # Why it is now `true`
 ///
-/// Net effect: any convolution routed to `WinogradConv` leaves the
-/// caller's output buffer **completely untouched** (whatever device memory
-/// happened to already be there) rather than merely computing a wrong
-/// answer. This is intentionally documented, not hidden -- see the
-/// "Honesty contract" and the `winograd_*_transform_*_launches` canary
-/// tests in `gpu_tests/conv_fprop.rs`, which assert the untouched-buffer
-/// behaviour as their PASS condition.
+/// [`WinogradConv`](super::fprop::winograd::WinogradConv) is a real
+/// F(2x2,3x3) implementation: input transform, filter transform, a
+/// shared-memory-tiled batched GEMM over the 16 transform-domain positions,
+/// and an output transform with bias. Two independent on-device validations
+/// gate this flag (`gpu_tests::conv_winograd`, RTX A4000 / sm_86):
 ///
-/// Before real F(2,3)/F(4,3) kernels existed, [`select_algorithm`]'s Rule 3
-/// would route *any* eligible shape over `WINOGRAD_FLOP_THRESHOLD` FLOPs
-/// (ordinary mid-size 3x3 CNN layers, not an exotic edge case) into this
-/// silently-broken path. This gate keeps [`select_algorithm`] and
-/// [`candidate_algorithms`] from ever returning
-/// [`ConvAlgorithm::Winograd`] while it returns `false`, so callers fall
-/// back to the numerically-verified [`Im2colGemm`](ConvAlgorithm::Im2colGemm)
-/// / [`ImplicitGemm`](ConvAlgorithm::ImplicitGemm) engines instead.
+/// * against an `f64` CPU oracle — relative L2 error `1.0e-7` to `1.7e-7`
+///   across 15 shapes covering partial tiles, odd extents, `C == 1`, `K == 1`,
+///   multi-batch and both supported paddings;
+/// * against `ImplicitGemmConv` on device — relative L2 `7.9e-8` to `1.4e-6`,
+///   including all four InSwapper-128-scale layers.
 ///
-/// # Flipping this on
+/// Both are three to four orders of magnitude inside the documented `1e-4`
+/// budget. Performance is measured, not assumed: see
+/// [`WINOGRAD_FLOP_THRESHOLD`] for the full table, which is also what defines
+/// the problem-size region this rule applies to (Winograd is 1.5x to 3.8x
+/// faster above the threshold and *slower* below it, so the flag alone is not
+/// the whole decision).
 ///
-/// Set this to `true` only once `WinogradConv`'s three launch stages have
-/// real kernel bodies verified against the `conv2d_ref` CPU oracle in
-/// `gpu_tests/conv_fprop.rs` (the same way `Im2colGemmConv` and
-/// `ImplicitGemmConv` already are), and update that file's untouched-buffer
-/// canary tests to real numeric-oracle assertions accordingly.
+/// # If you need to turn it back off
+///
+/// Setting this to `false` restores the previous behaviour exactly — every
+/// eligible shape falls through to the `ImplicitGemm` / `Im2colGemm` engines,
+/// which remain fully verified. Nothing else in the crate needs changing; the
+/// dispatch regression test in `gpu_tests::conv_fprop` asserts a correct
+/// numeric result either way.
 #[must_use]
 #[inline]
 pub const fn winograd_forward_implemented() -> bool {
-    false
+    true
 }
 
 /// Selects the best convolution algorithm for the given problem and SM version.
@@ -103,11 +139,12 @@ pub fn select_algorithm(problem: &ConvProblem, sm: SmVersion) -> ConvAlgorithm {
     let r = problem.filter_dims.first().copied().unwrap_or(1);
     let s = problem.filter_dims.get(1).copied().unwrap_or(1);
 
-    // Rule 3: 3x3 Winograd when conditions are met -- gated behind
-    // `winograd_forward_implemented()` until `WinogradConv` has real
-    // kernels (see that function's docs). While the gate is closed this
-    // always falls through to rule 4/5/6 rather than handing the caller a
-    // silently-untouched output buffer.
+    // Rule 3: 3x3 Winograd when the engine supports the shape and the problem
+    // is large enough for the transform overhead to pay for itself. Both
+    // conditions are load-bearing: `is_winograd_eligible` mirrors the engine's
+    // own `supports`, and the FLOP threshold is calibrated from measurements
+    // (see its docs) -- below it Winograd is measurably *slower*, because it
+    // issues four kernels where implicit GEMM issues one.
     if winograd_forward_implemented() && is_winograd_eligible(problem, r, s) {
         let flops = estimate_gemm_flops(problem, r, s);
         if flops > WINOGRAD_FLOP_THRESHOLD {
@@ -129,26 +166,24 @@ pub fn select_algorithm(problem: &ConvProblem, sm: SmVersion) -> ConvAlgorithm {
     ConvAlgorithm::Im2colGemm
 }
 
-/// Returns `true` if Winograd is applicable.
+/// Returns `true` if the Winograd engine can compute `problem`.
 ///
-/// Winograd requires:
-/// - 3x3 filter
-/// - Unit stride and dilation
-/// - FP32 precision (FP16 Winograd has excessive numerical error)
-/// - Non-grouped convolution (or exact depthwise, handled above)
+/// Delegates to [`WinogradConv::supports`](super::fprop::winograd::WinogradConv::supports)
+/// rather than restating the conditions, because the two must agree *exactly*:
+/// a selector that is more permissive than the engine turns a working
+/// convolution into a hard error at dispatch time (the engine refuses the
+/// problem the selector just handed it), and one that is less permissive
+/// silently leaves performance on the table. `r`/`s` are the caller's
+/// already-extracted filter extent and are checked for consistency with the
+/// problem so a stale pair cannot widen the test.
 ///
-/// This is the *shape* eligibility test only -- it is independent of
-/// [`winograd_forward_implemented`], which separately gates whether
-/// `select_algorithm`/`candidate_algorithms` are actually allowed to act on
-/// it. `pub(crate)` so `gpu_tests` can assert a regression shape is
-/// genuinely eligible (not merely below the FLOP threshold).
+/// This is the *shape* eligibility test only — profitability is
+/// [`WINOGRAD_FLOP_THRESHOLD`], and whether the rule is consulted at all is
+/// [`winograd_forward_implemented`]. `pub(crate)` so `gpu_tests` can assert a
+/// regression shape is genuinely eligible (not merely below the FLOP
+/// threshold).
 pub(crate) fn is_winograd_eligible(problem: &ConvProblem, r: u32, s: u32) -> bool {
-    r == 3
-        && s == 3
-        && problem.stride.iter().all(|&v| v == 1)
-        && problem.dilation.iter().all(|&v| v == 1)
-        && problem.input_type == PtxType::F32
-        && problem.groups == 1
+    r == 3 && s == 3 && super::fprop::winograd::WinogradConv::supports(problem)
 }
 
 /// Estimates the number of multiply-accumulate operations for a standard
@@ -195,9 +230,13 @@ pub fn candidate_algorithms(problem: &ConvProblem, sm: SmVersion) -> Vec<ConvAlg
     let r = problem.filter_dims.first().copied().unwrap_or(1);
     let s = problem.filter_dims.get(1).copied().unwrap_or(1);
 
-    // Same gate as Rule 3 in `select_algorithm`: don't offer the autotuner
-    // a "candidate" whose engine silently no-ops (it would look like the
-    // fastest option by benchmarking as literally instantaneous).
+    // Same eligibility test as Rule 3 in `select_algorithm`, but deliberately
+    // *without* its FLOP threshold: the threshold is a heuristic about where
+    // Winograd usually wins, and an autotuner exists precisely to measure that
+    // for the shape in hand rather than trust the heuristic. The capability
+    // gate still applies -- an engine that cannot compute the problem must
+    // never be offered, since the autotuner would time its immediate error
+    // return as an infinitely fast kernel.
     if winograd_forward_implemented() && is_winograd_eligible(problem, r, s) {
         push_if_absent(&mut candidates, ConvAlgorithm::Winograd);
     }
@@ -219,6 +258,7 @@ fn push_if_absent(vec: &mut Vec<ConvAlgorithm>, algo: ConvAlgorithm) {
 mod tests {
     use super::*;
     use crate::types::TensorLayout;
+    use oxicuda_ptx::ir::PtxType;
 
     fn problem_3x3_nchw() -> ConvProblem {
         ConvProblem {
@@ -283,51 +323,104 @@ mod tests {
         assert_eq!(algo, ConvAlgorithm::Direct);
     }
 
+    /// The selector's eligibility test and the engine's own `supports` must be
+    /// the same predicate. If the selector is the wider of the two, Rule 3
+    /// hands `conv_forward` a problem `WinogradConv::new` then refuses — a
+    /// working convolution turned into a hard error.
+    /// A named mutation of the baseline problem, for table-driven tests.
+    type ProblemMutation = (&'static str, fn(&mut ConvProblem));
+
     #[test]
-    fn winograd_forward_not_yet_implemented() {
-        // Sanity-check the capability gate is still closed. If this starts
-        // failing because someone flipped `winograd_forward_implemented`,
-        // every assertion below (and the `conv_forward` regression test in
-        // `gpu_tests::conv_fprop`) must be re-validated against the CPU
-        // oracle for a real Winograd engine before shipping.
-        assert!(!winograd_forward_implemented());
+    fn eligibility_matches_the_engine_exactly() {
+        use crate::conv::fprop::winograd::WinogradConv;
+        let mutations: [ProblemMutation; 10] = [
+            ("baseline", |_| {}),
+            ("5x5 filter", |p| p.filter_dims = vec![5, 5]),
+            ("stride 2", |p| p.stride = vec![2, 2]),
+            ("dilation 2", |p| p.dilation = vec![2, 2]),
+            ("groups 2", |p| p.groups = 2),
+            ("padding 2", |p| p.padding = vec![2, 2]),
+            ("padding 0", |p| p.padding = vec![0, 0]),
+            ("NHWC", |p| p.layout = TensorLayout::Nhwc),
+            ("f16", |p| p.input_type = PtxType::F16),
+            ("3-D", |p| p.in_dims = vec![4, 8, 8]),
+        ];
+        for (label, mutate) in mutations {
+            let mut p = problem_3x3_nchw();
+            mutate(&mut p);
+            let r = p.filter_dims.first().copied().unwrap_or(1);
+            let s = p.filter_dims.get(1).copied().unwrap_or(1);
+            assert_eq!(
+                is_winograd_eligible(&p, r, s),
+                WinogradConv::supports(&p),
+                "{label}: selector and engine disagree about eligibility"
+            );
+        }
     }
 
     #[test]
-    fn select_3x3_large_shape_is_winograd_eligible_but_gate_is_closed() {
-        // `problem_3x3_nchw()` genuinely satisfies `is_winograd_eligible`
-        // and clears `WINOGRAD_FLOP_THRESHOLD` -- i.e. this is exactly the
-        // shape Rule 3 would route to the broken `WinogradConv` engine were
-        // the gate not in place. Proves the fallback below is caused solely
-        // by `winograd_forward_implemented() == false`, not by the shape
-        // failing Winograd's own eligibility criteria.
+    fn select_3x3_large_nchw_is_winograd() {
+        // `problem_3x3_nchw()` satisfies `is_winograd_eligible` and clears
+        // `WINOGRAD_FLOP_THRESHOLD` by a wide margin (batch 32, 256 channels,
+        // 56x56), so Rule 3 must fire. NCHW does not qualify for Rule 5, so
+        // before the engine existed this landed on Im2colGemm.
         let p = problem_3x3_nchw();
         assert!(is_winograd_eligible(&p, 3, 3));
         assert!(estimate_gemm_flops(&p, 3, 3) > WINOGRAD_FLOP_THRESHOLD);
+        assert_eq!(
+            select_algorithm(&p, SmVersion::Sm80),
+            ConvAlgorithm::Winograd
+        );
     }
 
+    /// Below the measured break-even Winograd is *slower*, so an eligible but
+    /// small shape must not be routed there however capable the engine is.
     #[test]
-    fn select_3x3_large_falls_back_while_winograd_unimplemented() {
-        // Same eligible/over-threshold shape as the test above. NCHW layout
-        // doesn't qualify for Rule 5 (ImplicitGemm requires channels-last),
-        // so with Rule 3 gated closed this must land on the Rule 6 default:
-        // Im2colGemm, whose `execute` path is verified correct end-to-end
-        // against the CPU oracle in `gpu_tests::conv_fprop`.
-        let algo = select_algorithm(&problem_3x3_nchw(), SmVersion::Sm80);
-        assert_eq!(algo, ConvAlgorithm::Im2colGemm);
-        assert_ne!(algo, ConvAlgorithm::Winograd);
+    fn select_small_3x3_stays_off_winograd() {
+        let mut p = problem_3x3_nchw();
+        p.batch = 1;
+        p.in_channels = 16;
+        p.out_channels = 16;
+        p.in_dims = vec![16, 16];
+        assert!(
+            is_winograd_eligible(&p, 3, 3),
+            "shape must be eligible, so the FLOP threshold is what excludes it"
+        );
+        assert!(estimate_gemm_flops(&p, 3, 3) < WINOGRAD_FLOP_THRESHOLD);
+        assert_ne!(
+            select_algorithm(&p, SmVersion::Sm80),
+            ConvAlgorithm::Winograd
+        );
     }
 
+    /// A shape the engine cannot compute must never be offered to the
+    /// autotuner: it would time the engine's immediate error return as an
+    /// infinitely fast kernel and always "win".
     #[test]
-    fn candidates_exclude_unimplemented_winograd() {
-        // The autotune candidate list must not offer Winograd either --
-        // an autotuner benchmarking a no-op kernel would see it as
-        // infinitely fast and always "win".
-        let cands = candidate_algorithms(&problem_3x3_nchw(), SmVersion::Sm80);
+    fn candidates_exclude_unsupported_winograd_shapes() {
+        let mut p = problem_3x3_nchw();
+        p.padding = vec![2, 2];
+        let cands = candidate_algorithms(&p, SmVersion::Sm80);
         assert!(
             !cands.contains(&ConvAlgorithm::Winograd),
-            "Winograd must not be offered as an autotune candidate while its \
-             forward kernels are load/launch-only skeletons: {cands:?}"
+            "padding 2 is outside the engine's supported region: {cands:?}"
+        );
+    }
+
+    /// The candidate list deliberately ignores the FLOP threshold — measuring
+    /// is the autotuner's whole job — but still respects the capability gate.
+    #[test]
+    fn candidates_offer_winograd_below_the_flop_threshold() {
+        let mut p = problem_3x3_nchw();
+        p.batch = 1;
+        p.in_channels = 16;
+        p.out_channels = 16;
+        p.in_dims = vec![16, 16];
+        assert!(estimate_gemm_flops(&p, 3, 3) < WINOGRAD_FLOP_THRESHOLD);
+        let cands = candidate_algorithms(&p, SmVersion::Sm80);
+        assert_eq!(
+            cands.contains(&ConvAlgorithm::Winograd),
+            winograd_forward_implemented()
         );
     }
 

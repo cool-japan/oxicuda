@@ -12,7 +12,7 @@
 //! |-----------|----------|-----------|
 //! | [`ImplicitGemm`](fprop::implicit_gemm) | General-purpose | None |
 //! | [`Im2colGemm`](fprop::im2col_gemm) | Medium feature maps | Yes |
-//! | [`Winograd`](fprop::winograd) | 3x3 kernels, stride 1 -- **gated off**: load/launch-only skeleton, no numeric work (see `algo_select::winograd_forward_implemented`) | Yes |
+//! | [`Winograd`](fprop::winograd) | 3x3 NCHW FP32, stride 1, pad <= 1, above the profitability threshold | Yes |
 //! | [`Direct`](fprop::direct) | 1x1 and depthwise | None |
 //! | [`FftConv2d`](fft_conv::FftConv2dPlan) | Large kernels (7x7+) | Yes |
 //!

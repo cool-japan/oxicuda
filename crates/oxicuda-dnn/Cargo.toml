@@ -64,6 +64,10 @@ harness = false
 name = "fused_conv_bn_relu"
 harness = false
 
+[[bench]]
+name = "winograd_vs_implicit_gemm"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

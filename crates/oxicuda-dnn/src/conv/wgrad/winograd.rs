@@ -570,7 +570,9 @@ impl WinogradWgrad {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conv::fprop::winograd::{AT_F2X3, AT_F4X3, BT_F2X3, BT_F4X3, G_F2X3, G_F4X3};
+    use crate::conv::fprop::winograd::matrices::{
+        AT_F2X3, AT_F4X3, BT_F2X3, BT_F4X3, G_F2X3, G_F4X3,
+    };
     use crate::types::TensorLayout;
 
     fn make_3x3_problem() -> ConvProblem {

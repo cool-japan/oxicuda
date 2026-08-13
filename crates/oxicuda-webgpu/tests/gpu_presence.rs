@@ -24,6 +24,19 @@
 //! gpu-tests` is expected to compile but never find an adapter — enabling
 //! the feature is itself the opt-in to "this environment must have a GPU".
 //!
+//! # A GPU is not sufficient on Linux: the loader must be installed too
+//!
+//! wgpu reaches an NVIDIA/AMD/Intel GPU through the **Vulkan loader**
+//! (`libvulkan.so.1`), not through the vendor driver directly. A box can have
+//! a perfectly good GPU, a working CUDA stack, and even the vendor's Vulkan
+//! ICD manifest in `/usr/share/vulkan/icd.d/` and still fail here: with no
+//! loader installed, wgpu enumerates only its OpenGL fallback adapter, whose
+//! `request_device` fails with "Parent device is lost". `WebGpuDevice::new`
+//! appends the adapter's backend to that message precisely so this case is
+//! recognisable — a reported `backend Gl` on a machine with a discrete GPU
+//! means the loader is missing (`apt install libvulkan1`), not that the
+//! hardware is absent.
+//!
 //! This is a *compile-time feature* deliberately distinct from the
 //! `OXICUDA_REQUIRE_GPU=1` *runtime* env-var switch used by the crate's
 //! in-tree `#[cfg(test)]` suites (see `src/backend_tests.rs`). The two are

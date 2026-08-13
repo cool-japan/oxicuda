@@ -419,17 +419,21 @@ pub(super) fn reduce_axis(
 
 /// Returns the backend's cached PTX-launch stream (with its lifetime-token
 /// context), creating both lazily on first use and reusing them on every
-/// subsequent call instead of standing up a throwaway context and stream per
+/// subsequent call instead of standing up a fresh context and stream per
 /// launch.
 ///
 /// The returned guard must be held for the duration of the launch (and the
 /// trailing synchronize): [`oxicuda-launch`](oxicuda_launch) requires a
 /// [`Stream`](oxicuda_driver::Stream), which in turn needs an `Arc<Context>`.
-/// A throwaway regular context is built once, solely to satisfy that
-/// signature; the primary context is re-bound before `Stream::new` so the
-/// stream — and therefore every kernel launched on it — runs in the context
-/// that owns the device memory. The throwaway context owns no resources and
-/// is destroyed together with the backend.
+/// That token is a **non-owning wrapper around the backend's primary context**
+/// (see [`primary_context_token`](super::primary_context_token)), not a
+/// throwaway regular context: `Stream::new` creates the stream *in the context
+/// the token names*, so a throwaway token would leave the stream in a context
+/// that owns none of the device memory and holds none of the JIT-loaded
+/// modules — `cuLaunchKernel` then rejects the mismatched
+/// function/stream pair with `CUDA_ERROR_INVALID_HANDLE`. Binding the token to
+/// the primary context puts the stream, the modules loaded by
+/// [`build_kernel`], and every device pointer in one and the same context.
 fn ptx_stream_state(
     backend: &CudaBackend,
     device: Device,
@@ -439,13 +443,10 @@ fn ptx_stream_state(
         .lock()
         .map_err(|_| BackendError::DeviceError("PTX stream lock poisoned".into()))?;
     if guard.is_none() {
-        // `Context::new` makes the throwaway context current; re-bind primary
-        // so the stream is created in the context that owns the device
-        // buffers.
-        let token = Arc::new(oxicuda_driver::Context::new(&device).map_err(|e| {
-            BackendError::DeviceError(format!("stream context token creation failed: {e}"))
-        })?);
-        backend.activate_gpu()?;
+        // Borrows the retained primary context (and re-affirms it as current on
+        // this thread), so the stream is created in the context that owns the
+        // device buffers and the JIT-loaded modules.
+        let token = super::primary_context_token(backend, device)?;
         let stream = oxicuda_driver::Stream::new(&token)
             .map_err(|e| BackendError::DeviceError(format!("stream creation failed: {e}")))?;
         *guard = Some((token, stream));

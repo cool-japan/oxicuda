@@ -86,7 +86,8 @@ impl WebGpuDevice {
                 WebGpuError::NoAdapter
             })?;
 
-        let adapter_name = adapter.get_info().name.clone();
+        let adapter_info = adapter.get_info();
+        let adapter_name = adapter_info.name.clone();
 
         // Enable FP16 shader support when the adapter advertises it, so the
         // `gemm_f16` path (whose WGSL declares `enable f16;`) validates instead
@@ -121,7 +122,20 @@ impl WebGpuDevice {
                 ..Default::default()
             })
             .await
-            .map_err(|e| WebGpuError::DeviceRequest(e.to_string()))?;
+            // Name the adapter the device was requested *from*. Which adapter
+            // `request_adapter` hands back is the decisive fact when this
+            // fails, and it is invisible in wgpu's own message: a Linux box
+            // with a GPU but no Vulkan loader (`libvulkan.so.1`) installed
+            // enumerates only wgpu's OpenGL fallback, whose `request_device`
+            // reports the thoroughly unhelpful "Parent device is lost".
+            // Reporting `backend=Gl` alongside it turns that into an
+            // actionable "the Vulkan adapter never appeared".
+            .map_err(|e| {
+                WebGpuError::DeviceRequest(format!(
+                    "{e} (adapter: {adapter_name}, backend {:?}, device type {:?})",
+                    adapter_info.backend, adapter_info.device_type
+                ))
+            })?;
 
         // Install a non-fatal uncaptured-error handler. wgpu's default
         // handler panics/aborts the process on any validation, out-of-memory,

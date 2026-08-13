@@ -10,21 +10,17 @@
 //!   padding, stride, dilation, groups and the bias epilogue are all exercised.
 //!   The full `Im2colGemmConv::execute` (im2col PTX + BLAS GEMM) is also checked
 //!   end-to-end against a direct convolution.
-//! * **Load / launch-only (fragments)** — the Winograd input/output transform
-//!   kernels are structural skeletons (the body emits only step-marker
-//!   comments and `ret`, writing nothing). For these we assert they assemble
-//!   (`ptxas`), JIT-load, launch and synchronise fault-free, and —
-//!   documenting the fragment status honestly rather than green-washing a
-//!   wrong numeric result — that the output buffer is left untouched (the
-//!   kernels perform no stores). These tests are canaries: they will
-//!   (correctly) fail the moment the kernels are given a real body.
-//! * **Dispatch regression (capability gate)** — `conv::algo_select` must never
-//!   route a convolution into the broken `WinogradConv` engine above via the
-//!   public `conv::api::conv_forward` entry point. `conv_forward_winograd_eligible_shape_matches_cpu_oracle`
-//!   drives a shape that is genuinely Winograd-eligible and over the
-//!   profitability threshold end-to-end through `conv_forward` (not through
-//!   any single engine directly) and checks the result against `conv2d_ref`,
-//!   proving the dispatcher fell back to a numerically-correct engine instead.
+//! * **Winograd** — moved to the sibling module `conv_winograd` (same
+//!   fixture and CPU oracle, different tolerance methodology: Winograd is not
+//!   a rearrangement of the direct sum, so it is checked by relative L2 error
+//!   rather than element-wise).
+//! * **Dispatch regression (capability gate)** — whichever way
+//!   `conv::algo_select::winograd_forward_implemented` is set,
+//!   `conv_forward_winograd_eligible_shape_matches_cpu_oracle` drives a shape
+//!   that is genuinely Winograd-eligible and over the profitability threshold
+//!   end-to-end through `conv_forward` (not through any single engine
+//!   directly) and checks the result against `conv2d_ref` — so the dispatcher
+//!   is proved to land on a numerically-correct engine either way.
 //! * **Fused conv+BN+activation** — covered by the sibling module
 //!   `conv_fused` (split out of this file to stay under the workspace's
 //!   2000-line budget): the `FusedConvBnAct` load/launch-only fragment, and
@@ -41,16 +37,17 @@ use oxicuda_launch::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::ir::PtxType;
 
-use crate::conv::algo_select::{estimate_gemm_flops, is_winograd_eligible};
+use crate::conv::algo_select::{
+    estimate_gemm_flops, is_winograd_eligible, winograd_forward_implemented,
+};
 use crate::conv::api::conv_forward;
 use crate::conv::descriptor::ConvProblem;
 use crate::conv::fprop::direct::{Conv1x1, DepthwiseConv};
 use crate::conv::fprop::im2col_gemm::Im2colGemmConv;
 use crate::conv::fprop::implicit_gemm::ImplicitGemmConv;
-use crate::conv::fprop::winograd::{WinogradConv, WinogradTileSize};
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
-use crate::types::{ConvolutionDescriptor, TensorDesc, TensorDescMut, TensorLayout};
+use crate::types::{ConvAlgorithm, ConvolutionDescriptor, TensorDesc, TensorDescMut, TensorLayout};
 
 // ---------------------------------------------------------------------------
 // Shared geometry + CPU oracle
@@ -1052,190 +1049,29 @@ fn im2col_gemm_execute_matches_direct_conv_f32() {
 }
 
 // ---------------------------------------------------------------------------
-// Winograd transforms  (winograd.rs — load/launch-only fragments)
-// ---------------------------------------------------------------------------
-
-fn winograd_problem(layout: TensorLayout) -> ConvProblem {
-    ConvCase {
-        n: 1,
-        c: 2,
-        h: 8,
-        w: 8,
-        k: 3,
-        r: 3,
-        s: 3,
-        pad_h: 1,
-        pad_w: 1,
-        str_h: 1,
-        str_w: 1,
-        dil_h: 1,
-        dil_w: 1,
-        groups: 1,
-        layout,
-    }
-    .problem(PtxType::F32)
-}
-
-fn run_winograd_input(fx: &GpuFixture, tile: WinogradTileSize) {
-    let problem = winograd_problem(TensorLayout::Nchw);
-    let conv = WinogradConv::with_tile_size(problem, tile, fx.sm).expect("winograd engine");
-    let ptx = conv
-        .generate_input_transform_ptx()
-        .expect("winograd input ptx");
-    let entry = format!("winograd_input_transform_f{}x3", tile.output_tile());
-    ptxas_assembles(&ptx, &entry).expect("ptxas winograd input transform");
-    let kernel = load_kernel(&ptx, &entry);
-
-    let (in_h, in_w) = (8u32, 8u32);
-    let (out_h, out_w) = (8u32, 8u32);
-    let (batch, channels) = (1u32, 2u32);
-    let ot = tile.output_tile();
-    let alpha2 = tile.transform_elements();
-    let num_tiles = out_h.div_ceil(ot) * out_w.div_ceil(ot) * batch * channels;
-
-    let in_buf = DeviceBuffer::from_host(&vec![0.5f32; (batch * channels * in_h * in_w) as usize])
-        .expect("alloc winograd input");
-    let sentinel = 7.0f32;
-    let tr_len = (num_tiles * alpha2).max(256) as usize;
-    let tr_buf = DeviceBuffer::from_host(&vec![sentinel; tr_len]).expect("alloc transformed");
-
-    let grid = ceil_div(num_tiles, 256);
-    let params = LaunchParams::new(grid, 256u32);
-    let args = (
-        in_buf.as_device_ptr(),
-        tr_buf.as_device_ptr(),
-        batch,
-        channels,
-        in_h,
-        in_w,
-        out_h,
-        out_w,
-        1u32,
-        1u32,
-        num_tiles,
-    );
-    kernel
-        .launch(&params, fx.stream(), &args)
-        .expect("launch winograd input transform");
-    fx.stream().synchronize().expect("synchronize");
-
-    // The input-transform kernel is a structural skeleton: it bounds-checks and
-    // emits step-marker comments only, performing zero stores. Confirm it ran
-    // fault-free and left the workspace untouched (no green-washing).
-    let mut got = vec![0.0f32; tr_len];
-    tr_buf.copy_to_host(&mut got).expect("copy transformed");
-    assert!(
-        got.iter().all(|&v| v == sentinel),
-        "winograd input transform f{}x3 is a no-op skeleton; workspace must be untouched",
-        tile.output_tile()
-    );
-}
-
-fn run_winograd_output(fx: &GpuFixture, tile: WinogradTileSize) {
-    let problem = winograd_problem(TensorLayout::Nchw);
-    let conv = WinogradConv::with_tile_size(problem, tile, fx.sm).expect("winograd engine");
-    let ptx = conv
-        .generate_output_transform_ptx()
-        .expect("winograd output ptx");
-    let entry = format!("winograd_output_transform_f{}x3", tile.output_tile());
-    ptxas_assembles(&ptx, &entry).expect("ptxas winograd output transform");
-    let kernel = load_kernel(&ptx, &entry);
-
-    let (out_h, out_w) = (8u32, 8u32);
-    let (batch, out_channels) = (1u32, 3u32);
-    let ot = tile.output_tile();
-    let alpha2 = tile.transform_elements();
-    let num_tiles = out_h.div_ceil(ot) * out_w.div_ceil(ot) * batch * out_channels;
-
-    let tr_len = (num_tiles * alpha2).max(256) as usize;
-    let tr_buf = DeviceBuffer::from_host(&vec![0.25f32; tr_len]).expect("alloc transformed");
-    let sentinel = -3.0f32;
-    let out_len = (batch * out_channels * out_h * out_w).max(256) as usize;
-    let out_buf = DeviceBuffer::from_host(&vec![sentinel; out_len]).expect("alloc output");
-
-    let grid = ceil_div(num_tiles, 256);
-    let params = LaunchParams::new(grid, 256u32);
-    let args = (
-        tr_buf.as_device_ptr(),
-        out_buf.as_device_ptr(),
-        0u64,
-        batch,
-        out_channels,
-        out_h,
-        out_w,
-        num_tiles,
-    );
-    kernel
-        .launch(&params, fx.stream(), &args)
-        .expect("launch winograd output transform");
-    fx.stream().synchronize().expect("synchronize");
-
-    let mut got = vec![0.0f32; out_len];
-    out_buf.copy_to_host(&mut got).expect("copy output");
-    assert!(
-        got.iter().all(|&v| v == sentinel),
-        "winograd output transform f{}x3 is a no-op skeleton; output must be untouched",
-        tile.output_tile()
-    );
-}
-
-#[test]
-fn winograd_input_transform_f2x3_launches() {
-    let Some(fx) = gpu_fixture() else {
-        return;
-    };
-    run_winograd_input(&fx, WinogradTileSize::F2x3);
-}
-
-#[test]
-fn winograd_input_transform_f4x3_launches() {
-    let Some(fx) = gpu_fixture() else {
-        return;
-    };
-    run_winograd_input(&fx, WinogradTileSize::F4x3);
-}
-
-#[test]
-fn winograd_output_transform_f2x3_launches() {
-    let Some(fx) = gpu_fixture() else {
-        return;
-    };
-    run_winograd_output(&fx, WinogradTileSize::F2x3);
-}
-
-#[test]
-fn winograd_output_transform_f4x3_launches() {
-    let Some(fx) = gpu_fixture() else {
-        return;
-    };
-    run_winograd_output(&fx, WinogradTileSize::F4x3);
-}
-
-// ---------------------------------------------------------------------------
 // conv_forward — Winograd capability-gate regression (algo_select.rs)
 // ---------------------------------------------------------------------------
 //
-// The Winograd fragment tests above prove `WinogradConv`'s own kernels are
-// no-ops. The test below proves the *dispatcher* no longer routes anything
-// there: `conv::algo_select::select_algorithm` gates Rule 3 behind
-// `winograd_forward_implemented()` (currently `false`), so the public
-// `conv::api::conv_forward` entry point must fall back to a real engine for
-// a shape that is otherwise squarely Winograd-eligible.
+// `conv::algo_select::select_algorithm` gates its Winograd rule behind
+// `winograd_forward_implemented()`. The test below pins down the property
+// that must hold *whichever way that gate is set*: the public
+// `conv::api::conv_forward` entry point returns a numerically-correct result
+// for a shape that is squarely Winograd-eligible and over the profitability
+// threshold. It therefore catches both the historical failure (routing into a
+// no-op engine) and any future regression in whichever engine the gate
+// selects.
 
 /// A conv shape that is Winograd-*eligible* (3x3 filter, unit stride and
 /// dilation, F32, groups=1) and clears the Winograd profitability FLOP
 /// threshold: 128 in/out channels, 80x80 output, batch 1 — mirroring a
 /// realistic SCRFD-scale mid-network layer (~1.89e9 estimated GEMM FLOPs).
-/// This is exactly the class of shape `select_algorithm`'s Rule 3 would
-/// have routed into the broken, no-op `WinogradConv` engine before
-/// `winograd_forward_implemented()` gated it closed.
+/// This is exactly the class of shape `select_algorithm`'s Winograd rule
+/// governs.
 ///
-/// Regression test for the public, high-level `conv_forward` API: before
-/// the gate existed, this call would have returned `Ok(())` while leaving
-/// `output` at whatever value it was initialised to, because
-/// `WinogradConv::execute` launches kernels that never load, transform, or
-/// store anything (see the "Honesty contract" above and in
-/// `gpu_tests/mod.rs`). The test drives the *actual* dispatcher
+/// Regression test for the public, high-level `conv_forward` API: when
+/// `WinogradConv` was a no-op skeleton this call returned `Ok(())` while
+/// leaving `output` at whatever value it was initialised to. The test drives
+/// the *actual* dispatcher
 /// (`ConvProblem::from_descriptors` + `select_algorithm`, exactly as
 /// `conv_forward` does internally) rather than constructing a specific
 /// engine directly, so it fails the same way a real caller of
@@ -1277,6 +1113,19 @@ fn conv_forward_winograd_eligible_shape_matches_cpu_oracle() {
         estimate_gemm_flops(&problem, case.r, case.s) > 1_000_000_000,
         "regression shape must clear the Winograd FLOP threshold"
     );
+    // Pin down which branch this test is actually exercising, so the numeric
+    // check below is known to cover the engine the gate currently selects
+    // rather than silently testing the fallback forever.
+    let selected = problem.select_algorithm(fx.sm);
+    if winograd_forward_implemented() {
+        assert_eq!(
+            selected,
+            ConvAlgorithm::Winograd,
+            "with the gate open this shape must route to Winograd"
+        );
+    } else {
+        assert_ne!(selected, ConvAlgorithm::Winograd);
+    }
 
     let (out_h, out_w) = case.out_hw();
     let in_n = (case.n * case.c * case.h * case.w) as usize;
@@ -1344,29 +1193,39 @@ fn conv_forward_winograd_eligible_shape_matches_cpu_oracle() {
     let mut gpu = vec![0.0f32; out_n];
     out_buf.copy_to_host(&mut gpu).expect("copy output");
 
-    // Before the capability gate, `WinogradConv::execute` would have
-    // returned `Ok(())` while leaving every element at the sentinel. Catch
-    // that failure mode explicitly and separately from the numeric
-    // comparison below (an all-sentinel buffer could in principle, if
+    // A no-op engine would return `Ok(())` and leave every element at the
+    // sentinel. Catch that failure mode explicitly and separately from the
+    // numeric comparison below (an all-sentinel buffer could in principle, if
     // astronomically unlikely with random f32 inputs, still slip past a
-    // per-element tolerance check).
+    // tolerance check).
     assert!(
         gpu.iter().any(|&v| v != sentinel),
-        "output buffer was never written -- looks like the broken no-op \
-         Winograd path was selected"
+        "output buffer was never written -- a no-op engine was selected"
     );
 
     let in_o: Vec<f64> = in32.iter().map(|&x| f64::from(x)).collect();
     let fil_o: Vec<f64> = fil32.iter().map(|&x| f64::from(x)).collect();
     let exp64 = conv2d_ref(case, &in_o, &fil_o, None);
-    let exp32: Vec<f32> = exp64.iter().map(|&x| x as f32).collect();
-    assert_close_f32(
-        &gpu,
-        &exp32,
-        2e-4,
-        2e-4,
-        "conv_forward_winograd_eligible_shape",
-    );
+
+    if winograd_forward_implemented() {
+        // Winograd reassociates the sum, so it is held to the whole-tensor
+        // relative-L2 budget documented on the engine, not to an element-wise
+        // bound the direct engines meet by construction.
+        let err = rel_l2_error(&gpu, &exp64);
+        assert!(
+            err < 1e-4,
+            "conv_forward (Winograd) relative L2 = {err:e}, budget 1e-4"
+        );
+    } else {
+        let exp32: Vec<f32> = exp64.iter().map(|&x| x as f32).collect();
+        assert_close_f32(
+            &gpu,
+            &exp32,
+            2e-4,
+            2e-4,
+            "conv_forward_winograd_eligible_shape",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

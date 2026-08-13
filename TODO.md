@@ -538,16 +538,21 @@ See [oxicuda-estimation.md](oxicuda-estimation.md) for detailed project estimati
 
 ## Vol.4: Deep Learning Primitives -- cuDNN equivalent [COMPLETE]
 
-> **Known exception (2026-08-12):** two items below are checked `[ ]`/`[x]`
+> **Known exception (2026-08-13):** two items below are checked `[ ]`/`[x]`
 > per the notes inline with them, not blanket "done" -- see those lines for
-> specifics. In short: Winograd forward (`conv/fprop/winograd.rs`) and
-> Winograd backward (`conv/dgrad/winograd.rs`, `conv/wgrad/winograd.rs`) are
-> load/launch-only skeletons -- their PTX bodies emit only step-marker
-> comments and `ret`, so calling them leaves the output buffer completely
-> untouched rather than numerically wrong. `conv/algo_select.rs` gates the
-> forward dispatcher (`winograd_forward_implemented() == false`) so
-> `conv_forward` never routes real work into the broken engine, falling
-> back to `Im2colGemm`/`ImplicitGemm` instead. `conv/fused.rs`'s
+> specifics. Winograd **forward** is now real: `conv/fprop/winograd/` implements
+> F(2x2,3x3) for NCHW FP32 (input transform, filter transform, a
+> shared-memory-tiled batched GEMM over the 16 transform-domain positions, and
+> an output transform with bias), validated on an RTX A4000 against both an
+> `f64` CPU oracle (relative L2 1.0e-7..1.7e-7) and `ImplicitGemmConv`
+> (7.9e-8..1.4e-6), and 1.5x..3.9x faster than `ImplicitGemmConv` above the
+> profitability threshold, so `winograd_forward_implemented()` is now `true`.
+> Winograd **backward** (`conv/dgrad/winograd.rs`, `conv/wgrad/winograd.rs`) is
+> still a load/launch-only skeleton -- its PTX bodies emit only step-marker
+> comments and `ret`, so calling it leaves the output buffer completely
+> untouched rather than numerically wrong; `conv_backward_data` /
+> `conv_backward_filter` never dispatch to it (they use the separate
+> implicit-GEMM engines). `conv/fused.rs`'s
 > single-kernel `FusedConvBnAct` is the same kind of skeleton and is
 > likewise never dispatched; the public `conv_bn_relu` decomposes into a
 > real `conv_forward` call plus a real, numerically-verified BN-affine +
@@ -566,7 +571,7 @@ See [oxicuda-estimation.md](oxicuda-estimation.md) for detailed project estimati
   - [x] High-level API (conv/api.rs) -- unified convolution interface
   - [x] Forward: implicit GEMM (conv/fprop/implicit_gemm.rs)
   - [x] Forward: im2col + GEMM (conv/fprop/im2col_gemm.rs)
-  - [ ] Forward: Winograd 3x3 (conv/fprop/winograd.rs) -- load/launch-only skeleton, no numeric work; `algo_select.rs` gates it off so `conv_forward` safely falls back to Im2colGemm/ImplicitGemm instead of dispatching to it
+  - [x] Forward: Winograd 3x3 (conv/fprop/winograd/) -- real F(2x2,3x3) for NCHW FP32, stride 1, dilation 1, groups 1, padding 0/1; four kernels (input/filter transform, tiled batched GEMM over the 16 transform-domain positions, output transform + bias); hardware-validated vs an `f64` CPU oracle and vs `ImplicitGemmConv` (`gpu_tests/conv_winograd.rs`, relative L2 <= 1.4e-6 against a 1e-4 budget); `algo_select.rs` routes eligible shapes above a measured 1e7-FLOP profitability threshold to it (1.5x..3.9x faster than `ImplicitGemmConv` there, measurably slower below, see `benches/winograd_vs_implicit_gemm.rs`). F(4x4,3x3) forward is still unimplemented and rejected explicitly by `WinogradTileSize::forward_supported`
   - [x] Forward: direct 1x1 / depthwise (conv/fprop/direct.rs)
   - [x] Backward data: implicit GEMM (conv/dgrad/implicit_gemm.rs)
   - [x] Backward filter: implicit GEMM (conv/wgrad/implicit_gemm.rs)

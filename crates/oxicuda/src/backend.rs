@@ -62,8 +62,10 @@ pub use oxicuda_levelzero::LevelZeroBackend;
 #[cfg(feature = "ptx")]
 mod ptx_ops;
 
-/// The backend's cached PTX-launch stream plus its lifetime-token context (or
-/// `None` before the first PTX-backed op has run). Aliased to keep the
+/// The backend's cached PTX-launch stream plus the borrowed primary-context
+/// lifetime token it was created in (see
+/// [`primary_context_token`]), or `None` before the first PTX-backed op has
+/// run. Aliased to keep the
 /// `CudaBackend` field and [`ptx_ops`]'s accessor readable and to avoid a
 /// `clippy::type_complexity` warning on the nested `Arc`/tuple/`Option`.
 #[cfg(feature = "ptx")]
@@ -93,10 +95,13 @@ type PtxStreamState = Option<(
 /// …) and all compute kernels run inside that single context, so device
 /// pointers are valid across every operation. The BLAS/DNN handles needed by
 /// [`gemm`](ComputeBackend::gemm), [`conv2d_forward`](ComputeBackend::conv2d_forward),
-/// and [`attention`](ComputeBackend::attention) require an `Arc<Context>`;
-/// the backend builds a short-lived regular context as a lifetime token for
-/// those handles while keeping the primary context current, so their streams
-/// and kernels still execute in the primary context.
+/// and [`attention`](ComputeBackend::attention) require an `Arc<Context>`, as
+/// does the `ptx_ops` launch stream behind [`unary`](ComputeBackend::unary),
+/// [`binary`](ComputeBackend::binary), and [`reduce`](ComputeBackend::reduce);
+/// the backend hands each of them a **non-owning wrapper around that same
+/// primary context** (internally, `primary_context_token`) as their lifetime
+/// token, so every handle, stream, and JIT-loaded module lives in the one
+/// context that owns the device memory.
 ///
 /// # Example
 ///
@@ -150,10 +155,10 @@ pub struct CudaBackend {
             std::sync::Arc<oxicuda_launch::Kernel>,
         >,
     >,
-    /// Cached stream (plus its context lifetime-token) used to launch the
-    /// [`ptx_ops`] elementwise/reduction kernels, created lazily on first use
-    /// and reused thereafter instead of a throwaway context and stream per
-    /// call.
+    /// Cached stream (plus the borrowed primary-context lifetime token it was
+    /// created in) used to launch the [`ptx_ops`] elementwise/reduction
+    /// kernels, created lazily on first use and reused thereafter instead of a
+    /// fresh stream per call.
     #[cfg(feature = "ptx")]
     ptx_stream: Mutex<PtxStreamState>,
 }
@@ -174,9 +179,9 @@ impl std::fmt::Debug for CudaBackend {
 /// Explicit, order-sensitive teardown of every cached GPU resource.
 ///
 /// Every cached BLAS/DNN handle, JIT-compiled kernel, and PTX launch stream
-/// actually executes inside the backend's **primary** context (see the
-/// `# Context model` section on [`CudaBackend`]) even though each is bound to
-/// its own throwaway regular-context lifetime token. If the primary context
+/// lives inside the backend's **primary** context (see the `# Context model`
+/// section on [`CudaBackend`]), held only through a non-owning borrowed
+/// lifetime token that never destroys it. If the primary context
 /// were released *before* those cached resources are torn down, the driver
 /// calls their destructors make (`cuModuleUnload`, `cuStreamDestroy`, …)
 /// would run against an already-destroyed context: at best this surfaces as
@@ -627,25 +632,30 @@ impl ComputeBackend for CudaBackend {
 
 // ─── BLAS GEMM wiring (feature = "blas") ────────────────────
 
-/// Builds the `Arc<Context>` lifetime token that a BLAS/DNN handle binds to,
-/// wrapping the backend's retained **primary context** without owning it.
+/// Builds the `Arc<Context>` lifetime token that a BLAS/DNN handle — or the
+/// [`ptx_ops`] launch stream — binds to, wrapping the backend's retained
+/// **primary context** without owning it.
 ///
 /// `oxicuda-blas` / `oxicuda-dnn` handles take an `Arc<Context>` and create
-/// their stream *in that context* (see `Stream::new`), but the backend's
-/// persistent memory context is a [`PrimaryContext`]. Rather than stand up a
-/// throwaway regular context (which would leave the handle's stream bound to a
-/// context that owns none of the device memory), this wraps the primary
-/// context's raw handle in a non-owning [`Context`](oxicuda_driver::Context)
-/// via [`Context::from_raw_borrowed`](oxicuda_driver::Context::from_raw_borrowed):
-/// the handle's stream and kernels then run in the very context where all
-/// device memory lives, and the wrapper never destroys the primary context on
-/// drop (that is [`PrimaryContext`]'s responsibility, ordered last in
+/// their stream *in that context* (see `Stream::new`), as does
+/// `Stream::new` itself for the PTX launch stream; the backend's persistent
+/// memory context, however, is a [`PrimaryContext`]. Rather than stand up a
+/// throwaway regular context (which would leave the stream bound to a context
+/// that owns none of the device memory and none of the JIT-loaded modules —
+/// `cuLaunchKernel` rejects such a mismatch with
+/// `CUDA_ERROR_INVALID_HANDLE`), this wraps the primary context's raw handle
+/// in a non-owning [`Context`](oxicuda_driver::Context) via
+/// [`Context::from_raw_borrowed`](oxicuda_driver::Context::from_raw_borrowed):
+/// the stream and its kernels then run in the very context where all device
+/// memory lives, and the wrapper never destroys the primary context on drop
+/// (that is [`PrimaryContext`]'s responsibility, ordered last in
 /// [`CudaBackend`]'s `Drop`).
 ///
-/// Called exactly once per backend, the first time [`with_blas_handle`] or
-/// [`with_dnn_handle`] lazily initializes its cached state.
-#[cfg(any(feature = "blas", feature = "dnn"))]
-fn handle_context_token(
+/// Called at most once per cached resource per backend, the first time
+/// [`with_blas_handle`], [`with_dnn_handle`], or `ptx_ops`'s
+/// `ptx_stream_state` lazily initializes its state.
+#[cfg(any(feature = "blas", feature = "dnn", feature = "ptx"))]
+fn primary_context_token(
     backend: &CudaBackend,
     device: Device,
 ) -> BackendResult<std::sync::Arc<oxicuda_driver::Context>> {
@@ -675,7 +685,7 @@ fn handle_context_token(
 }
 
 /// Runs `f` with the backend's cached [`BlasHandle`](oxicuda_blas::BlasHandle),
-/// creating it (and its [`handle_context_token`] lifetime token) the first
+/// creating it (and its [`primary_context_token`] lifetime token) the first
 /// time this is called and reusing it on every subsequent call.
 ///
 /// The mutex guard is held for the duration of `f`, which serializes GEMM
@@ -694,7 +704,7 @@ fn with_blas_handle<R>(
         .lock()
         .map_err(|_| BackendError::DeviceError("BLAS handle lock poisoned".into()))?;
     if guard.is_none() {
-        let ctx = handle_context_token(backend, device)?;
+        let ctx = primary_context_token(backend, device)?;
         let handle = oxicuda_blas::BlasHandle::new(&ctx)
             .map_err(|e| BackendError::DeviceError(format!("BLAS handle creation failed: {e}")))?;
         *guard = Some((ctx, handle));
@@ -720,7 +730,7 @@ fn with_dnn_handle<R>(
         .lock()
         .map_err(|_| BackendError::DeviceError("DNN handle lock poisoned".into()))?;
     if guard.is_none() {
-        let ctx = handle_context_token(backend, device)?;
+        let ctx = primary_context_token(backend, device)?;
         let handle = oxicuda_dnn::handle::DnnHandle::new(&ctx)
             .map_err(|e| BackendError::DeviceError(format!("DNN handle creation failed: {e}")))?;
         *guard = Some((ctx, handle));
@@ -1319,9 +1329,18 @@ mod tests {
     // ── GPU compute wiring tests (require a CUDA device) ─────
     //
     // These exercise the real BLAS / DNN / PTX pipelines. When no GPU is
-    // present `init` still succeeds but the compute calls return a
-    // DeviceError; the tests then accept that error so they remain valid
-    // on GPU-less CI while genuinely verifying the wiring on a GPU box.
+    // present `init` still succeeds but no context is retained, so each test
+    // returns early on `!has_gpu_context()` and stays valid on GPU-less CI.
+    //
+    // Past that guard there *is* a live context, and a `DeviceError` is then a
+    // genuine defect, never an environment artefact — so none of these tests
+    // tolerates one. They used to, and that is exactly how the PTX launch
+    // stream's context mismatch (`CUDA_ERROR_INVALID_HANDLE`, see
+    // `primary_context_token`) stayed green here for a whole release: the
+    // wiring tests swallowed the very error the bug produced, and only
+    // `compute::tests::default_backend_runs_a_real_compute_round_trip` — which
+    // unwraps — caught it. `Unsupported` remains acceptable where the op
+    // legitimately may not be implemented for a given shape/dtype.
 
     /// Returns `true` when a live CUDA context was retained.
     #[cfg(feature = "blas")]
@@ -1480,8 +1499,10 @@ mod tests {
                     backend.copy_dtoh(&mut out, c_ptr).ok();
                     Some(out)
                 }
-                Err(BackendError::DeviceError(_)) | Err(BackendError::InvalidArgument(_)) => None,
-                Err(e) => panic!("unexpected GEMM error on repeated call: {e:?}"),
+                Err(e) => panic!(
+                    "GEMM on a live GPU context must succeed (the identical call in \
+                     `gemm_wiring_identity_multiply` does), got: {e:?}"
+                ),
             };
             backend.free(a_ptr).ok();
             backend.free(b_ptr).ok();
@@ -1553,12 +1574,13 @@ mod tests {
         backend.free(filt_ptr).ok();
         backend.free(out_ptr).ok();
 
-        // The wiring must either succeed or surface a structured DNN error;
-        // it must never silently no-op.
+        // With a live context the wiring must either succeed or report the op
+        // as unimplemented for this configuration; a DeviceError here is a
+        // real failure, and it must never silently no-op.
         match result {
             Ok(()) => {}
-            Err(BackendError::DeviceError(_)) | Err(BackendError::Unsupported(_)) => {}
-            Err(e) => panic!("unexpected conv2d error: {e:?}"),
+            Err(BackendError::Unsupported(_)) => {}
+            Err(e) => panic!("conv2d on a live GPU context failed: {e:?}"),
         }
     }
 
@@ -1619,8 +1641,8 @@ mod tests {
                     backend.copy_dtoh(&mut out, out_ptr).ok();
                     Some(out)
                 }
-                Err(BackendError::DeviceError(_)) | Err(BackendError::Unsupported(_)) => None,
-                Err(e) => panic!("unexpected conv2d error on repeated call: {e:?}"),
+                Err(BackendError::Unsupported(_)) => None,
+                Err(e) => panic!("conv2d on a live GPU context failed on repeated call: {e:?}"),
             };
             backend.free(in_ptr).ok();
             backend.free(filt_ptr).ok();
@@ -1682,8 +1704,8 @@ mod tests {
 
         match result {
             Ok(()) => {}
-            Err(BackendError::DeviceError(_)) | Err(BackendError::Unsupported(_)) => {}
-            Err(e) => panic!("unexpected attention error: {e:?}"),
+            Err(BackendError::Unsupported(_)) => {}
+            Err(e) => panic!("attention on a live GPU context failed: {e:?}"),
         }
     }
 
@@ -1732,8 +1754,7 @@ mod tests {
                     );
                 }
             }
-            Err(BackendError::DeviceError(_)) => {}
-            Err(e) => panic!("unexpected unary error: {e:?}"),
+            Err(e) => panic!("unary on a live GPU context failed: {e:?}"),
         }
     }
 
@@ -1781,8 +1802,7 @@ mod tests {
                     assert!((got - want).abs() < 1e-4, "add[{i}] = {got}, want {want}");
                 }
             }
-            Err(BackendError::DeviceError(_)) => {}
-            Err(e) => panic!("unexpected binary error: {e:?}"),
+            Err(e) => panic!("binary on a live GPU context failed: {e:?}"),
         }
     }
 
@@ -1844,8 +1864,7 @@ mod tests {
                         );
                     }
                 }
-                Err(BackendError::DeviceError(_)) => {}
-                Err(e) => panic!("unexpected binary error on repeated call: {e:?}"),
+                Err(e) => panic!("binary on a live GPU context failed on repeated call: {e:?}"),
             }
         }
     }
@@ -1894,8 +1913,7 @@ mod tests {
                 assert!((got[0] - 10.0).abs() < 1e-4, "row0 sum = {}", got[0]);
                 assert!((got[1] - 26.0).abs() < 1e-4, "row1 sum = {}", got[1]);
             }
-            Err(BackendError::DeviceError(_)) => {}
-            Err(e) => panic!("unexpected reduce error: {e:?}"),
+            Err(e) => panic!("reduce on a live GPU context failed: {e:?}"),
         }
     }
 

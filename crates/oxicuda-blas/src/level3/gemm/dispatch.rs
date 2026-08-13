@@ -5,7 +5,7 @@
 //! [`GemmTemplate`], and caches compiled modules for reuse.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use oxicuda_driver::Module;
 use oxicuda_launch::{Dim3, Kernel, LaunchParams};
@@ -160,13 +160,11 @@ struct CompiledSplitK {
 }
 
 /// Owns the scratch workspace for a split-K launch, sized `split_factor *
-/// m * n` accumulator-precision elements. Freed on drop; `oxicuda-memory`'s
-/// `DeviceBuffer` allocates through the classic (non-stream-ordered)
-/// `cuMemAlloc`/`cuMemFree`, and the CUDA driver defines `cuMemFree` to block
-/// until every operation already submitted to every stream has completed —
-/// so simply letting this drop at the end of [`GemmDispatcher::dispatch_skinny_split_k`]
-/// is sufficient to guarantee both kernel launches have finished before the
-/// underlying device memory is reclaimed, with no separate synchronisation.
+/// m * n` accumulator-precision elements.
+///
+/// Allocated once per [`SplitKWorkspaceKey`] and then **kept for the
+/// dispatcher's lifetime** — see [`GemmDispatcher::split_k_workspace`] for why
+/// that is both a performance and a correctness-of-capture property.
 enum SplitKWorkspace {
     F32(DeviceBuffer<f32>),
     F64(DeviceBuffer<f64>),
@@ -194,6 +192,37 @@ impl SplitKWorkspace {
             Self::F64(buf) => buf.as_device_ptr(),
         }
     }
+
+    /// Bytes of device memory this workspace holds.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::F32(buf) => buf.len() * std::mem::size_of::<f32>(),
+            Self::F64(buf) => buf.len() * std::mem::size_of::<f64>(),
+        }
+    }
+}
+
+/// Cache key for a reusable split-K workspace.
+///
+/// The stream is part of the identity, and that is the whole safety argument:
+/// the partial and reduction kernels of one split-K launch communicate through
+/// this buffer, so two launches sharing it must be ordered against each other.
+/// Two launches on the *same* stream are ordered by stream semantics (and
+/// [`GemmDispatcher::split_k_workspace`]'s lock keeps each launch's two
+/// submissions adjacent in that order, so a second partial pass can never
+/// slip between a first partial pass and its reduction). Two launches on
+/// *different* streams have no such ordering — so they are given different
+/// buffers rather than made to race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SplitKWorkspaceKey {
+    /// The stream the launch pair rides. See the type docs.
+    stream: oxicuda_driver::ffi::CUstream,
+    /// Accumulator precision of the workspace elements.
+    output_type: PtxType,
+    /// Exact element count. Keying on the exact count rather than a size class
+    /// is deliberate: an entry, once created, is never resized or freed, so the
+    /// device pointer for a given key is stable for the dispatcher's lifetime.
+    elements: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +250,39 @@ pub struct GemmDispatcher {
     /// type, split factor) — the reduction loop is unrolled at PTX-generation
     /// time over `split_factor`, so each factor is a distinct kernel.
     split_k_reduce: RwLock<HashMap<(PtxType, u32), Arc<CompiledSplitK>>>,
+    /// Reusable split-K reduction workspaces, keyed by
+    /// [`SplitKWorkspaceKey`] and **never evicted, resized, or freed** while
+    /// the dispatcher lives.
+    ///
+    /// # Why this is a cache rather than a per-call allocation
+    ///
+    /// Two reasons, and the second is the one that could not be worked around
+    /// anywhere else:
+    ///
+    /// * **`cuMemFree` is a device-wide barrier.** `DeviceBuffer` frees through
+    ///   the classic (non-stream-ordered) `cuMemFree`, which the driver defines
+    ///   to block until every operation already submitted to every stream has
+    ///   completed. Allocating a workspace per call therefore ended every
+    ///   split-K GEMM with a full synchronisation the caller never asked for —
+    ///   on a per-frame inference workload, once per skinny GEMM per frame.
+    /// * **`cuMemAlloc` cannot be called during CUDA stream capture.** The
+    ///   driver rejects it with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`, which
+    ///   made every split-K GEMM uncapturable — and split-K is exactly the
+    ///   shape class (`m*n < 65536`, `k >= 512`) that repeated small-batch
+    ///   inference GEMMs fall into. With the workspace resolved from this map
+    ///   the launch pair contains nothing but two `cuLaunchKernel`s, so it
+    ///   records into a graph cleanly.
+    ///
+    /// Keeping entries forever (rather than pooling them with reuse) is what
+    /// makes the recorded pointer *stable*: a graph captured today replays
+    /// against the same workspace tomorrow. See [`SplitKWorkspaceKey`] for the
+    /// concurrency argument, and [`Self::SPLIT_K_WORKSPACE_MAX_ENTRIES`] /
+    /// [`Self::SPLIT_K_WORKSPACE_MAX_BYTES`] for the bound on what that costs.
+    ///
+    /// A `Mutex` rather than an `RwLock` because the guard is deliberately held
+    /// across *both* launches of a split-K pair — see
+    /// [`Self::dispatch_skinny_split_k`].
+    split_k_workspace: Mutex<HashMap<SplitKWorkspaceKey, SplitKWorkspace>>,
 }
 
 impl GemmDispatcher {
@@ -231,6 +293,7 @@ impl GemmDispatcher {
             compiled: RwLock::new(HashMap::new()),
             split_k_partial: RwLock::new(HashMap::new()),
             split_k_reduce: RwLock::new(HashMap::new()),
+            split_k_workspace: Mutex::new(HashMap::new()),
         }
     }
 
@@ -845,10 +908,42 @@ impl GemmDispatcher {
         })?;
         // Every `(z, row, col)` workspace slot is written exactly once by
         // the partial kernel below (see its doc comment), so an
-        // uninitialised allocation is safe: nothing is ever read before it
-        // is written.
-        let workspace = SplitKWorkspace::alloc(problem.output_type, ws_elements)?;
-        let ws_ptr = workspace.device_ptr();
+        // uninitialised — or previously-used — allocation is safe: nothing is
+        // ever read before it is written, this call or any earlier one.
+        //
+        // `cached` is held across BOTH launches below, which is what keeps the
+        // partial/reduction pair adjacent in stream order. Without it, two
+        // threads submitting split-K GEMMs of the same shape onto the same
+        // stream could interleave as `partial(A), partial(B), reduce(A),
+        // reduce(B)`, and `reduce(A)` would sum B's partial sums. It is a
+        // submission-side lock only: it is released as soon as both launches
+        // are *enqueued*, never held while the device runs them.
+        let mut cached = self.lock_split_k_workspaces()?;
+        let key = SplitKWorkspaceKey {
+            stream: stream.raw(),
+            output_type: problem.output_type,
+            elements: ws_elements,
+        };
+        // A per-call allocation, used only when the cache is at its bound. It
+        // must outlive both launches, so it is bound here rather than inside
+        // the `else` arm. (This is also the only path that can still fail
+        // under stream capture — `cuMemAlloc` is forbidden there — which is
+        // reported to the caller as a launch failure exactly as before.)
+        let overflow_workspace;
+        let ws_ptr = if let Some(workspace) = cached.get(&key) {
+            workspace.device_ptr()
+        } else if Self::split_k_cache_has_room(&cached, problem.output_type, ws_elements) {
+            let workspace = SplitKWorkspace::alloc(problem.output_type, ws_elements)?;
+            let ptr = workspace.device_ptr();
+            cached.insert(key, workspace);
+            ptr
+        } else {
+            // Over the bound: fall back to the historical per-call allocation.
+            // Correct, merely slower (and not capturable) — never a wrong
+            // answer, and never an unbounded cache.
+            overflow_workspace = SplitKWorkspace::alloc(problem.output_type, ws_elements)?;
+            overflow_workspace.device_ptr()
+        };
 
         // Partial pass: gridDim.z == split_factor selects the K-partition;
         // gridDim.x * blockDim.x grid-strides over the flattened M*N output
@@ -890,15 +985,85 @@ impl GemmDispatcher {
                 BlasError::LaunchFailed(format!("split-K reduction launch failed: {e}"))
             })?;
 
-        // `workspace` drops here. `DeviceBuffer` frees through the classic
-        // `cuMemFree`, which the CUDA driver defines to block until every
-        // operation already submitted to every stream has completed --
-        // both kernel launches above are therefore guaranteed complete
-        // before the allocation is reclaimed, with no separate
-        // synchronisation needed for that safety property. (The *caller*
-        // still owns synchronising `stream` before reading `c_ptr` back to
-        // the host, exactly as for the single-pass launch path.)
+        // Both launches are enqueued; the submission lock may go now. A cached
+        // workspace stays allocated (that is the point). An `overflow_workspace`
+        // — the over-the-bound fallback — drops here instead, and `DeviceBuffer`
+        // frees through the classic `cuMemFree`, which the driver defines to
+        // block until every operation already submitted to every stream has
+        // completed, so both launches above are guaranteed finished before that
+        // memory is reclaimed. (The *caller* still owns synchronising `stream`
+        // before reading `c_ptr` back to the host, exactly as for the
+        // single-pass launch path.)
+        drop(cached);
         Ok(())
+    }
+
+    /// Most distinct split-K workspaces kept alive at once.
+    ///
+    /// An inference session repeats a handful of skinny GEMM shapes forever, so
+    /// this is generous for the workload it exists for while still bounding
+    /// what an adversarial shape sweep can pin down.
+    const SPLIT_K_WORKSPACE_MAX_ENTRIES: usize = 64;
+
+    /// Most device memory the split-K workspace cache may hold, in bytes.
+    ///
+    /// A single workspace is at most `32 * 65535` accumulator elements
+    /// (`split_factor` caps at 32, and `m*n` below
+    /// [`Self::SPLIT_K_MN_THRESHOLD`]), i.e. ~8 MiB in F32 and ~16 MiB in F64,
+    /// so this admits dozens of distinct shapes before the fallback engages.
+    const SPLIT_K_WORKSPACE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+    /// Acquire the split-K workspace map.
+    ///
+    /// A poisoned lock is reported rather than recovered: the map owns live
+    /// device pointers that a captured CUDA graph may already have baked in,
+    /// so continuing past a panic that happened while it was being mutated is
+    /// not a risk worth taking for a cache.
+    fn lock_split_k_workspaces(
+        &self,
+    ) -> BlasResult<std::sync::MutexGuard<'_, HashMap<SplitKWorkspaceKey, SplitKWorkspace>>> {
+        self.split_k_workspace
+            .lock()
+            .map_err(|_| BlasError::LaunchFailed("split-K workspace cache lock poisoned".into()))
+    }
+
+    /// Whether a new `elements`-long workspace of `output_type` still fits
+    /// inside both cache bounds.
+    fn split_k_cache_has_room(
+        cached: &HashMap<SplitKWorkspaceKey, SplitKWorkspace>,
+        output_type: PtxType,
+        elements: usize,
+    ) -> bool {
+        if cached.len() >= Self::SPLIT_K_WORKSPACE_MAX_ENTRIES {
+            return false;
+        }
+        let element_bytes = match output_type {
+            PtxType::F64 => std::mem::size_of::<f64>(),
+            // Only F32/F64 ever reach here (`should_use_split_k_workspace`),
+            // and `SplitKWorkspace::alloc` rejects anything else; F32 is the
+            // right size for the only other reachable case.
+            _ => std::mem::size_of::<f32>(),
+        };
+        let held: usize = cached.values().map(SplitKWorkspace::bytes).sum();
+        held.saturating_add(elements.saturating_mul(element_bytes))
+            <= Self::SPLIT_K_WORKSPACE_MAX_BYTES
+    }
+
+    /// Device bytes currently held by this dispatcher's split-K workspace
+    /// cache.
+    ///
+    /// Zero until the first split-K GEMM; monotonically non-decreasing after
+    /// that, by design — see [`Self::split_k_workspace`].
+    ///
+    /// # Errors
+    ///
+    /// [`BlasError::LaunchFailed`] if the cache lock is poisoned.
+    pub fn split_k_workspace_bytes(&self) -> BlasResult<usize> {
+        Ok(self
+            .lock_split_k_workspaces()?
+            .values()
+            .map(SplitKWorkspace::bytes)
+            .sum())
     }
 
     /// Retrieves (or compiles and caches) the split-K partial-GEMM kernel

@@ -150,6 +150,26 @@ impl BlasHandle {
         &self.gemm_dispatcher
     }
 
+    /// Device memory this handle's GEMM dispatcher is holding in reusable
+    /// split-K reduction workspaces.
+    ///
+    /// Zero until the first skinny GEMM takes the split-K path, and
+    /// monotonically non-decreasing afterwards: those workspaces are kept for
+    /// the handle's lifetime so their device addresses stay stable, which is
+    /// what lets a split-K GEMM be recorded into a CUDA graph and replayed.
+    /// See `GemmDispatcher::split_k_workspace` for the full rationale, and
+    /// `tests/splitk_workspace_gpu.rs` for the regression test that pins it.
+    ///
+    /// The number is a *consequence* of the caching policy, not a knob.
+    ///
+    /// # Errors
+    ///
+    /// [`BlasError::LaunchFailed`](crate::error::BlasError::LaunchFailed) if
+    /// the workspace cache's lock is poisoned.
+    pub fn split_k_workspace_bytes(&self) -> BlasResult<usize> {
+        self.gemm_dispatcher.split_k_workspace_bytes()
+    }
+
     /// Returns a cached compiled [`Module`] for `name`, or generates its PTX
     /// via `gen`, compiles it, caches it, and returns it.
     ///
