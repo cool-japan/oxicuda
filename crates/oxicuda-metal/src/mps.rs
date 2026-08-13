@@ -1,17 +1,60 @@
-//! Metal Performance Shaders (MPS) interop for Apple Silicon.
+//! Metal Performance Shaders (MPS) — parameter validation and descriptor
+//! types only. **There is no MPS framework call anywhere in this module.**
 //!
-//! Provides a thin Rust facade over the Metal Performance Shaders framework,
-//! enabling GPU-accelerated BLAS and image processing operations on Apple
-//! Silicon and Intel Mac GPUs.
+//! # What this module actually does
 //!
-//! On non-macOS platforms all operations return
-//! [`MetalError::UnsupportedPlatform`] so the crate compiles cross-platform.
+//! * Typed descriptors that mirror MPS shape/parameter structs
+//!   ([`MpsMatrixDescriptor`], [`MpsMatrixMultiply`],
+//!   [`MpsImageConvolveConfig`]) with `validate()` methods that check the
+//!   same invariants the real `MPSMatrixDescriptor` /
+//!   `MPSMatrixMultiplication` / `MPSImageConvolution` constructors would
+//!   enforce — positive dimensions, matching inner GEMM dimensions, odd
+//!   convolution kernel sizes, and so on.
+//! * [`MpsMatrixMultiply::prefers_mps`] — a size/dtype heuristic for whether
+//!   an MPS dispatch *would be* worth preferring over this crate's own
+//!   [`crate::msl`] kernels, for a caller that already has both paths wired.
+//! * [`MpsFeatureDetector`] — an offline, device-*name-string* heuristic for
+//!   whether MPS matrix/convolution ops are *likely* supported, independent
+//!   of the real capability table in [`crate::device_family`].
 //!
-//! # Operations Supported
+//! # What this module does **not** do
 //!
-//! * [`MpsMatrixMultiply`] — SGEMM via MPSMatrixMultiplication
-//! * [`MpsImageConvolveConfig`] — 2-D convolution via MPSImageConvolution
-//! * `MpsImageNormalize` — mean/variance normalisation
+//! There is no `metal::` type anywhere in this file, no `use metal`, no
+//! Objective-C message send, and no MPS dispatch entry point of any kind.
+//! Building an [`MpsMatrixMultiply`] and calling `.validate()` on it checks
+//! that the shapes *would* be legal for `MPSMatrixMultiplication` — it does
+//! **not** run a GEMM, touch a `metal::Buffer`, or allocate any GPU
+//! resource. Every GEMM dispatch [`crate::backend::MetalBackend`] actually
+//! takes today goes through the hand-written compute kernels in
+//! [`crate::msl`], never through this module — `MpsMatrixMultiply` and
+//! `MpsFeatureDetector` currently have no non-test callers anywhere in this
+//! crate. Read the doc-comment references to `MPSMatrixMultiplication` /
+//! `MPSImageConvolution` in this module as "this descriptor's shape and
+//! validation rules were modelled on that Apple type" — **not** as "this
+//! crate calls that API".
+//!
+//! # Roadmap — wiring real MPS
+//!
+//! `metal` (the `metal-rs` crate, this crate's only macOS-only dependency,
+//! see `Cargo.toml`) does not bind Metal Performance Shaders at all. Making
+//! any type in this module actually dispatch work requires adding
+//! `objc2-metal-performance-shaders` (built on `objc2` / `objc2-metal`) as a
+//! new, macOS-only, **default-off** dependency (Pure Rust policy: Apple
+//! system-framework interop with no C toolchain build step, feature-gated),
+//! constructing real `MPSMatrixDescriptor` / `MPSMatrix` /
+//! `MPSMatrixMultiplication` objects from it, and calling
+//! `encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:` against the
+//! `metal::CommandQueue` already owned by [`crate::device::MetalDevice`].
+//! That work has not started; this module is validation-only until it does.
+//!
+//! # Platform note
+//!
+//! Unlike most of this crate, nothing in this module is gated on
+//! `target_os = "macos"` — every type here is plain data and arithmetic (no
+//! `metal::` types), so it compiles and behaves identically on every
+//! platform. It does **not** return [`MetalError::UnsupportedPlatform`] on
+//! non-macOS targets; that variant is used elsewhere in the crate (e.g.
+//! [`crate::device::MetalDevice::new`]), not here.
 
 use crate::error::{MetalError, MetalResult};
 use std::fmt;
@@ -98,13 +141,16 @@ impl MpsMatrixDescriptor {
 
 // ─── MpsMatrixMultiply ────────────────────────────────────────────────────────
 
-/// Configuration for an MPS-accelerated matrix multiplication.
+/// Shape/parameter descriptor for an MPS-style matrix multiplication —
+/// **validation only, no dispatch**. See the module doc.
 ///
-/// Corresponds to `MPSMatrixMultiplication` with optional alpha/beta scaling.
+/// Its shape and validation rules are modelled on `MPSMatrixMultiplication`
+/// with optional alpha/beta scaling, but calling [`Self::validate`] never
+/// touches the GPU or the Metal Performance Shaders framework.
 ///
-/// The operation computes: `C = alpha * op(A) * op(B) + beta * C`
-/// where `op` is either identity or transpose according to `transpose_left`
-/// and `transpose_right`.
+/// The operation this descriptor *describes* is: `C = alpha * op(A) * op(B)
+/// + beta * C`, where `op` is either identity or transpose according to
+/// `transpose_left` and `transpose_right`.
 #[derive(Debug, Clone)]
 pub struct MpsMatrixMultiply {
     /// Descriptor for matrix A (or its transpose).
@@ -156,11 +202,25 @@ impl MpsMatrixMultiply {
         Ok(())
     }
 
-    /// Return `true` when MPS acceleration should be preferred.
+    /// Return `true` when MPS acceleration should be preferred — a
+    /// hypothetical judgement, since nothing currently dispatches through
+    /// MPS either way (see the module doc).
     ///
     /// MPS is beneficial for larger matrices and `Float32`/`Float16` types.
     /// Very small matrices (<= 4×4) are typically faster through the
     /// general-purpose Metal kernel path.
+    ///
+    /// # Known limitation
+    ///
+    /// `m`/`n` below are computed as `max(rows, columns)` of the
+    /// **pre-transpose** `left`/`right` descriptors, which is not the GEMM's
+    /// actual effective M/N whenever `transpose_left`/`transpose_right` is
+    /// set or a matrix is non-square, and `k` is not consulted at all — so
+    /// this is only a coarse "bigger than a handful of elements" gate, not a
+    /// real cost model. Left as-is because nothing calls this method outside
+    /// its own tests today; tighten it (effective post-transpose `m`, `n`,
+    /// and `k`) when a real MPS dispatch path is wired (see the module doc's
+    /// roadmap section).
     pub fn prefers_mps(&self) -> bool {
         let m = self.left.rows.max(self.left.columns);
         let n = self.right.rows.max(self.right.columns);
@@ -175,7 +235,10 @@ impl MpsMatrixMultiply {
 
 // ─── MpsImageConvolveConfig ───────────────────────────────────────────────────
 
-/// Configuration for an MPS image convolution.
+/// Shape/parameter descriptor for an MPS-style image convolution —
+/// **validation only, no dispatch**. See the module doc; its shape is
+/// modelled on `MPSImageConvolution` but [`Self::validate`] never touches
+/// the GPU or the Metal Performance Shaders framework.
 #[derive(Debug, Clone)]
 pub struct MpsImageConvolveConfig {
     /// Kernel width (must be odd).
@@ -215,15 +278,37 @@ impl MpsImageConvolveConfig {
 
 // ─── MpsFeatureDetector ───────────────────────────────────────────────────────
 
-/// Detect MPS feature support from a device name string.
+/// Offline, device-*name-string* heuristic for MPS feature support.
 ///
-/// On macOS the actual check is done via `[MTLDevice supportsFamily:]` at
-/// runtime. This heuristic covers offline static analysis.
+/// This is **not** the runtime check — nothing here calls
+/// `[MTLDevice supportsFamily:]`. The real runtime probe lives in
+/// [`crate::device::MetalDevice::new`], which calls `supports_family` on the
+/// live `metal::Device` and resolves a [`crate::device_family::MetalDeviceCapabilities`]
+/// snapshot (see [`crate::device::MetalDevice::capabilities`]); prefer that,
+/// or [`crate::device_family::MetalDeviceCapabilities::from_device_name`],
+/// over this type whenever a live device or even just its name is available
+/// from the normal init path.
+///
+/// `MpsFeatureDetector` exists only for call sites that have nothing but a
+/// device-name *string* from some other source and want a quick,
+/// MPS-specific yes/no independent of that. **Deduplication note:** its two
+/// chip-substring lists below are hand-maintained and *not* derived from
+/// `device_family`'s table, so the two can drift out of sync — if you extend
+/// one for a new chip, extend the other too (or better, replace the call
+/// site with `device_family` directly).
 pub struct MpsFeatureDetector;
 
 impl MpsFeatureDetector {
     /// Return `true` if the named device likely supports MPS matrix operations
     /// (requires Apple Silicon or Intel Mac GPU with Metal 3+).
+    ///
+    /// Heuristic only — see the [`MpsFeatureDetector`] type doc. Intended to
+    /// roughly track
+    /// [`MetalGpuFamily::supports_simdgroup_matrix`](crate::device_family::MetalGpuFamily::supports_simdgroup_matrix)
+    /// (Apple7+ and Mac2), but computed independently from a raw name string
+    /// rather than from a resolved
+    /// [`MetalGpuFamily`](crate::device_family::MetalGpuFamily), so it is not
+    /// guaranteed to agree in every case (see the deduplication note above).
     pub fn supports_mps_matrix(device_name: &str) -> bool {
         let name = device_name.to_ascii_lowercase();
         // Apple Silicon (M-series) and recent Intel Mac GPUs support MPS matrix ops.
@@ -241,7 +326,10 @@ impl MpsFeatureDetector {
 
     /// Return `true` if the device supports MPS image convolution.
     ///
-    /// This is a weaker requirement — all Metal-capable GPUs support it.
+    /// This is a weaker requirement — all Metal-capable GPUs support it — so
+    /// this is deliberately just a non-empty-name check rather than a real
+    /// capability query. Heuristic only; see the [`MpsFeatureDetector`] type
+    /// doc.
     pub fn supports_mps_convolve(device_name: &str) -> bool {
         !device_name.is_empty()
     }

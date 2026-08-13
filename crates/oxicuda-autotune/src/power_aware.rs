@@ -83,9 +83,17 @@ pub trait PowerMonitor: Send + Sync {
 /// nvidia-smi --query-gpu=power.draw,temperature.gpu,clocks.sm --format=csv,noheader,nounits
 /// ```
 ///
-/// On macOS (where `nvidia-smi` is unavailable), returns synthetic data
-/// (power=150.0W, temp=45.0C, clock=1500MHz) so the module compiles
-/// and tests pass without a GPU.
+/// On macOS there are no NVIDIA GPUs and no `nvidia-smi` binary, so
+/// [`read_power`](PowerMonitor::read_power) honestly reports failure
+/// (`Err(AutotuneError::BenchmarkFailed(_))`) instead of fabricating a
+/// plausible-looking constant reading. Every energy-per-op, EDP and
+/// perf-per-watt computation downstream of a `PowerMonitor` depends on the
+/// reading being a real measurement, so a silent fake here would make
+/// power-aware autotuning quietly degenerate to plain latency tuning while
+/// reporting confident wattage numbers. Callers that want power data on
+/// macOS for testing or development should construct a
+/// [`SyntheticPowerMonitor`] explicitly, so the syntheticness is visible at
+/// the call site.
 #[derive(Debug, Clone)]
 pub struct NvidiaSmiMonitor {
     /// GPU index to query (for multi-GPU systems).
@@ -119,15 +127,18 @@ impl PowerMonitor for NvidiaSmiMonitor {
 
 impl NvidiaSmiMonitor {
     #[cfg(target_os = "macos")]
-    fn read_power_inner(&self, timestamp_us: u64) -> Result<PowerReading, AutotuneError> {
-        // macOS has no NVIDIA GPUs — return synthetic data.
-        let _ = self.gpu_index;
-        Ok(PowerReading {
-            timestamp_us,
-            power_watts: 150.0,
-            gpu_temp_celsius: 45.0,
-            clock_mhz: 1500,
-        })
+    fn read_power_inner(&self, _timestamp_us: u64) -> Result<PowerReading, AutotuneError> {
+        // macOS has no NVIDIA GPUs and no `nvidia-smi` binary. Report the
+        // honest absence rather than fabricating a constant `PowerReading`
+        // that looks like a live measurement (see the type-level doc above
+        // for why that matters). `SyntheticPowerMonitor` already exists for
+        // callers that explicitly want synthetic data.
+        Err(AutotuneError::BenchmarkFailed(format!(
+            "nvidia-smi is not available on macOS (requested GPU index {}); \
+             use SyntheticPowerMonitor for testing, or a Metal/IOReport-based \
+             power monitor for real macOS GPU telemetry",
+            self.gpu_index
+        )))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -863,16 +874,68 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 4: NvidiaSmiMonitor on macOS returns synthetic data
+    // Test 4: NvidiaSmiMonitor on macOS honestly reports unavailability
     // -----------------------------------------------------------------------
     #[test]
     #[cfg(target_os = "macos")]
-    fn nvidia_smi_monitor_macos_synthetic() {
+    fn nvidia_smi_monitor_macos_reports_unavailable() {
         let monitor = NvidiaSmiMonitor::default_gpu();
-        let reading = monitor.read_power().expect("should succeed on macOS");
-        assert!((reading.power_watts - 150.0).abs() < 1e-9);
-        assert!((reading.gpu_temp_celsius - 45.0).abs() < 1e-9);
-        assert_eq!(reading.clock_mhz, 1500);
+        let err = match monitor.read_power() {
+            Err(e) => e,
+            Ok(reading) => panic!(
+                "expected NvidiaSmiMonitor to report unavailability on macOS, got Ok({reading:?})"
+            ),
+        };
+        assert!(
+            matches!(err, AutotuneError::BenchmarkFailed(_)),
+            "expected BenchmarkFailed, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("macOS"),
+            "error message should mention macOS: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4b: the macOS error message reports which GPU index was requested
+    // -----------------------------------------------------------------------
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn nvidia_smi_monitor_macos_error_mentions_gpu_index() {
+        let monitor = NvidiaSmiMonitor::new(3);
+        let err = monitor.read_power().expect_err("should fail on macOS");
+        let msg = err.to_string();
+        assert!(
+            msg.contains('3'),
+            "error should mention the requested GPU index: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4c: a caller chaining NvidiaSmiMonitor into
+    // PowerAwareBenchmarkEngine on macOS gets the error, not a fabricated
+    // benchmark result
+    // -----------------------------------------------------------------------
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn benchmark_engine_with_nvidia_smi_monitor_propagates_macos_error() {
+        let engine = BenchmarkEngine::with_config(BenchmarkConfig {
+            warmup: WarmupStrategy::Fixed(1),
+            benchmark_runs: 5,
+        });
+        let power_engine = PowerAwareBenchmarkEngine::new(
+            engine,
+            Box::new(NvidiaSmiMonitor::default_gpu()),
+            350.0,
+        );
+
+        let config = Config::new();
+        let result = power_engine.benchmark_with_power(&config, 2e9, || Ok(()));
+        assert!(
+            matches!(result, Err(AutotuneError::BenchmarkFailed(_))),
+            "expected BenchmarkFailed to propagate from the idle-power read, got {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

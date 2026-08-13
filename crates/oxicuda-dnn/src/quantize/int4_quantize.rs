@@ -10,11 +10,8 @@
 //! - Low nibble (bits 3:0) = even-indexed element
 //! - High nibble (bits 7:4) = odd-indexed element
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::ir::PtxType;
@@ -22,6 +19,7 @@ use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 
 /// Block size for INT4/NF4 quantization kernels.
@@ -171,10 +169,12 @@ pub fn quantize_to_int4<T: GpuFloat>(
     }
 
     // Step 1: Compute per-group scales (and zeros for asymmetric)
-    let scale_ptx = generate_int4_scale_ptx::<T>(handle.sm_version(), config)?;
-    let scale_mod = Arc::new(Module::from_ptx(&scale_ptx)?);
-    let scale_name = format!("dnn_int4_scale_{}", T::NAME);
-    let scale_kernel = Kernel::from_module(scale_mod, &scale_name)?;
+    let scale_name = int4_kernel_name::<T>("scale", config.symmetric);
+    let scale_kernel = handle.get_or_compile_kernel(
+        &cache_key(&scale_name, handle.sm_version()),
+        &scale_name,
+        || generate_int4_scale_ptx::<T>(handle.sm_version(), config),
+    )?;
 
     let scale_grid = grid_size_for(num_groups as u32, INT4_QUANT_BLOCK);
     let scale_params = LaunchParams::new(scale_grid, INT4_QUANT_BLOCK);
@@ -188,14 +188,17 @@ pub fn quantize_to_int4<T: GpuFloat>(
     );
 
     scale_kernel
+        .kernel()
         .launch(&scale_params, handle.stream(), &scale_args)
         .map_err(|e| DnnError::LaunchFailed(format!("INT4 scale compute: {e}")))?;
 
     // Step 2: Quantize and pack
-    let quant_ptx = generate_int4_pack_ptx::<T>(handle.sm_version(), config)?;
-    let quant_mod = Arc::new(Module::from_ptx(&quant_ptx)?);
-    let quant_name = format!("dnn_int4_pack_{}", T::NAME);
-    let quant_kernel = Kernel::from_module(quant_mod, &quant_name)?;
+    let quant_name = int4_kernel_name::<T>("pack", config.symmetric);
+    let quant_kernel = handle.get_or_compile_kernel(
+        &cache_key(&quant_name, handle.sm_version()),
+        &quant_name,
+        || generate_int4_pack_ptx::<T>(handle.sm_version(), config),
+    )?;
 
     // Each thread processes one output byte (2 elements)
     let quant_grid = grid_size_for(packed_bytes as u32, INT4_QUANT_BLOCK);
@@ -211,6 +214,7 @@ pub fn quantize_to_int4<T: GpuFloat>(
     );
 
     quant_kernel
+        .kernel()
         .launch(&quant_params, handle.stream(), &quant_args)
         .map_err(|e| DnnError::LaunchFailed(format!("INT4 pack: {e}")))?;
 
@@ -264,10 +268,11 @@ pub fn dequantize_int4<T: GpuFloat>(
         });
     }
 
-    let ptx = generate_int4_unpack_ptx::<T>(handle.sm_version(), config)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let name = format!("dnn_int4_unpack_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &name)?;
+    let name = int4_kernel_name::<T>("unpack", config.symmetric);
+    let kernel =
+        handle.get_or_compile_kernel(&cache_key(&name, handle.sm_version()), &name, || {
+            generate_int4_unpack_ptx::<T>(handle.sm_version(), config)
+        })?;
 
     let grid = grid_size_for(packed_bytes as u32, INT4_QUANT_BLOCK);
     let params = LaunchParams::new(grid, INT4_QUANT_BLOCK);
@@ -282,6 +287,7 @@ pub fn dequantize_int4<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("INT4 unpack: {e}")))?;
 
@@ -350,10 +356,12 @@ pub fn quantize_to_nf4<T: GpuFloat>(
         group_size,
         symmetric: true,
     };
-    let scale_ptx = generate_int4_scale_ptx::<T>(handle.sm_version(), &sym_config)?;
-    let scale_mod = Arc::new(Module::from_ptx(&scale_ptx)?);
-    let scale_name = format!("dnn_int4_scale_{}", T::NAME);
-    let scale_kernel = Kernel::from_module(scale_mod, &scale_name)?;
+    let scale_name = int4_kernel_name::<T>("scale", sym_config.symmetric);
+    let scale_kernel = handle.get_or_compile_kernel(
+        &cache_key(&scale_name, handle.sm_version()),
+        &scale_name,
+        || generate_int4_scale_ptx::<T>(handle.sm_version(), &sym_config),
+    )?;
 
     // For NF4, zeros buffer is unused (symmetric), but we need a dummy pointer
     let dummy_zeros = DeviceBuffer::<T>::alloc(1)?;
@@ -369,14 +377,17 @@ pub fn quantize_to_nf4<T: GpuFloat>(
     );
 
     scale_kernel
+        .kernel()
         .launch(&scale_params, handle.stream(), &scale_args)
         .map_err(|e| DnnError::LaunchFailed(format!("NF4 scale compute: {e}")))?;
 
     // Step 2: NF4 quantize and pack
-    let nf4_ptx = generate_nf4_pack_ptx::<T>(handle.sm_version())?;
-    let nf4_mod = Arc::new(Module::from_ptx(&nf4_ptx)?);
     let nf4_name = format!("dnn_nf4_pack_{}", T::NAME);
-    let nf4_kernel = Kernel::from_module(nf4_mod, &nf4_name)?;
+    let nf4_kernel = handle.get_or_compile_kernel(
+        &cache_key(&nf4_name, handle.sm_version()),
+        &nf4_name,
+        || generate_nf4_pack_ptx::<T>(handle.sm_version()),
+    )?;
 
     let nf4_grid = grid_size_for(packed_bytes as u32, INT4_QUANT_BLOCK);
     let nf4_params = LaunchParams::new(nf4_grid, INT4_QUANT_BLOCK);
@@ -390,10 +401,38 @@ pub fn quantize_to_nf4<T: GpuFloat>(
     );
 
     nf4_kernel
+        .kernel()
         .launch(&nf4_params, handle.stream(), &nf4_args)
         .map_err(|e| DnnError::LaunchFailed(format!("NF4 pack: {e}")))?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Kernel naming
+// ---------------------------------------------------------------------------
+
+/// Builds the entry-point name for an INT4 kernel, encoding the quantization
+/// mode alongside the element type.
+///
+/// # Why `symmetric` is part of the name
+///
+/// `generate_int4_scale_ptx`, `generate_int4_pack_ptx` and
+/// `generate_int4_unpack_ptx` all branch on `config.symmetric` at
+/// *code-generation* time (symmetric derives `scale = absmax / 8` and quantizes
+/// into `[-8, 7]`; asymmetric derives a min/max range with a zero point and
+/// quantizes into `[0, 15]`). The two modes therefore emit different
+/// instruction streams from the same generator.
+///
+/// The kernel name is the compiled-module cache key (see
+/// [`crate::kernel_cache`]), so omitting the mode would let
+/// [`quantize_nf4`] — which always requests the *symmetric* scale kernel —
+/// be served the asymmetric module previously compiled by
+/// [`quantize_int4`] on the same handle, silently producing wrong scales.
+/// Encoding it here keeps the key faithful.
+fn int4_kernel_name<T: GpuFloat>(base: &str, symmetric: bool) -> String {
+    let mode = if symmetric { "sym" } else { "asym" };
+    format!("dnn_int4_{base}_{mode}_{}", T::NAME)
 }
 
 // ---------------------------------------------------------------------------
@@ -405,8 +444,8 @@ fn generate_int4_scale_ptx<T: GpuFloat>(
     sm: SmVersion,
     config: &Int4QuantConfig,
 ) -> DnnResult<String> {
-    let kernel_name = format!("dnn_int4_scale_{}", T::NAME);
     let symmetric = config.symmetric;
+    let kernel_name = int4_kernel_name::<T>("scale", symmetric);
 
     let ptx = KernelBuilder::new(&kernel_name)
         .target(sm)
@@ -543,8 +582,8 @@ fn generate_int4_pack_ptx<T: GpuFloat>(
     sm: SmVersion,
     config: &Int4QuantConfig,
 ) -> DnnResult<String> {
-    let kernel_name = format!("dnn_int4_pack_{}", T::NAME);
     let symmetric = config.symmetric;
+    let kernel_name = int4_kernel_name::<T>("pack", symmetric);
 
     let ptx = KernelBuilder::new(&kernel_name)
         .target(sm)
@@ -705,8 +744,8 @@ fn generate_int4_unpack_ptx<T: GpuFloat>(
     sm: SmVersion,
     config: &Int4QuantConfig,
 ) -> DnnResult<String> {
-    let kernel_name = format!("dnn_int4_unpack_{}", T::NAME);
     let symmetric = config.symmetric;
+    let kernel_name = int4_kernel_name::<T>("unpack", symmetric);
 
     let ptx = KernelBuilder::new(&kernel_name)
         .target(sm)
@@ -1001,7 +1040,7 @@ mod tests {
         let ptx = generate_int4_scale_ptx::<f32>(SmVersion::Sm80, &cfg);
         assert!(ptx.is_ok());
         let ptx_str = ptx.expect("should generate");
-        assert!(ptx_str.contains("dnn_int4_scale_f32"));
+        assert!(ptx_str.contains("dnn_int4_scale_sym_f32"));
     }
 
     #[test]
@@ -1017,7 +1056,39 @@ mod tests {
         let ptx = generate_int4_pack_ptx::<f32>(SmVersion::Sm80, &cfg);
         assert!(ptx.is_ok());
         let ptx_str = ptx.expect("should generate");
-        assert!(ptx_str.contains("dnn_int4_pack_f32"));
+        assert!(ptx_str.contains("dnn_int4_pack_sym_f32"));
+    }
+
+    /// The INT4 kernels branch on `symmetric` at code-generation time, and the
+    /// entry name is the compiled-module cache key. If the two modes shared a
+    /// name, `quantize_nf4` (always symmetric) would be handed the asymmetric
+    /// module previously compiled by `quantize_int4` on the same handle and
+    /// silently produce wrong scales.
+    #[test]
+    fn int4_symmetric_and_asymmetric_never_share_an_entry_name() {
+        let sym = Int4QuantConfig::new(32, true).expect("valid");
+        let asym = Int4QuantConfig::new(32, false).expect("valid");
+        for (generate, label) in [
+            (
+                generate_int4_scale_ptx::<f32>
+                    as fn(SmVersion, &Int4QuantConfig) -> DnnResult<String>,
+                "scale",
+            ),
+            (generate_int4_pack_ptx::<f32>, "pack"),
+            (generate_int4_unpack_ptx::<f32>, "unpack"),
+        ] {
+            let sym_ptx = generate(SmVersion::Sm80, &sym).expect("sym ptx");
+            let asym_ptx = generate(SmVersion::Sm80, &asym).expect("asym ptx");
+            assert_ne!(
+                sym_ptx, asym_ptx,
+                "{label}: the two modes must emit different PTX"
+            );
+            assert!(
+                sym_ptx.contains(&format!("dnn_int4_{label}_sym_f32"))
+                    && asym_ptx.contains(&format!("dnn_int4_{label}_asym_f32")),
+                "{label}: entry name must encode the quantization mode"
+            );
+        }
     }
 
     #[test]

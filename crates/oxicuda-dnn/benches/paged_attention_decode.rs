@@ -162,11 +162,32 @@ fn bench_paged_attention_decode(c: &mut Criterion) {
 
     let tokens_per_call = u64::from(BATCH);
 
+    // Warm-up call outside the timed loop, plus `.expect()` inside it below:
+    // a silently-discarded `Result` here would let a future regression (or a
+    // future workspace requirement, mirroring the `conv_forward` bug this
+    // repository has already hit) time an early-return-on-error instead of
+    // the kernel this benchmark claims to measure.
+    paged_attention_decode(
+        &handle,
+        &q,
+        k_cache_buf.as_device_ptr(),
+        v_cache_buf.as_device_ptr(),
+        &page_table,
+        &seq_lengths,
+        &mut output,
+        &config,
+    )
+    .expect("paged_attention_decode warm-up call must succeed");
+    handle
+        .stream()
+        .synchronize()
+        .expect("synchronize after warm-up");
+
     let mut group = c.benchmark_group("dnn_p3_paged_attention_decode");
     group.throughput(Throughput::Elements(tokens_per_call));
     group.bench_function("oxicuda_f32_b32_seq4096_d128_h32_kv8", |b| {
         b.iter(|| {
-            let _ = paged_attention_decode(
+            paged_attention_decode(
                 &handle,
                 &q,
                 k_cache_buf.as_device_ptr(),
@@ -175,7 +196,8 @@ fn bench_paged_attention_decode(c: &mut Criterion) {
                 &seq_lengths,
                 &mut output,
                 &config,
-            );
+            )
+            .expect("paged_attention_decode");
         });
     });
     group.finish();

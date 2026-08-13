@@ -16,19 +16,16 @@
 //! The im2col expansion is performed by a separate GPU kernel before
 //! invoking the GEMM.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
 use oxicuda_blas::level3::gemm_api;
 use oxicuda_blas::types::{Layout, MatrixDesc, MatrixDescMut, Transpose};
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::KernelBuilder;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 use super::super::descriptor::ConvProblem;
@@ -57,6 +54,13 @@ impl Im2colGemmConv {
     }
 
     /// Returns the kernel name for the im2col expansion.
+    ///
+    /// The element width is the *only* thing
+    /// [`Self::generate_im2col_ptx`] bakes into the instruction stream (it
+    /// selects the load/store width); every dimension, pad, stride and
+    /// dilation is a runtime kernel parameter. The precision is encoded here,
+    /// so this name is a complete compiled-module cache key for a given target
+    /// architecture.
     #[must_use]
     pub fn im2col_kernel_name(&self) -> String {
         let prec = self.problem.input_type.as_ptx_str().trim_start_matches('.');
@@ -189,9 +193,11 @@ impl Im2colGemmConv {
         input: &TensorDesc<T>,
         workspace: &mut oxicuda_memory::DeviceBuffer<u8>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_im2col_ptx()?;
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &self.im2col_kernel_name())?;
+        let entry = self.im2col_kernel_name();
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&entry, self.sm_version), &entry, || {
+                self.generate_im2col_ptx()
+            })?;
 
         let out_dims = self.problem.output_dims()?;
         let out_h = out_dims.first().copied().unwrap_or(1);
@@ -214,10 +220,7 @@ impl Im2colGemmConv {
             ))
         })?;
 
-        let block_size = 256u32;
-        let grid = grid_size_for(total_elements, block_size);
-
-        let params = LaunchParams::new(grid, block_size);
+        let params = kernel.launch_1d(total_elements);
         let args = (
             input.ptr,
             workspace.as_device_ptr(),
@@ -239,6 +242,7 @@ impl Im2colGemmConv {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -722,6 +726,8 @@ mod tests {
     #[test]
     #[cfg(feature = "gpu-tests")]
     fn launch_im2col_rejects_element_count_overflow() {
+        use std::sync::Arc;
+
         use oxicuda_driver::{Context, Device};
         use oxicuda_memory::DeviceBuffer;
 

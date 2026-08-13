@@ -23,8 +23,8 @@ to cuDNN. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda) (Vol.4).
 #### Convolution -- Forward Propagation
 - [x] conv/fprop/direct.rs -- Direct convolution (1x1, depthwise)
 - [x] conv/fprop/im2col_gemm.rs -- Im2col + GEMM convolution
-- [x] conv/fprop/implicit_gemm.rs -- Implicit GEMM convolution (fused im2col)
-- [x] conv/fprop/winograd.rs -- Winograd convolution (F(2x2, 3x3) and F(4x4, 3x3))
+- [x] conv/fprop/implicit_gemm.rs -- Implicit GEMM convolution (fused im2col); transparently wraps a CTA-tiled register-blocked GEMM mainloop (conv/fprop/tiled_implicit_gemm.rs) when the shape qualifies (F32/NCHW/groups==1/2-D, above minimum K/output-channel/CTA-count thresholds) -- 5.7-8.0 TFLOPS vs. a ~900 GFLOPS scalar baseline on real face-pipeline 3x3 shapes; `ImplicitGemmConv::scalar_only` pins the scalar path, `OXICUDA_DISABLE_TILED_CONV` env var disables tiling process-wide
+- [x] conv/fprop/winograd/ -- Winograd F(2x2,3x3) forward: input transform, filter transform, a shared-memory-tiled batched GEMM over the 16 transform-domain positions, output transform + bias (split into mod.rs/kernels.rs/matrices.rs for the 2000-line-file policy). Hardware-validated on an RTX A4000 against an f64 CPU oracle (relative L2 1.0e-7..1.7e-7) and ImplicitGemmConv (7.9e-8..1.4e-6); `conv/algo_select.rs` routes eligible shapes above a measured profitability threshold to it (1.5x-3.9x faster than ImplicitGemmConv there). F(4x4,3x3) forward remains unimplemented, explicitly rejected by `WinogradTileSize::forward_supported` (round-off budget, not yet derived)
 
 #### Convolution -- Backward Data Gradient
 - [x] conv/dgrad/implicit_gemm.rs -- Implicit GEMM backward data gradient
@@ -38,7 +38,7 @@ to cuDNN. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda) (Vol.4).
 - [x] conv/algo_select.rs -- Algorithm selection heuristics
 - [x] conv/api.rs -- Public convolution API
 - [x] conv/descriptor.rs -- Convolution descriptor management
-- [x] conv/fused.rs -- Fused Conv+BN+ReLU operations
+- [x] conv/fused.rs -- Fused Conv+BN+ReLU operations, but not literally: the public `conv_bn_relu` decomposes into a real `conv_forward` call plus a real combined BN-affine+activation epilogue kernel (correct output, one fewer memory round-trip than 3 separate kernels); the single-kernel `FusedConvBnAct` engine this file also defines remains a load/launch-only skeleton and is never dispatched
 - [x] conv/mod.rs -- Convolution module organization
 
 #### Convolution -- Transposed
@@ -130,7 +130,7 @@ to cuDNN. Part of [OxiCUDA](https://github.com/cool-japan/oxicuda) (Vol.4).
 - [x] 3D convolution (conv/conv3d/) -- im2col3d + GEMM, forward/backward/wgrad for volumetric data
 - [x] Deformable convolution (conv/deformable.rs) -- learnable sampling offsets (DCNv2) with bilinear interpolation, forward+backward
 - [x] Transposed convolution -- fractionally-strided convolution for upsampling (conv/transpose_conv.rs; TransposeConvConfig, TransposeConvPlan with col2im and weight reshape PTX kernels; ~25 tests)
-- [x] Winograd backward pass optimization -- dgrad and wgrad through Winograd domain (dgrad/winograd.rs, wgrad/winograd.rs)
+- [ ] Winograd backward pass optimization -- dgrad and wgrad through Winograd domain (dgrad/winograd.rs, wgrad/winograd.rs); still load/launch-only skeletons (unlike the now-real forward pass, conv/fprop/winograd/), and not reachable from the public `conv_backward_data`/`conv_backward_filter` API (those use the separate implicit-GEMM dgrad/wgrad engines) -- exercised only directly by gpu_tests canaries
 - [x] Depthwise separable conv fusion (conv/depthwise_separable.rs) -- fused DW+PW kernel
 - [x] MoE load balancing monitoring (moe/monitoring.rs) -- runtime expert utilization tracking and imbalance detection
 - [x] Expert capacity factor tuning (moe/capacity.rs) -- dynamic capacity adjustment based on routing statistics
@@ -194,7 +194,14 @@ production-grade cuDNN parity (all template expansions, precision variants per
 architecture, and exhaustive numerical accuracy test suites), whereas the current
 implementation provides complete API coverage with PTX generation delegated to
 oxicuda-ptx. Key high-difficulty components (FlashAttention-2, PagedAttention,
-Fused MoE, Winograd convolution) are all present.
+Fused MoE) are all present and numerically verified on-device. Winograd
+F(2x2,3x3) forward is now a real, hardware-validated implementation
+(`conv/fprop/winograd/`), routed to by the algorithm dispatcher above a
+measured profitability threshold. Winograd F(4x4,3x3) forward and both
+backward passes remain load/launch-only skeletons (see the "Implementation
+status" section in `conv/dgrad/winograd.rs` and `conv/wgrad/winograd.rs`,
+and `WinogradTileSize::forward_supported` for F(4x4,3x3)) -- the dispatcher
+never routes real work through those.
 
 ---
 
@@ -207,7 +214,7 @@ Fused MoE, Winograd convolution) are all present.
 | D1 | Conv2D forward — Implicit GEMM NHWC layout | P0 | [x] |
 | D2 | Conv2D — 1×1 convolution and depthwise convolution | P0 | [x] |
 | D3 | Conv2D backward — dgrad (input gradient) and wgrad (filter gradient) | P1 | [x] |
-| D4 | Winograd 3×3 convolution — F(2×2,3×3) and F(4×4,3×3) transforms | P2 | [x] |
+| D4 | Winograd 3×3 convolution forward — F(2×2,3×3) real and hardware-validated, routed to by `algo_select.rs` above a profitability threshold; F(4×4,3×3) forward and both backward (dgrad/wgrad) variants remain load/launch-only skeletons | P2 | [x] |
 | D5 | FlashAttention forward — FP16 causal mask | P0 | [x] |
 | D6 | FlashAttention backward | P1 | [x] |
 | D7 | PagedAttention decode — variable-length KV-cache | P0 | [x] |
@@ -222,7 +229,7 @@ Fused MoE, Winograd convolution) are all present.
 | D16 | MaxPool2D and AvgPool2D | P0 | [x] |
 | D17 | AdaptiveAvgPool2D — including global average pooling | P0 | [x] |
 | D18 | FP8 quantize / dequantize (Hopper+) | P1 | [x] |
-| D19 | Fused Conv + BatchNorm + ReLU | P0 | [x] |
+| D19 | Fused Conv + BatchNorm + ReLU (decomposed dispatch: real `conv_forward` + a real BN-affine+activation epilogue kernel, not `FusedConvBnAct`'s single-kernel body, which remains a skeleton) | P0 | [x] |
 | D20 | Fused Add + RMSNorm (Transformer Add&Norm pattern) | P0 | [x] |
 
 ### Performance Requirements
@@ -306,7 +313,7 @@ Fused MoE, Winograd convolution) are all present.
 - [x] Conv+BN+ReLU coefficient folding math verified
 - [x] LayerNorm formula verified: output mean≈0, var≈1
 - [x] RMSNorm formula verified: shift-invariance distinction from LayerNorm confirmed
-- [x] Winograd F(4×4,3×3): 4× multiplication reduction vs baseline conv measured
+- [x] Winograd F(4×4,3×3): 4x theoretical multiply-count ratio (144 naive vs 36 Winograd-domain) verified algebraically by a CPU unit test on the tile-size constants -- not a measured GPU runtime comparison; no kernels exist to realize this reduction yet -- `WinogradTileSize::forward_supported` returns `false` for F4x3 (only F2x3, now real and hardware-validated, is enabled), so `WinogradConv::with_tile_size` refuses it outright rather than dispatching a skeleton
 - [x] PagedAttention: GQA (Grouped Query Attention) with `num_kv_heads < num_heads` verified
 - [x] FlashAttention causal mask: triangular mask correctness vs unfused reference < 2e-2 FP16
 - [x] FlashAttention-3 Hopper kernel bodies implemented: real MMA (mma.sync.aligned.m16n8k16), ldmatrix, warp shuffle, TMA (cp.async.bulk), wgmma.mma_async instructions emitted

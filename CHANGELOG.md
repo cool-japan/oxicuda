@@ -5,6 +5,597 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-08-13
+
+This release runs the alt-backend audit that the 2026-07-06 production-readiness wave queued but
+never reached (`oxicuda-vulkan`/`metal`/`rocm`/`levelzero`/`webgpu` all hit the session token limit
+before a single agent ran — see `TODO.md`). `oxicuda-metal` and `oxicuda-webgpu` are now audited and
+fixed on real Apple Silicon (M3, Metal 4, macOS/arm64); `vulkan`/`rocm`/`levelzero` remain pending.
+The headline finding is that `oxicuda-metal`'s `conv2d_forward` and `attention` were false
+completions — pure-CPU scalar loops round-tripping every operand through the host even though
+finished MSL kernels for both sat unused in the same crate, and `softmax` inherited the trait's
+`Unsupported` default despite a complete shader shipping alongside it. All three now dispatch real
+GPU kernels. `oxicuda-webgpu` had no comparable false completion, but the same adversarial pass found
+a device-limits bug that silently capped every allocation and dispatch at the WebGPU conformance
+baseline regardless of the real GPU, a process-fatal default error handler, and several
+integer-overflow / out-of-bounds-write bugs in generated shaders.
+
+Separately, this release also closes out a downstream performance/correctness investigation
+triggered by `oxiface` (a Rust face-swap CLI) underperforming on Linux+NVIDIA relative to its CoreML
+path, traced to `oxicuda-blas`/`oxicuda-dnn` GEMM and convolution dispatch for the exact shapes
+ArcFace/InSwapper/SCRFD inference is dominated by, and verified end to end on a real RTX A4000
+(driver 550.144.03, sm_86). It turned up a split-K GEMM path that was implemented and unit-tested
+but never actually wired into the dispatcher, a convolution algorithm selector that could silently
+route ordinary 3x3 convolutions into a no-op kernel, wrong Ampere GA10x hardware-capacity constants
+shared with a datacenter-class part, and a cross-stream readback race in downstream callers — plus
+new `oxicuda-dnn`/`oxicuda-memory` infrastructure (a JIT kernel cache and a reusable pinned staging
+buffer) built in the course of the same investigation.
+
+### Fixed
+
+- `oxicuda-metal`: `ComputeBackend::conv2d_forward` and `ComputeBackend::attention` copied every
+  operand to the host and ran scalar Rust loops, even though the finished `conv2d_msl`/`attention_msl`
+  MSL kernels existed with no caller anywhere in the crate. Both now dispatch on the GPU via a new
+  `backend/nn.rs` module: `conv2d_forward` unconditionally (no host fallback — it errors on `u32`
+  overflow and no-ops on zero output elements), `attention` via a new single-pass online-softmax
+  `attention_msl_v2` kernel (one SIMD-group per query), falling back to the host implementation only
+  when `head_dim`'s accumulator cannot fit in one threadgroup-memory slice — a real, caller-reachable
+  limit that a new on-device test (`gpu_device_is_live_when_required`) asserts is not silently taken
+  by default.
+- `oxicuda-metal`: `ComputeBackend::softmax` inherited the trait's `Unsupported` default despite a
+  complete numerically-stable softmax MSL shader already shipping in the crate; it now dispatches
+  `softmax_msl_with_mode` for real (last-axis only — an earlier axis still returns `Unsupported`
+  rather than silently reducing the wrong dimension).
+- `oxicuda-metal`: six ad-hoc GPU dispatch paths (unary/binary/reduce/gemm/batched_gemm/gemm_f16),
+  plus the FFT plan, treated a non-`Completed` `MTLCommandBuffer` status as success. All now route
+  through a shared `commit_and_wait`/`status_to_result` (`pipeline.rs`), so a GPU-side failure
+  (device removal, out-of-memory, shader-validation error at runtime) surfaces as `Err` instead of a
+  silently wrong or stale result.
+- `oxicuda-metal`: the buffer-handle map's mutex was held across kernel encoding *and* the blocking
+  `waitUntilCompleted`, serializing otherwise-independent dispatches (and a latent deadlock risk under
+  contention). `resolve_buffers` now takes its `metal::Buffer` retains under the lock and drops it
+  before encoding.
+- `oxicuda-metal`: `MetalMemoryManager::alloc` called `new_buffer` on `bytes == 0` and on requests
+  larger than `device.max_buffer_length()` without checking first; it now pre-validates both
+  (`InvalidArgument` / `OutOfMemory`) plus a post-hoc nil/short-length probe as defence in depth.
+- `oxicuda-metal`: `reduce` masked every zero-length shape dimension to `1` via `.max(1)`, so a
+  zero-extent axis silently reduced over one phantom element instead of erroring — `Mean` in
+  particular could produce `NaN` with no diagnostic. Zero-length dimensions are now rejected with
+  `InvalidArgument`.
+- `oxicuda-metal`: `simdgroup_gemm_msl` read past the end of its operands with a raw
+  `simdgroup_load` and accumulated into one 64-float threadgroup tile shared (and raced) across every
+  SIMD-group. Fixed with zero-filled threadgroup staging, per-element store guards, and a private
+  per-SIMD-group accumulator; a new `simdgroup_gemm_msl_v2` (same fix, `simdgroup_float8x8` MMA) is
+  F32-only for now — the F16 path returns `Unsupported` rather than accumulate in `half`.
+- `oxicuda-metal`: `next_power_of_2` shifted by 64 (undefined/panicking in debug) for inputs near
+  `usize::MAX`; replaced with `checked_next_power_of_two`. Every v2-kernel dimension parameter (m/n/k,
+  batch counts, strides) now goes through a checked `usize -> u32` conversion instead of `as u32`.
+- `oxicuda-metal`: `DoubleSingle::from_f64` could produce a `NaN` low limb on overflow instead of
+  saturating; fixed, plus new `try_from_f64`/`is_finite`/`pack_df64_checked` and `msl_float_literal`
+  now rejects NaN/inf float literals outright rather than emitting invalid MSL.
+- `oxicuda-metal`: the FFT plan's `determine_threadgroup_size` unconditionally halved an
+  already-power-of-two threadgroup width (e.g. 512 -> 256, wrongly under-occupying the device); it now
+  only rounds down when the input was *not* already a power of two.
+- `oxicuda-metal`: FFT twiddle factors were recomputed per-thread via `cos`/`sin` on `M_PI_F`; the
+  butterfly kernel now indexes a precomputed forward-twiddle table (`twiddle_buffer`, uploaded once
+  per plan), negating the imaginary part for the inverse transform instead of a second table.
+- `oxicuda-webgpu`: `WebGpuDevice::new_async` requested `wgpu::Limits::default()` — the WebGPU
+  conformance *baseline* (e.g. a 256 MiB `max_buffer_size`, 65535 workgroups per dimension) — instead
+  of the real adapter capability, silently capping every allocation and dispatch even on hardware that
+  supports far more. It now requests `adapter.limits()` and `WebGpuMemoryManager::alloc` validates
+  against the real value.
+- `oxicuda-webgpu`: wgpu's default uncaptured-error handler is fatal to the process; `WebGpuDevice`
+  now installs a handler that records the message instead (drained via `poll_error`), so a GPU-side
+  validation error surfaces as a typed `Err` rather than crashing the host process.
+- `oxicuda-webgpu`: GPU readback used `let _ = device.poll(wait_indefinitely())`, silently discarding
+  a `PollError` (or hanging indefinitely) and letting the caller read a staging buffer that might not
+  have been written yet. It now waits on the specific `wgpu::SubmissionIndex` the copy itself produced,
+  with `PollError` propagated as a typed error.
+- `oxicuda-webgpu`: `batched_gemm`'s `stride_a`/`stride_b`/`stride_c` were cast to the shader's `u32`
+  uniform with a bare `as u32` (a stride above `u32::MAX` wrapped to a small value, so the kernel
+  silently read the wrong batch slice) and `batch_count` fed the Z dispatch dimension unchecked against
+  wgpu's 65535-per-axis limit. Both now go through a checked `dim_u32` conversion returning a typed
+  `Err` instead.
+- `oxicuda-webgpu`: `scan_wgsl`'s write stage guarded both elements of a thread's pair
+  (`output[base+2*tid]`, `output[base+2*tid+1]`) behind one `if (base + 2*tid < n)` check, so an odd
+  remainder within the final block (`base+2*tid < n <= base+2*tid+1`) let the second write land one
+  element past `n`. Each element now carries its own independent bound.
+- `oxicuda-dnn`: `conv::algo_select::select_algorithm` routed any 3x3, unit-stride/dilation, F32,
+  non-grouped convolution over the ~1 GFLOP profitability threshold — an ordinary mid-size CNN
+  layer, not an edge case — into `WinogradConv`, whose forward kernels were comment-only PTX
+  skeletons (`generate_input_transform_ptx`/`generate_output_transform_ptx` emitted only step-marker
+  `comment()` calls before `ret`, and `launch_winograd_gemm` launched no kernel at all), so
+  `conv_forward` returned `Ok(())` while leaving the output buffer completely untouched instead of
+  computing anything. The pre-existing test `select_3x3_large_winograd` had asserted this routing as
+  the correct outcome. First fixed defensively with a capability gate, `winograd_forward_implemented()`
+  (landed as a `const fn` returning `false`), that kept `select_algorithm`/`candidate_algorithms` from
+  ever returning `ConvAlgorithm::Winograd` until the engine had a real kernel body — both fell through
+  to `Im2colGemm`/`ImplicitGemm` instead, and a new regression test,
+  `conv_forward_winograd_eligible_shape_matches_cpu_oracle`, drove the public `conv_forward` entry
+  point with a genuinely Winograd-eligible, over-threshold shape to pin the honest fallback against
+  the `conv2d_ref` CPU oracle. Later in this same release, `WinogradConv` was implemented for real —
+  input transform, filter transform, a shared-memory-tiled batched GEMM over the 16 transform-domain
+  positions, and an output transform with bias — and `winograd_forward_implemented()` now returns
+  `true`. Two independent on-device validations (RTX A4000, sm_86) back the flip: relative-L2 error
+  `1.0e-7`-`1.7e-7` against the `f64` CPU oracle across 15 shapes (partial tiles, odd extents, `C==1`,
+  `K==1`, multi-batch, both supported paddings), and `7.9e-8`-`1.4e-6` against `ImplicitGemmConv` on
+  device including all four InSwapper-128-scale layers — three to four orders of magnitude inside the
+  documented `1e-4` budget. `conv_forward_winograd_eligible_shape_matches_cpu_oracle` survives from
+  the interim fix and now exercises real Winograd computation rather than the honest-fallback path it
+  originally pinned; the old routing-canary tests in `gpu_tests::conv_fprop` (an "honesty contract"
+  asserting an *untouched* output buffer as the passing outcome) are gone, superseded by a new
+  `gpu_tests::conv_winograd` module of real numeric-oracle assertions. `WINOGRAD_FLOP_THRESHOLD` —
+  the separate profitability gate that `winograd_forward_implemented()` doesn't replace — is
+  recalibrated from `1_000_000_000` to `10_000_000` based on the new `winograd_vs_implicit_gemm`
+  bench (see Added): below ~5e6 FLOPs every measured shape is launch-bound (Winograd issues four
+  kernels where implicit GEMM issues one), above ~1.9e7 Winograd wins by 1.5x+, growing with size.
+  `is_winograd_eligible` now delegates to `WinogradConv::supports` verbatim instead of restating its
+  own copy of the conditions (which had drifted: the restated version had no padding constraint; the
+  engine's real one caps padding at `<=1`), closing a selector/engine-disagreement class of bug by
+  construction. Selection priority changed again in the same release with the arrival of the tiled
+  implicit-GEMM engine (see Added, below), which now claims most 3x3 shapes ahead of Winograd —
+  Winograd remains the fallback for the shapes tiling declines (`groups > 1`, F64, NHWC, or too
+  small), where it is still 1.5-3.9x ahead of the scalar kernel.
+- `oxicuda-dnn`: `conv::api::conv_bn_relu` dispatched into `FusedConvBnAct::execute`, whose PTX body
+  (`emit_fused_body`) is a comment-only skeleton that narrates the convolution/BN/activation steps
+  but never loads, computes, or stores anything — so the public fused conv+BN+activation entry point
+  silently returned `Ok(())` while leaving `output` untouched. Fixed by decomposing `conv_bn_relu`
+  into a real `conv_forward` dispatch (with an internally-managed workspace) followed by a new
+  crate-private `apply_fused_bn_activation` epilogue kernel in `conv::fused` that applies the BN
+  affine transform and activation to `output` in place, in one combined elementwise pass over
+  NCHW/NHWC, reusing the activation math already validated for the MoE epilogue
+  (`moe::fused_moe::emit_activation_ptx`) rather than re-deriving it. Two new regression tests,
+  `conv_bn_relu_nchw_relu_matches_cpu_oracle` and `conv_bn_relu_nhwc_silu_matches_cpu_oracle`, drive
+  the public entry point end to end against a CPU oracle. `FusedConvBnAct`'s single-kernel body
+  remains an intentionally-documented skeleton and is not reachable from any public API.
+- `oxicuda-blas`: `level3::gemm::splitk`'s split-K partial-reduction machinery (`SplitKConfig`,
+  `generate_splitk_reduction_kernel`) was unit-tested in isolation, and `dispatch.rs`'s
+  `splitk_tile_config` even computed a split factor for the `SplitK` category, but
+  `GemmDispatcher::dispatch` never called any of it — every GEMM, including `Skinny`-category shapes
+  (small `M`/`N`, large `K`), launched only the single-pass kernel's one-thread-per-output-element
+  grid, capping the launch at `M*N` total threads regardless of `K`. For `M=1, K=25088, N=512` (an
+  ArcFace/InSwapper embedding projection) that is 512 threads on hardware that can schedule tens of
+  thousands concurrently, each thread serially reducing all 25088 elements. Fixed by adding a real
+  two-pass launch: a new `splitk::generate_splitk_partial_kernel` lets `gridDim.z` threads each
+  reduce a disjoint `K` sub-range into a scratch workspace, and a new
+  `GemmDispatcher::dispatch_skinny_split_k` routes `NoTrans`x`NoTrans` F32/F64 `Skinny` problems
+  with `M*N < 65,536` and `K >= 512` through it instead of the single-pass path. Measured ~17.6x on
+  the exact ArcFace shape (2525µs to 144µs/call, warm kernel cache, RTX A4000). New coverage:
+  `oxicuda-blas/tests/gemm_shape_sweep_gpu.rs` checks every element (not sampled) against an f64 CPU
+  oracle across an M/K/N sweep through the real `gemm()` entry point, including 1024^3/2048^3
+  (previously throughput-benchmarked only, never checked for numeric correctness).
+- `oxicuda-ptx`: `arch::SmVersion::max_threads_per_sm` and `max_shared_mem_per_block` grouped `Sm86`
+  (Ampere GA10x — RTX A4000/A5000/A6000/3080/3090) into the same match arm as `Sm80` (Ampere GA100 —
+  A100), overstating both figures for real GA10x silicon: 2048 threads/SM instead of 1536, and
+  163,840 shared-memory bytes/block instead of 101,376. Live-verified against a real RTX A4000
+  (driver 550.144.03, compute capability 8.6) via
+  `Device::max_threads_per_multiprocessor()`/`max_shared_memory_per_block_optin()`;
+  `oxicuda-launch`'s independently-maintained copy of the same table (`telemetry::SmVersion`)
+  already had the correct Sm86 figures from a prior release, corroborating these values. Concretely,
+  `oxicuda-blas`'s tensor-core tile selector could pick a `Tile256x128`/3-stage config requesting
+  147,456 shared-memory bytes for an Sm86 GEMM — legal under the wrong 163,840 budget but exceeding
+  the real 101,376-byte opt-in ceiling, which would fail `cuFuncSetAttribute`/kernel launch on real
+  hardware. Fixed by splitting `Sm86` into its own match arm (1536 threads/SM, 101,376 bytes,
+  matching `Sm89`). `max_threads_per_sm` previously had no test coverage at all, and
+  `max_shared_mem_per_block`'s test never exercised `Sm86`; new tests cover every `SmVersion`
+  variant exhaustively, a dedicated `Sm86`-vs-`Sm80` regression, a `gpu-tests`-gated on-device check
+  against live `cuDeviceGetAttribute` queries, and an `oxicuda-blas` regression pinning the
+  tensor-core tile-selection consequence.
+- `oxicuda-memory`: `aligned::AlignedBuffer::alloc` fabricated a synthetic device pointer on macOS
+  (`0x0000_0001_0000_0100`, "simulating" a 256-byte-aligned driver allocation) instead of calling
+  the driver, so callers got a fake `Ok` backed by no real device memory rather than an honest
+  error. It now calls `try_driver()` unconditionally on every platform, which naturally fails with
+  `CudaError::NotInitialized` on macOS (no CUDA driver there) — matching the contract already
+  followed by `NativeMemoryPool::new` and `VirtualMemoryReservation::reserve` elsewhere in this
+  crate. Tests updated accordingly (`alloc_default_alignment` ->
+  `alloc_default_alignment_fails_without_driver`, etc.); real allocation round-trip coverage moved
+  to a new `gpu-tests`-gated module for Linux/Windows+NVIDIA.
+- `oxicuda-driver`: `tests/macos_stub.rs` required both `target_os = "macos"` and the `gpu-tests`
+  feature to compile at all, but every test in the file asserts an *error* path (the driver failing
+  to load) and touches no GPU, so a plain `cargo test`/`cargo nextest run` on macOS never ran these
+  tests — `gpu-tests` is meant for real-hardware testing on Linux/Windows, not macOS's
+  driver-absence contract. Re-gated to `target_os = "macos"` alone, so the tests that pin macOS's
+  honest-failure behavior actually run under a plain test invocation.
+- `oxicuda-autotune`: `incremental::HardwareFingerprint::try_from_device` unconditionally returned
+  `Err(...)` on macOS, which `current()` catches and falls back to `synthetic()` — a fixed,
+  identical fingerprint for every Mac. Since the incremental-tuning result database is keyed on
+  `fingerprint_hash`, this silently treated tuning results measured on one Mac as valid on a
+  completely different Mac (e.g. M1 vs. M4 Max), defeating the exact staleness check the
+  fingerprint exists to catch. It now reads real Apple Silicon identity via `sysctl` (a plain
+  `std::process::Command` spawn, no FFI, no new dependency): `machdep.cpu.brand_string` for
+  `gpu_name`, `hw.model` for `compute_capability` (an extra discriminator, not a real CUDA value
+  here), `kern.osproductversion` for `driver_version`, and `hw.memsize` for `total_memory_mb`;
+  `clock_mhz`/`sm_count` stay `0` (documented as unavailable, not fabricated), and a failed
+  brand-string read still falls back to `synthetic()` via `current()` rather than a half-populated
+  fingerprint. New test `macos_current_does_not_collapse_to_synthetic` — "the core regression test
+  for the fix," per its own comment — plus fingerprint-stability/real-identity checks, all run
+  under plain `cargo test` on macOS (no `gpu-tests` feature needed).
+- `oxicuda-autotune`: `power_aware::NvidiaSmiMonitor::read_power` returned a hardcoded constant
+  `PowerReading` on macOS (power=150.0W, temp=45.0C, clock=1500MHz) "so the module compiles and
+  tests pass without a GPU," and the pre-existing test `nvidia_smi_monitor_macos_synthetic`
+  asserted those fabricated numbers as correct. Every energy-per-op, EDP, and perf-per-watt
+  computation downstream of a `PowerMonitor` depends on the reading being real, so this silently
+  degenerated power-aware autotuning to plain latency tuning while reporting confident-looking fake
+  wattage. It now returns `Err(AutotuneError::BenchmarkFailed(_))` on macOS, naming the requested
+  GPU index; callers wanting power data there for testing should construct a
+  `SyntheticPowerMonitor` explicitly instead, so the syntheticness is visible at the call site. The
+  renamed `nvidia_smi_monitor_macos_reports_unavailable` pins the honest failure, and a new
+  `benchmark_engine_with_nvidia_smi_monitor_propagates_macos_error` proves the error propagates
+  through `PowerAwareBenchmarkEngine::benchmark_with_power` rather than a fabricated result.
+- `oxicuda-metal`: the same cross-platform-reachability gap as the `oxicuda-driver`/
+  `tests/macos_stub.rs` fix above, in `backend/nn.rs`. `ConvParamsV2`/`AttnParamsV2` — whose field
+  order and types must exactly mirror the platform-independent MSL parameter-buffer generator —
+  were declared `#[cfg(target_os = "macos")]`, so the layout tests pinning that byte-for-byte
+  agreement silently never compiled, let alone ran, anywhere but macOS. Both structs are now
+  defined on every platform (`#[cfg_attr(not(target_os = "macos"), allow(dead_code))]`; only macOS
+  ever constructs one), so their layout tests run cross-platform. Making the module compile
+  everywhere also needed a non-macOS stand-in for `attention_simdgroups` — a new stub returning
+  `None` off macOS, since there is no threadgroup-memory budget to size a SIMD-group count against
+  without a real Metal device — so the shared numeric test module that calls it stays buildable
+  cross-platform. One test in `msl.rs`, `msl_v2_sources_compile_on_macos`, genuinely cannot compile
+  without the `metal` crate, which is itself declared `[target.'cfg(target_os = "macos")'.dependencies]`
+  in this crate's `Cargo.toml`; it gained the explicit `#[cfg(target_os = "macos")]` it had been
+  missing, so it no longer breaks the build this same commit made possible elsewhere in the file.
+- `oxicuda-blas`: `GemmDispatcher::compute_grid` massively under-provisioned the naive/grid-stride
+  GEMM kernel's launch, and `template_shared_mem_bytes` requested shared memory that kernel never
+  uses — two symptoms of one root cause. `compute_grid` sized the launch as if
+  `GemmTemplate::generate()`'s output were CTA-tiled (`ceil(n/tile_n) * ceil(m/tile_m)` CTAs), but
+  that kernel is actually one thread per output element with an internal grid-stride loop; for a
+  1024^3 F32 GEMM at the `Standard` 128x128 tile config that was only 64 CTAs (8,192 threads) each
+  grid-striding ~128 elements serially, on hardware that can run tens of thousands of threads
+  concurrently. Fixed by sizing the grid from device occupancy instead: `GRID_STRIDE_WAVES` (3)
+  full-device thread-occupancies (`sm_count * max_threads_per_sm`), clamped to total output elements
+  — measured 191 -> 747 GFLOPS at 1024^3 F32 from this fix alone (RTX A4000, per the shipped doc
+  comment). Separately, the same launch kind unconditionally computed
+  `(tile_m*tile_k + tile_k*tile_n) * elem_bytes * stages` dynamic shared-memory bytes for a kernel
+  with no `.shared` declaration at all, silently taxing CTA occupancy for zero benefit; a new
+  `GemmTemplate::uses_shared_memory_tiles()` capability flag (see Changed) now gates that computation
+  to `0` for every config `generate()` produces today.
+- `oxicuda-blas`: split-K GEMM's reduction workspace is now a bounded, reusable cache instead of an
+  alloc-per-call. This is further work on top of — not a repeat of — the split-K dispatcher-wiring
+  fix above: that fix made split-K *reachable*; this fix addresses two problems with it once reached.
+  First, `DeviceBuffer`'s classic `cuMemFree` (used on every prior per-call workspace) is a
+  device-wide barrier — it blocks until every operation on every stream completes — so every split-K
+  GEMM ended with an unwanted full-device sync, once per skinny GEMM per inference frame. Second,
+  `cuMemAlloc` is forbidden during CUDA stream capture (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`),
+  making every split-K GEMM — exactly the shape class (`m*n < 65536`, `k >= 512`) repeated
+  small-batch inference falls into — impossible to record into a CUDA graph at all;
+  `oxionnx-cuda`'s `graph_cache` depends on this fix. Fixed with a new
+  `Mutex<HashMap<SplitKWorkspaceKey, SplitKWorkspace>>` cache keyed on `(stream, output_type, element
+  count)`, entries kept for the dispatcher's lifetime (never resized/evicted) so a captured graph's
+  baked-in device pointer stays valid on replay, bounded by `SPLIT_K_WORKSPACE_MAX_ENTRIES=64` /
+  `SPLIT_K_WORKSPACE_MAX_BYTES=256 MiB` with a fallback to the historical (correct, merely slower and
+  non-capturable) per-call path beyond that. The lock is deliberately held across *both* kernel
+  launches of one split-K pair — without that, two concurrent same-shape split-K calls on one stream
+  could interleave as `partial(A), partial(B), reduce(A), reduce(B)`, making `reduce(A)` sum B's
+  partial results. New coverage: `oxicuda-blas/tests/splitk_workspace_gpu.rs`.
+- `oxicuda` (facade): the cached PTX-ops launch stream (backing `unary`/`binary`/`reduce`) was
+  created in the wrong CUDA context, and the wiring tests that should have caught it tolerated the
+  resulting error as an "environment" outcome. `oxicuda-driver`'s `create_stream_in_ctx` explicitly
+  force-binds its passed context via `cu_ctx_set_current` for the duration of `cuStreamCreate` and
+  restores the prior current context afterward — so which context is current *before* the call is
+  irrelevant. The pre-fix code called `Context::new(&device)` (a fresh throwaway context, itself left
+  current), then `backend.activate_gpu()` to re-bind the primary context, then `Stream::new(&token)`
+  — but since `token` was still the throwaway context, `Stream::new`'s own context-binding
+  unconditionally overrode `activate_gpu()`'s effect, permanently creating the stream in the
+  throwaway context rather than the primary context that actually owns the device memory and
+  JIT-loaded modules. Any kernel launch on that stream mismatching the primary context is rejected
+  by the driver with `CUDA_ERROR_INVALID_HANDLE`. This went undetected because the existing GPU
+  wiring tests treated `Err(BackendError::DeviceError(_))` as an acceptable "no GPU present" outcome
+  even after confirming a live context existed — swallowing the exact error the bug produced; only
+  one unrelated, unwrapping test (`compute::tests::default_backend_runs_a_real_compute_round_trip`)
+  caught it. Fixed by unifying BLAS, DNN, and now PTX-ops stream creation around one shared
+  `primary_context_token()` helper (renamed from `handle_context_token`), and by tightening every
+  `unary`/`binary`/`reduce`/`gemm`/`conv2d`/`attention` wiring test to stop accepting `DeviceError`
+  once a live context is confirmed present.
+- `oxicuda-ptx`: `BatchNormTemplate::generate` emitted `fma` PTX instructions with no rounding
+  modifier, which `ptxas` rejects outright ("Rounding modifier required for instruction 'fma'",
+  confirmed on real hardware) — affecting all three emission sites (variance accumulation,
+  training-mode and inference-mode scale/shift), both F32 and F64, both BN modes. Fixed with
+  `fma.rn` at all three sites, plus a new regression test
+  (`every_fma_instruction_carries_an_explicit_rounding_modifier`) that scans every emitted PTX line
+  for a bare unmodified `fma`. Caveat on blast radius:
+  `oxicuda-ptx::templates::batch_norm::BatchNormTemplate` has no caller anywhere in this workspace
+  outside its own tests — `oxicuda-dnn`'s actual, kernel-cache-wired `norm::batch_norm` generates its
+  PTX independently via `BodyBuilder` directly. So this was a real compile-time defect in a template
+  that, as far as this repo shows, nothing has ever actually invoked.
+
+### Changed
+
+- `oxicuda-metal`: `gemm`/`batched_gemm`/`gemm_f16` now dispatch through a runtime-parameterised v2
+  kernel family (`gemm_msl_v2`/`batched_gemm_msl_v2`, `GemmParamsV2`/`BatchedGemmParamsV2`) that
+  supports **all four transpose combinations** with padded (non-packed) leading dimensions. Previously
+  only `NoTrans` operands with tightly-packed leading dimensions were accepted; every other combination
+  correctly returned `BackendError::Unsupported` rather than a wrong answer, but is now actually
+  computed. `validate_gemm_layout` now only rejects a leading dimension smaller than the operand it
+  describes.
+- `oxicuda-metal`: `MetalDevice` now owns a single `MTLCommandQueue`, created once and shared by every
+  compute pipeline built against it, replacing a `new_command_queue()` call inside
+  `MetalComputePipeline::new` (one queue per pipeline).
+- `oxicuda-metal`: the pipeline cache is now a bounded 64-entry LRU (`PipelineCache`) keyed on a
+  zero-allocation semantic `PipelineKey::Builtin { kind, op, dtype }` for built-in kernels (source is
+  only generated on a cache miss) or the full source text for `PipelineKey::Custom` kernels —
+  replacing an unbounded cache keyed on a 64-bit `DefaultHasher` digest of the generated source.
+- `oxicuda-metal`: reductions over >= 4096 flat elements now take a two-pass GPU path
+  (`chunked_reduce_msl`): a first pass spreads work across up to 1024 threadgroups into a scratch
+  buffer, a second folds the partials, both encoded into one command buffer.
+- `oxicuda-metal`: FFT batch execution now allocates its input/output buffers once per `execute()`
+  call (sized for the whole batch) and encodes bit-reversal plus every butterfly stage into **one**
+  command buffer with a 2-D dispatch grid (`gid.y` selects the batch row), instead of reallocating and
+  committing once per batch element.
+- `oxicuda-metal`: dispatch grid/threadgroup sizing for GEMM (1-D and 2-D) now goes through a new
+  `DispatchPlanner`, built from a `MetalDevice::capabilities()` probe (`supportsFamily:` plus the
+  driver-reported threadgroup limits) instead of hardcoded constants, and clamped against each
+  pipeline's own `max_total_threads_per_threadgroup`/`thread_execution_width`.
+- `oxicuda-metal`: `MetalBufferInfo` now records its `MTLStorageMode`, and `copy_to_device` /
+  `copy_device_to_device` call `did_modify_range` after a host write when the mode is `Managed` (the
+  correct way to publish a CPU-side write to the GPU under that storage mode). Untestable on this
+  session's Apple Silicon hardware, where `Managed` does not exist as a storage mode — compile-verified
+  only.
+- `oxicuda-metal`: `MetalBackend` gained an opt-in asynchronous dispatch mode
+  (`set_async_dispatch`/`async_dispatch`/`inflight_count`) — a committed command buffer is tracked
+  instead of awaited immediately, and is only waited on at the next real synchronisation point
+  (`synchronize`, a host read/write, `free`, a custom-kernel launch, or backend drop). **Off by
+  default** (every op still blocks until the GPU finishes, as before).
+- `oxicuda-metal`: new `MetalExternalBuffer` type gives `register_external`/`import_buffer` the same
+  signature on every platform (an alias for `metal::Buffer` on macOS, an inert unit struct elsewhere),
+  removing a macOS-only API surface gap.
+- `oxicuda-metal`: the existing `numeric` module gains full IEEE-754 binary16 conversions
+  (`f32_to_f16_bits`/`f16_bits_to_f32`, correct subnormals/ties-to-even/overflow-to-infinity/NaN
+  preservation) and host-side bf16 pack/unpack; no MSL `bfloat` kernel ships yet (needs a Metal-3.1
+  compile gate).
+- `oxicuda-metal`: new fast-math control (`MslMathMode::{Fast,Precise}`, `with_math_mode`, a
+  `#pragma METAL fp math_mode(safe)` prelude) for reduction/softmax/layernorm/F64-emulated-GEMM kernel
+  generation; default is `Fast`.
+- `oxicuda-dnn`: every convolution engine wired to the new kernel cache (see Added) now derives its
+  launch's threads-per-block from `CachedKernel::launch_1d`, which queries
+  `cuOccupancyMaxPotentialBlockSize` against the compiled kernel (memoised per kernel, one query)
+  instead of using every engine's previously hard-coded `block_size = 256u32`. The policy
+  (`kernel_cache::elementwise_block_size`) snaps the driver's suggestion onto a warp-aligned ladder
+  (1024/512/256/128/64/32), then shrinks it toward a 64-thread floor when the problem can't produce
+  enough blocks to saturate every SM at the suggested size — otherwise a small batch-1 convolution
+  could be handed a 1024-thread block and collapse onto a single SM, slower than the 256 it
+  replaces. Falls back to exactly the legacy 256-thread geometry when the driver declines to answer,
+  so an unsupported device or driver reproduces the previous behavior byte for byte. A new test,
+  `occupancy_launch_covers_every_output_element`, proves grid coverage (`grid * block >= total`)
+  holds at every block size the policy can select, across sizes deliberately chosen to straddle
+  warp/block boundaries. This occupancy-derived policy is specific to `conv`'s engines; every other
+  kernel-generating module wired to the cache (see Added) keeps its own pre-existing launch geometry
+  and gains only the module/kernel cache itself — including kernels like `layer_norm`/`rms_norm`
+  that size shared memory from a fixed `blockDim.x` and cannot safely vary it this way.
+- `oxicuda-blas`/`oxicuda-dnn`: `DnnHandle` now shares one CUDA stream with its internal
+  `BlasHandle` by default, instead of two independently-created streams. Rationale stated directly
+  in `DnnHandle::build`'s doc: no in-repo caller ever exploited the old design's BLAS/DNN overlap,
+  while making the two-stream design *correct* required either an event join or — as the ONNX
+  execution provider did — a blocking `stream.synchronize()` per node, measured at 237 per frame
+  across the three face-pipeline models. With one shared queue, a `Conv -> Gemm` handoff is ordered
+  by stream semantics alone (no event, no host rendezvous), and a captured CUDA graph spanning the
+  pair is a linear chain rather than a fork/join. The old two-stream construction remains available
+  via a new `DnnHandle::with_split_blas_stream()` for a caller that genuinely wants overlap; a new
+  `DnnHandle::streams_unified()` lets a caller check which mode it has, and `join_blas_stream()`
+  becomes a no-op automatically when the streams are unified (skips the now-pointless
+  `cuEventRecord`/`cuStreamWaitEvent` pair). `oxicuda-driver`'s `Stream` gains reference-counted
+  clone semantics (`Arc<StreamInner>`, `Clone`, new `is_same_queue()`) so the two subsystems can
+  share one queue without either one owning it exclusively — previously `Stream` directly owned its
+  `CUstream` and was not `Clone` at all; cloning now yields a second handle to the *same* driver
+  queue, destroyed only when the last handle drops.
+- `oxicuda-blas`: `GemmDispatcher`/`BlasHandle` now use the real, live per-device SM count instead
+  of an architecture-typical guess. New `GemmDispatcher::new_with_sm_count(sm, sm_count)`;
+  `BlasHandle::new` queries `device.multiprocessor_count()` and uses it, falling back to the old
+  per-architecture table (`typical_sm_count`) only on query failure — because compute capability
+  alone doesn't determine SM count (sm_86 alone spans 46-SM to 84+-SM parts). This feeds directly
+  into the `compute_grid` fix above (see Fixed).
+- `oxicuda-ptx`: `GemmTemplate::generate_pipelined` renamed to `generate_pipelined_skeleton` with
+  substantially expanded documentation stating plainly that it is **not numerically functional** —
+  its `mma.sync`/FMA compute section reads fixed placeholder registers never loaded from the staged
+  tiles it also emits — and is dispatched by nothing in production; `oxicuda-blas`'s dispatcher only
+  ever calls `GemmTemplate::generate` (SIMT path) or the separate `SimtGemmBuilder`
+  (transposed/triangle-masked path). Unchanged in behavior: it was test-only before this rename and
+  remains test-only after (`oxicuda-blas/src/gpu_tests.rs`'s only caller). Pure clarity/naming
+  change.
+- `oxicuda-webgpu`: `WebGpuDevice::new`'s `request_device` error message now includes the adapter
+  name, backend, and device type. Root cause documented: on Linux, wgpu reaches an
+  NVIDIA/AMD/Intel GPU through the Vulkan *loader* (`libvulkan.so.1`), not the vendor driver
+  directly; without it installed, wgpu silently falls back to its OpenGL adapter, whose
+  `request_device` fails with the unhelpful "Parent device is lost" — indistinguishable from "no
+  GPU" without the backend name attached. No behavior change, diagnostics only.
+
+### Performance
+
+- `oxicuda-webgpu`: pipeline compilation was already cached; the new `backend_cache` module extends
+  that cache to also bundle each pipeline's group-0 bind-group layout (previously re-fetched via
+  `get_bind_group_layout` on every single dispatch), and adds a second cache layer on top: for calls
+  that repeat with the same operand handles — the common training/inference loop shape — it reuses the
+  `wgpu::BindGroup` itself by refreshing a dedicated uniform buffer with `write_buffer` instead of
+  rebuilding the bind group from scratch. Correctness rests on wgpu's queue-timeline ordering guarantee
+  and on buffer handles never being reused while referenced; verified on real Metal hardware by a new
+  dedicated regression test. Cache entries are evicted on `free()` so a freed buffer is not kept alive
+  by a stale cache entry.
+- `oxicuda-memory`: `DeviceBuffer::zeroed`/`copy_from_host` close a real data race — their
+  underlying `cuMemsetD8_v2`/`cuMemcpyHtoD_v2` calls are asynchronous with respect to the host and
+  enqueue onto the legacy default stream, while every `Stream` here is `CU_STREAM_NON_BLOCKING` and
+  therefore does not implicitly wait on it — but previously closed it with `cuCtxSynchronize()`,
+  which blocks until *every* stream in the current context has drained, serialising unrelated
+  concurrent work in any multi-stream pipeline. Replaced with a new `sync_legacy_stream()` helper
+  that calls `cuStreamSynchronize(NULL)`, waiting only on the legacy default stream the memset/copy
+  actually landed on. Proven on-device by a new `tests/legacy_stream_sync_gpu.rs`:
+  `zeroed_still_waits_for_the_legacy_stream` and
+  `copy_from_host_result_is_visible_to_a_non_blocking_stream` confirm the race stays closed, while
+  `zeroed_no_longer_waits_for_unrelated_streams` fails against the old `cuCtxSynchronize`
+  implementation and passes now — the live demonstration that an independent non-blocking stream is
+  no longer needlessly awaited.
+- `oxicuda-ptx`: the naive GEMM kernel's row/col recovery is now strength-reduced. Previously
+  recomputed `row = idx/N, col = idx%N` via 64-bit `div.u64`/`rem.u64` — no native 64-bit divide on
+  this hardware, so `ptxas` lowers each to a software long-division subroutine call — once per
+  output element per grid-stride iteration. Now computed once (32-bit, since a single thread's
+  `global_id`/`total_threads` both fit `u32`) and advanced per-iteration via cheap
+  add/compare/select carry logic. A new `GemmTemplate::uses_shared_memory_tiles()` capability flag
+  (currently `false` for every config `generate()` can produce; a structural test pins that it's
+  never accidentally true) lets a caller detect that this kernel never stages through shared memory
+  at all.
+
+### Added
+
+- `oxicuda-metal`: `backend/gpu_tests.rs` — on-device numeric tests comparing the new GPU dispatch
+  paths (conv2d, attention, both v2 GEMM families) against host f64 oracles on real hardware, plus
+  `tests/gpu_presence.rs` and four Criterion benchmarks (`gemm`/`reduce`/`conv2d`/`attention`).
+- `oxicuda-webgpu`: `backend_tests_gpu_ops.rs` / `backend_tests_pipeline.rs` /
+  `backend_tests_gemm_f16.rs` — dedicated regression coverage for the conv2d/attention GPU dispatch
+  grid, the new pipeline/bind-group cache (including the queue-timeline-ordering test above), and FP16
+  GEMM numerics; plus `tests/gpu_presence.rs` and the same four Criterion benchmarks as `oxicuda-metal`.
+- `oxicuda-backend`: the existing `registry` module (`BackendRegistry`/`BackendEntry`/
+  `SelectionRequest`, a side-effect-free capability-based backend selector already offering `select`,
+  `fallback_chain`, and `route` by `OpClass`) gains workload-size-aware routing —
+  `SelectionRequest::for_workload`/`BackendRegistry::select_for_workload` pin small workloads to the
+  CPU reference backend at *selection* time (before any GPU allocation happens), since below some byte
+  count a host-device round trip costs more than the kernel itself. An explicit `require_gpu` or `pin`
+  is never overridden by this narrowing.
+- `oxicuda`: new `compute` module (`default_backend`, `gpu_backend`, `backend_for_workload`,
+  `select_backend`, `compiled_in_kinds`, `default_registry`) — probes every backend compiled into the
+  build, ranks them through `oxicuda-backend`'s registry, and returns the best one already
+  initialised, so callers no longer need to know which GPU stack a given machine has.
+- `oxicuda-memory`: new `StagingBuffer` — a reusable, grow-on-demand page-locked host allocation for
+  hot-path H2D/D2H transfers (allocated on first use via `PinnedBuffer`, grown only when a larger
+  transfer arrives, then reused for every subsequent call), for workloads like a video-inference
+  pipeline that move the same tensor shapes host<->device hundreds of times per run.
+  `upload_with`/`download_into` let the caller fill or read page-locked memory directly with no
+  intermediate host copy (measured 1.55x-1.75x H2D and 1.77x-2.67x D2H over
+  `DeviceBuffer::copy_from_host`/`copy_to_host` on an RTX A4000, 150 KiB-4.7 MiB); the
+  `upload`/`download` slice-taking convenience wrappers auto-select between staging and the driver's
+  own pageable path via a new `auto_stage_max_bytes` threshold (default 512 KiB) because the
+  wrapper's extra host memcpy actually loses to the driver's pipelined pageable path above that
+  size. New `StagingPod` marker trait (implemented for the numeric primitives, plus
+  `half::f16`/`half::bf16` behind a new `half` feature on this crate) restricts the typed views to
+  types with no invalid bit patterns. Usage is observable via a new `StagingStats` counter
+  (allocations/staged transfers/direct transfers/bytes moved).
+- `oxicuda-dnn`: `DnnHandle` gains `synchronize_all()`, which blocks on both of the handle's streams
+  — its own launch stream and the stream `BlasHandle` uses internally (independent, non-blocking
+  streams at the time this method was added, so BLAS and DNN launches could overlap). The two were
+  both `CU_STREAM_NON_BLOCKING` and therefore never implicitly ordered against each other, so a
+  caller that dispatches through `DnnHandle::blas()` and then synchronizes only `DnnHandle::stream()`
+  could read back a result buffer before the kernel that fills it has actually run — this was not
+  hypothetical: two `oxionnx-cuda` call sites hit exactly this, reading back 439/512 wrong elements
+  at `M=1,K=25088,N=512`, 3220/4096 at `M=8`, and 3456/4096 at a 64x64x64 all-ones sanity check,
+  because they synchronized the idle stream instead of the one the GEMM actually ran on. (Later in
+  this same release the default construction path changed to share one queue instead — see Changed,
+  above — which closes this whole hazard class by construction for the common case;
+  `synchronize_all()` still blocks on both streams correctly either way, and stays necessary for a
+  handle built via the now-opt-in `DnnHandle::with_split_blas_stream()`.) `DnnHandle` also gains a
+  matched set of
+  staged-transfer methods — `upload_staged`/`upload_staged_with` and
+  `download_staged`/`download_staged_into`, plus `reserve_staging`/`staging_stats` — built on the
+  new `StagingBuffer`, each internally ordered against *both* streams via a new private
+  `join_blas_stream()` (records an event on the BLAS stream and has the launch stream wait on it — a
+  device-side dependency, so the host never blocks) rather than requiring the caller to remember
+  `synchronize_all()`. New coverage: `gpu_tests/handle_sync.rs`'s
+  `synchronize_all_makes_blas_dispatched_gemm_readback_correct` and `tests/handle_staging_gpu.rs`'s
+  `staged_readback_sees_a_gemm_dispatched_through_blas` both drive a real GEMM through
+  `DnnHandle::blas()` and prove the readback is correctly ordered without a manual
+  `synchronize_all()` call in the staged case.
+- `oxicuda-dnn`: new `kernel_cache` module gives `DnnHandle` an in-memory map from a code-generation
+  key to its compiled `Module`/`Kernel` (via `get_or_compile_module`/`get_or_compile_kernel`), so a
+  repeated call becomes a hash lookup and an `Arc` clone instead of a fresh `cuModuleLoadData` JIT
+  compile — measured at ~194µs per call on an RTX A4000, which dwarfs the single-digit-microsecond
+  kernels themselves in a batch-1 inference pipeline that re-invokes the same handful of kernels
+  every frame. It is the DNN analogue of the existing `BlasHandle::get_or_compile_module`. Now wired
+  into every kernel-generating module in the crate: `attn` (flash attention
+  forward/backward/decode/paged, GQA, MHA, RoPE/NeoX RoPE, sliding-window), `conv` (fprop
+  direct/im2col/implicit-GEMM/Winograd, dgrad/wgrad implicit-GEMM, the fused BN+activation
+  epilogue), `linear::fused_linear`, `moe` (fused MoE, permute, routing), `norm`
+  (batch/group/layer/RMS, fused), `pool` (adaptive/avg/global/max), `quantize` (block-scale, FP8,
+  INT4/NF4, INT8), `resize` (bicubic/bilinear/nearest), and `rnn` (GRU/LSTM). Because the cache key
+  must capture everything the generated PTX depends on, several kernel entry names (which double as
+  the cache key) were extended to fully discriminate their code-generation constants where they
+  didn't already — e.g. `Conv1x1`/`ImplicitGemmConv` now fold in channels-per-group, and the INT4
+  kernels fold in symmetric-vs-asymmetric mode — so a cache hit can never hand back a module
+  compiled for a different problem. New on-device regression coverage:
+  `repeated_conv_compiles_exactly_one_module` and `distinct_conv_shapes_on_one_handle_stay_correct`
+  (16 identical convolutions JIT once; four shapes differing only in code-gen immediates never
+  collide) in `gpu_tests/conv_fprop.rs`, plus unit tests pinning the naming contract
+  (`kernel_name_discriminates_every_codegen_constant`,
+  `int4_symmetric_and_asymmetric_never_share_an_entry_name`).
+- `oxicuda-dnn`: new CTA-tiled implicit-GEMM forward convolution engine
+  (`conv::fprop::tiled_implicit_gemm::{TiledConvPlan, TiledImplicitGemmConv}`). Computes the
+  identical conv-to-GEMM index mapping as the existing scalar `ImplicitGemmConv` (same
+  cross-correlation convention, same implicit zero-padding), but via a real register-blocked,
+  shared-memory-staged GEMM mainloop instead of one thread per output element. Orients the GEMM as
+  `M = C_out`, `N = flattened (batch, oh, ow)`, `K = (C_in, R, S)` — deliberately transposed from
+  the textbook `M = pixels` mapping so both the input staging and the output epilogue stay
+  coalesced (`st.global.v4.f32`). `TiledConvPlan::for_problem` is the sole, pure, unit-testable
+  selection decision: declines anything but F32/NCHW/`groups==1`/2-D, problems under
+  `MIN_GEMM_K=64`/`MIN_OUT_CHANNELS=24`, and non-profitable shapes unless the resulting grid is at
+  least `MIN_CTAS=32` CTAs even under `MIN_GEMM_N=4096`. Needs no workspace (static shared memory
+  only). Wired transparently inside `ImplicitGemmConv::execute` (constructed once at
+  `ImplicitGemmConv::new`/`build` time; production callers still see one engine) and as the new
+  highest-priority Rule 3 in `algo_select::select_algorithm`/`candidate_algorithms` — ahead of
+  Winograd (see Fixed), because the module's own measured comparison table
+  (`benches/conv_engine_gflops_regression.rs`) shows 5.7-8.0 TFLOPS for the tiled kernel against
+  1.7-3.5 TFLOPS for Winograd on the same five real face-pipeline 3x3 shapes (SCRFD/ArcFace/
+  InSwapper), both far above the ~900 GFLOPS scalar baseline. A new `ImplicitGemmConv::scalar_only`
+  constructor pins the old scalar path for oracle/benchmark use, and a process-wide kill switch
+  (`OXICUDA_DISABLE_TILED_CONV`) restores pre-tiling dispatch everywhere at once (this engine,
+  `algo_select`, and `oxionnx-cuda`'s `pick_engine`) for A/B measurement or bisecting a suspected
+  miscompare.
+- `oxicuda-ptx`: new reusable CTA-tiled f32 GEMM mainloop emitter (`templates::tiled_mainloop`) —
+  the template the engine above generates its body from. Deliberately operand-agnostic: callers
+  supply per-staging-slot global addresses and validity predicates via a `GlobalTap` callback,
+  which is what lets one emitter serve both a plain GEMM and a convolution's *implicit* im2col (a
+  padded/strided/dilated view that is never materialized). Fixed 256-thread CTA (16x16), canonical
+  128x128x8 tile with an 8x8 register tile/thread; the module doc documents three specific
+  bank-conflict-avoidance design decisions (row-fragment broadcast, split column-fragment groups,
+  padded A-staging pitch) as load-bearing, not stylistic. Its own module doc states it was written
+  to serve both `oxicuda-dnn`'s convolutions and `oxicuda-blas`'s `GemmDispatcher` — but as of this
+  release, only the conv engine above actually calls it; `oxicuda-blas` has no reference to it at
+  all.
+- `oxicuda-ptx`: new vectorized shared-memory and TF32-rounding builder primitives
+  (`builder::body_builder::vector_mem_ops`): `BodyBuilder::load_shared_f32x4`/`store_shared_f32x4`
+  (`ld`/`st.shared.v4.f32`, mirroring the pre-existing `load_global_f32x4`), `store_global_f32x4`
+  (the previously-missing store-side counterpart of `load_global_f32x4`), and `cvt_f32_to_tf32`
+  (`cvt.rna.tf32.f32` — specifically `.rna`, since `ptxas` rejects `.rn` for this conversion on
+  `sm_80`-`sm_89` and accepts it only from `sm_90`; a `mov.b32` truncation alternative is
+  documented as a real trap, ~1e-3 relative error, at the edge of `oxionnx-cuda`'s
+  shadow-verification tolerance). Backed by a new `RoundingMode::Rna` IR variant. `KernelBuilder`
+  gains a matching `shared_mem_aligned(name, ty, count, align)` for declaring the 16-byte-aligned
+  shared arrays `.v4` accesses require (plain `shared_mem` only guarantees `max(elem_size, 4)`). Of
+  these, `shared_mem_aligned` is genuinely wired into production (the tiled conv engine's
+  `conv_smem_a`/`conv_smem_b` declarations); `load_shared_f32x4`/`store_shared_f32x4`/
+  `store_global_f32x4`/`cvt_f32_to_tf32` currently have no caller anywhere in this workspace outside
+  their own unit/gpu-tests — legitimate, independently-tested library additions to a crate whose
+  product is its public API, just not yet consumed by any in-tree kernel generator.
+- `oxicuda-ptx`: new channel-broadcast and PRelu kernel templates
+  (`templates::channel_broadcast::{ChannelBroadcastTemplate, PReluTemplate}`) —
+  `out[i] = full[i] OP small[channel(i)]` for ONNX-style `[1,C,1,1]`-vs-`[1,C,H,W]` or
+  scalar-vs-tensor `Add`/`Sub`/`Mul`/`Div`, and the per-channel-slope generalization of `LeakyRelu`.
+  Wired into `templates::mod` (module + re-exports); like the vector-mem-ops above, no caller
+  elsewhere in this repo as of this release.
+- New benchmarks. `benches/winograd_vs_implicit_gemm.rs` is a genuine Criterion bench — same
+  buffers, warmed kernel cache, one `synchronize()` per sample — across a 16x spatial x 4x channel
+  sweep; it's the actual source of the recalibrated `WINOGRAD_FLOP_THRESHOLD` (see Fixed).
+  `benches/conv_engine_gflops_regression.rs` despite its name is not a Criterion bench and asserts
+  nothing — it's a hand-rolled `fn main()` (`harness = false`) that drives real ONNX-graph-derived
+  SCRFD/ArcFace/InSwapper shapes through every engine that claims them
+  (scalar/tiled/Conv1x1/Depthwise/Winograd) and prints a GFLOPS/%-of-peak/speedup table for manual
+  comparison; it guards nothing automatically in CI. Both skip cleanly with no GPU.
+
+### Known issues
+
+- `ComputeBackend::unary`'s contract is silent on whether `input_ptr == output_ptr` is permitted, and
+  the backends diverge: `MetalBackend` accepts the aliasing, `WebGpuBackend` rejects it with
+  `InvalidArgument` (wgpu forbids binding one buffer as both `read` and `read_write` in a single
+  dispatch). Portable callers must pass distinct buffers until the trait doc pins this down; both
+  crates' `tests/gpu_presence.rs` now do so deliberately. See `TODO.md` follow-ups.
+- `oxicuda-webgpu`: `gemm`/`reduce`/`conv2d_forward`/`attention` never synchronise per operation by
+  design. Issuing many such dispatches with no interleaved `synchronize()` can abort the *whole
+  process* — a panic inside `wgpu-core` (`queue.rs`, "timed out waiting on last submission"), not a
+  recoverable `Err`. No test covers this: nextest isolates each test in its own process, so per-process
+  submission counts stay too low to trigger it. It was reproduced from benchmark-shaped submission
+  loops, and the in-tree Criterion benches work around it by synchronising every iteration. Callers
+  driving sustained WebGPU workloads should do the same.
+- Reduction over a zero-length dimension is a three-way divergence, not a defined contract:
+  `CpuBackend` returns the op's identity, `MetalBackend` returns `InvalidArgument`, and
+  `WebGpuBackend` returns `Ok` while leaving the output untouched. All three are covered by
+  per-backend tests asserting the *observed* behaviour, so the divergence cannot regress silently.
+
 ## [0.5.4] - 2026-08-11
 
 This release adds a SIMD-flavored warp-vector expression layer to `oxicuda-ptx`'s builder DSL —
@@ -656,3 +1247,5 @@ This release adds no new crates (still 73). It is a depth pass: implementing gen
 
 **Umbrella (1 crate)**
 - `oxicuda` (19,614 SLoC, 494 tests): Re-exports all sub-crates, ComputeBackend trait with CudaBackend, OxiONNX GPU inference backend, ToRSh tensor backend, TrustformeRS transformer backend, global init/device pool
+
+[0.5.5]: https://github.com/cool-japan/oxicuda/releases/tag/v0.5.5

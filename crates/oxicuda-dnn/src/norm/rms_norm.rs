@@ -12,16 +12,15 @@
 //! LLM pre-norm architectures.
 
 use std::fmt::Write as FmtWrite;
-use std::sync::Arc;
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams};
+use oxicuda_launch::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 // ---------------------------------------------------------------------------
@@ -57,14 +56,13 @@ pub fn rms_norm<T: GpuFloat>(
     let (num_rows, hidden_dim) = extract_row_dims(input)?;
     validate_rms_args(input, gamma, output, hidden_dim)?;
 
-    let ptx_source = generate_rms_norm_ptx::<T>(handle.sm_version(), hidden_dim, false)?;
+    let sm = handle.sm_version();
     let kernel_name = rms_norm_kernel_name::<T>(hidden_dim, false);
-    let module = Arc::new(
-        Module::from_ptx(&ptx_source)
-            .map_err(|e| DnnError::LaunchFailed(format!("module load for rms_norm: {e}")))?,
-    );
-    let kernel = Kernel::from_module(module, &kernel_name)
-        .map_err(|e| DnnError::LaunchFailed(format!("kernel lookup for {kernel_name}: {e}")))?;
+    let kernel = handle
+        .get_or_compile_kernel(&cache_key(&kernel_name, sm), &kernel_name, || {
+            generate_rms_norm_ptx::<T>(sm, hidden_dim, false)
+        })
+        .map_err(|e| DnnError::LaunchFailed(format!("compile {kernel_name}: {e}")))?;
 
     let (grid, block) = launch_config(num_rows, hidden_dim);
     let params = LaunchParams::new(grid, block);
@@ -82,6 +80,7 @@ pub fn rms_norm<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("rms_norm: {e}")))?;
 
@@ -130,14 +129,13 @@ pub fn fused_add_rms_norm<T: GpuFloat>(
         });
     }
 
-    let ptx_source = generate_rms_norm_ptx::<T>(handle.sm_version(), hidden_dim, true)?;
+    let sm = handle.sm_version();
     let kernel_name = rms_norm_kernel_name::<T>(hidden_dim, true);
-    let module =
-        Arc::new(Module::from_ptx(&ptx_source).map_err(|e| {
-            DnnError::LaunchFailed(format!("module load for fused_add_rms_norm: {e}"))
-        })?);
-    let kernel = Kernel::from_module(module, &kernel_name)
-        .map_err(|e| DnnError::LaunchFailed(format!("kernel lookup for {kernel_name}: {e}")))?;
+    let kernel = handle
+        .get_or_compile_kernel(&cache_key(&kernel_name, sm), &kernel_name, || {
+            generate_rms_norm_ptx::<T>(sm, hidden_dim, true)
+        })
+        .map_err(|e| DnnError::LaunchFailed(format!("compile {kernel_name}: {e}")))?;
 
     let (grid, block) = launch_config(num_rows, hidden_dim);
     let params = LaunchParams::new(grid, block);
@@ -154,6 +152,7 @@ pub fn fused_add_rms_norm<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("fused_add_rms_norm: {e}")))?;
 

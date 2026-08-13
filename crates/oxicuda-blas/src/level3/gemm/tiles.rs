@@ -705,7 +705,23 @@ mod tests {
     fn tile_config_fits_shared_memory_for_all_sm() {
         // (sm_version, max_smem_bytes_for_test)
         // Use the real SmVersion::max_shared_mem_per_block() values.
-        let sm_versions = [SmVersion::Sm75, SmVersion::Sm80, SmVersion::Sm90];
+        //
+        // NOTE: this only checks internal *self*-consistency (the tile
+        // selector never requests more than `sm.max_shared_mem_per_block()`
+        // reports) -- it cannot catch `max_shared_mem_per_block()` itself
+        // reporting a value too large for the real chip, because both sides
+        // of the assertion below read from that same function. Sm86/Sm89
+        // are included here mainly so the *shape/stage selection* logic is
+        // exercised for the "GA10x-class" budget, not to validate the budget
+        // number itself; see `sm86_tensor_core_tile_respects_real_hardware_shared_mem_limit`
+        // for a test that pins the literal hardware ceiling independently.
+        let sm_versions = [
+            SmVersion::Sm75,
+            SmVersion::Sm80,
+            SmVersion::Sm86,
+            SmVersion::Sm89,
+            SmVersion::Sm90,
+        ];
         let problems: &[(u32, u32, u32)] = &[
             (128, 128, 128),
             (512, 512, 512),
@@ -740,6 +756,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression test for the Sm86 shared-memory constant bug (GA10x wrongly
+    /// treated as GA100).
+    ///
+    /// Ampere GA10x (`Sm86`: RTX A4000/A5000/A6000/3080/3090) opts in to at
+    /// most 101,376 bytes of shared memory per block -- confirmed live
+    /// against this machine's real RTX A4000 via
+    /// `Device::max_shared_memory_per_block_optin()` -- which is far less
+    /// than GA100 (`Sm80`: A100)'s 163,840 bytes.
+    ///
+    /// Before `SmVersion::Sm86` had its own `max_shared_mem_per_block()` arm
+    /// (it was grouped into `Sm80`'s), `TileSelector::select_k_and_stages`
+    /// (via `max_stages_for_smem`) used the GA100 ceiling to budget pipeline
+    /// stages for GA10x hardware. For a "both-large, slightly-tall" tensor
+    /// core problem this picked `Tile256x128` with 3 pipeline stages --
+    /// `(256*32 + 32*128) * 4 bytes * 3 stages = 147,456 bytes` -- which fit
+    /// under the wrongly-reported 163,840-byte budget but exceeds the real
+    /// 101,376-byte opt-in ceiling. A `cuFuncSetAttribute
+    /// (CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 147_456)` call for
+    /// that kernel would fail on real Sm86 silicon.
+    ///
+    /// This test intentionally hardcodes the real, live-queried hardware
+    /// ceiling instead of calling `SmVersion::max_shared_mem_per_block()`
+    /// (that indirection is exactly what let the original bug hide from the
+    /// self-consistency test above), so it fails again if `arch.rs` ever
+    /// regresses back to sharing Sm80's match arm.
+    #[test]
+    fn sm86_tensor_core_tile_respects_real_hardware_shared_mem_limit() {
+        const RTX_A4000_MAX_SHARED_MEM_OPTIN_BYTES: u32 = 101_376;
+
+        let sel = tc_selector(SmVersion::Sm86);
+        // Both dimensions > 512, aspect ratio 1536/1024 = 1.5 (in the
+        // "slightly tall" 1.3..=2.0 band) -> Tile256x128, see
+        // `select_tile_shape`.
+        let tc = sel.select(1536, 1024, 1024);
+        assert_eq!(tc.tile_m, 256, "expected Tile256x128 to be selected");
+        assert_eq!(tc.tile_n, 128, "expected Tile256x128 to be selected");
+        assert!(tc.use_tensor_core);
+
+        let elem_bytes = 4u32; // f32, matches max_stages_for_smem's own estimate
+        let total_smem = (tc.tile_m * tc.tile_k + tc.tile_k * tc.tile_n) * elem_bytes * tc.stages;
+        assert!(
+            total_smem <= RTX_A4000_MAX_SHARED_MEM_OPTIN_BYTES,
+            "Sm86 tile {}x{}x{} with {} stages requests {} bytes of shared memory, \
+             but real GA10x hardware (RTX A4000, live-queried) only allows {} bytes \
+             per block opt-in -- cuFuncSetAttribute/launch would fail on real hardware \
+             even though this fit under the old GA100-derived budget",
+            tc.tile_m,
+            tc.tile_n,
+            tc.tile_k,
+            tc.stages,
+            total_smem,
+            RTX_A4000_MAX_SHARED_MEM_OPTIN_BYTES,
+        );
     }
 
     /// Verify Ampere gets at most 3 stages and Turing at most 2 stages for TC.

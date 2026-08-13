@@ -3,15 +3,13 @@
 //! Each output thread computes its source pixel via floor division of
 //! the scaled coordinates. No interpolation is performed.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 use crate::tensor_util::{nchw_dims, nchw_dims_mut};
 use crate::types::{TensorDesc, TensorDescMut};
@@ -46,10 +44,11 @@ pub fn resize_nearest<T: GpuFloat>(
         return Ok(());
     }
 
-    let ptx = generate_nearest_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let name = format!("dnn_resize_nearest_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &name)?;
+    let kernel =
+        handle.get_or_compile_kernel(&cache_key(&name, handle.sm_version()), &name, || {
+            generate_nearest_ptx::<T>(handle.sm_version())
+        })?;
 
     let grid = grid_size_for(total, RESIZE_BLOCK);
     let params = LaunchParams::new(grid, RESIZE_BLOCK);
@@ -59,6 +58,7 @@ pub fn resize_nearest<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("resize_nearest: {e}")))?;
 

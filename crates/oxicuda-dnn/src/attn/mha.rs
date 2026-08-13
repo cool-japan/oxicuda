@@ -10,12 +10,9 @@
 //! which is memory-intensive for long sequences but correct for any length.
 //! For sequences longer than ~512, prefer [`super::flash_attn`].
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
 use oxicuda_driver::ffi::CUdeviceptr;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::builder::BodyBuilder;
 use oxicuda_ptx::ir::Register;
@@ -23,6 +20,7 @@ use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::{cache_key, cache_key_with};
 use crate::ptx_helpers::{
     load_float_imm, load_global_float, mul_float, store_global_float, sub_float,
 };
@@ -82,14 +80,16 @@ pub fn multi_head_attention<T: GpuFloat>(
 
     // --- Step 1: Compute S = Q @ K^T (unscaled; scale+mask applied next) ---
     let s_kernel_name = format!("mha_qk_gemm_{}", T::NAME);
-    let s_ptx = generate_qk_gemm_ptx::<T>(&s_kernel_name, handle.sm_version())?;
-    let s_module = Arc::new(Module::from_ptx(&s_ptx)?);
-    let s_kernel = Kernel::from_module(s_module, &s_kernel_name)?;
+    let s_kernel = handle.get_or_compile_kernel(
+        &cache_key(&s_kernel_name, handle.sm_version()),
+        &s_kernel_name,
+        || generate_qk_gemm_ptx::<T>(&s_kernel_name, handle.sm_version()),
+    )?;
 
     let qk_grid = grid_size_for(s_elements as u32, block_dim);
     let qk_params = LaunchParams::new(qk_grid, block_dim);
 
-    s_kernel.launch(
+    s_kernel.kernel().launch(
         &qk_params,
         handle.stream(),
         &(
@@ -104,16 +104,24 @@ pub fn multi_head_attention<T: GpuFloat>(
 
     // --- Step 2-3: Scale and apply mask (in-place on the scratch buffer) ---
     let scale_kernel_name = format!("mha_scale_mask_{}", T::NAME);
-    let scale_ptx =
-        generate_scale_mask_ptx::<T>(&scale_kernel_name, handle.sm_version(), mask.is_some())?;
-    let scale_module = Arc::new(Module::from_ptx(&scale_ptx)?);
-    let scale_kernel = Kernel::from_module(scale_module, &scale_kernel_name)?;
+    // `has_mask` selects a different epilogue inside the generated PTX but is
+    // absent from the entry name, so it has to be part of the cache key.
+    let has_mask = mask.is_some();
+    let scale_kernel = handle.get_or_compile_kernel(
+        &cache_key_with(
+            &scale_kernel_name,
+            handle.sm_version(),
+            &format!("mask={has_mask}"),
+        ),
+        &scale_kernel_name,
+        || generate_scale_mask_ptx::<T>(&scale_kernel_name, handle.sm_version(), has_mask),
+    )?;
 
     let scale_grid = grid_size_for(s_elements as u32, block_dim);
     let scale_params = LaunchParams::new(scale_grid, block_dim);
 
     let mask_ptr: CUdeviceptr = mask.map_or(0, |m| m.ptr);
-    scale_kernel.launch(
+    scale_kernel.kernel().launch(
         &scale_params,
         handle.stream(),
         &(scores_ptr, mask_ptr, s_elements as u32, sm_scale),
@@ -121,15 +129,17 @@ pub fn multi_head_attention<T: GpuFloat>(
 
     // --- Step 4: Row-wise softmax (in-place on the scratch buffer) ---
     let softmax_kernel_name = format!("mha_softmax_{}", T::NAME);
-    let softmax_ptx = generate_row_softmax_ptx::<T>(&softmax_kernel_name, handle.sm_version())?;
-    let softmax_module = Arc::new(Module::from_ptx(&softmax_ptx)?);
-    let softmax_kernel = Kernel::from_module(softmax_module, &softmax_kernel_name)?;
+    let softmax_kernel = handle.get_or_compile_kernel(
+        &cache_key(&softmax_kernel_name, handle.sm_version()),
+        &softmax_kernel_name,
+        || generate_row_softmax_ptx::<T>(&softmax_kernel_name, handle.sm_version()),
+    )?;
 
     let softmax_rows = total_heads * seq_len;
     let softmax_grid = grid_size_for(softmax_rows, block_dim);
     let softmax_params = LaunchParams::new(softmax_grid, block_dim);
 
-    softmax_kernel.launch(
+    softmax_kernel.kernel().launch(
         &softmax_params,
         handle.stream(),
         &(scores_ptr, seq_len, softmax_rows),
@@ -137,15 +147,17 @@ pub fn multi_head_attention<T: GpuFloat>(
 
     // --- Step 5: Compute O = P @ V ---
     let ov_kernel_name = format!("mha_pv_gemm_{}", T::NAME);
-    let ov_ptx = generate_pv_gemm_ptx::<T>(&ov_kernel_name, handle.sm_version())?;
-    let ov_module = Arc::new(Module::from_ptx(&ov_ptx)?);
-    let ov_kernel = Kernel::from_module(ov_module, &ov_kernel_name)?;
+    let ov_kernel = handle.get_or_compile_kernel(
+        &cache_key(&ov_kernel_name, handle.sm_version()),
+        &ov_kernel_name,
+        || generate_pv_gemm_ptx::<T>(&ov_kernel_name, handle.sm_version()),
+    )?;
 
     let ov_elements = total_heads as usize * seq_len as usize * head_dim as usize;
     let ov_grid = grid_size_for(ov_elements as u32, block_dim);
     let ov_params = LaunchParams::new(ov_grid, block_dim);
 
-    ov_kernel.launch(
+    ov_kernel.kernel().launch(
         &ov_params,
         handle.stream(),
         &(

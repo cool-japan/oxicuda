@@ -100,6 +100,27 @@ impl MetalGpuFamily {
     pub fn simd_width(self) -> usize {
         32
     }
+
+    /// The numeric generation in the family's Metal name: `Apple7` → `7`,
+    /// `Mac2` → `2`.
+    ///
+    /// Metal has no CUDA-style *compute capability*, so this is what
+    /// `MetalBackend::available_devices` reports in
+    /// [`oxicuda_backend::DeviceInfo::compute_capability`]'s major slot — a real
+    /// driver-probed number rather than an invented version. The minor slot is
+    /// always `0`; the two families are not comparable across the `Apple`/`Mac`
+    /// split, so do not order devices by this value alone.
+    pub fn generation(self) -> u32 {
+        match self {
+            Self::Apple4 => 4,
+            Self::Apple5 => 5,
+            Self::Apple6 => 6,
+            Self::Apple7 => 7,
+            Self::Apple8 => 8,
+            Self::Apple9 => 9,
+            Self::Mac2 => 2,
+        }
+    }
 }
 
 impl fmt::Display for MetalGpuFamily {

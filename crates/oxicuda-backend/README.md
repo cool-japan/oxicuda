@@ -22,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxicuda-backend = "0.4.1"
+oxicuda-backend = "0.5.5"
 ```
 
 ```rust
@@ -48,8 +48,8 @@ fn run_gemm(backend: &dyn ComputeBackend) -> BackendResult<()> {
 
 ## Status
 
-- **Version**: 0.3.0 (2026-06-25)
-- **Tests**: 101 passing
+- **Version**: 0.5.5 (2026-08-13)
+- **Tests**: 106 passing
 
 ## License
 

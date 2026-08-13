@@ -51,6 +51,113 @@ pub(crate) struct MetalBufferInfo {
     /// Whether this manager owns the allocation (and may release it) or is only
     /// borrowing an external buffer via its own retain.
     pub(crate) ownership: BufferOwnership,
+    /// The buffer's Metal storage mode.
+    ///
+    /// [`MetalMemoryManager::alloc`] always produces `Shared` buffers, but
+    /// [`MetalMemoryManager::import_external`] accepts a caller-provided
+    /// `Managed` buffer (Intel / discrete Macs), where a host write is **not**
+    /// visible to the GPU until it is published with `didModifyRange:`.
+    #[cfg(target_os = "macos")]
+    pub(crate) storage_mode: metal::MTLStorageMode,
+}
+
+/// Publish a host write to `buffer` so the GPU-side copy of a `Managed` buffer
+/// sees it.
+///
+/// On `Shared` (and `Memoryless`/`Private`, which never reach here) storage this
+/// is a no-op: Apple Silicon's unified memory needs no explicit publication. On
+/// a `Managed` buffer — the only CPU-writable mode on Intel / discrete Macs —
+/// skipping `didModifyRange:` leaves the GPU reading the stale mirror.
+#[cfg(target_os = "macos")]
+fn publish_host_write(buffer: &metal::Buffer, mode: metal::MTLStorageMode, len: usize) {
+    if mode == metal::MTLStorageMode::Managed && len > 0 {
+        buffer.did_modify_range(metal::NSRange::new(0, len as u64));
+    }
+}
+
+// ─── Buffer reuse pool ───────────────────────────────────────────────────────
+
+/// Default byte budget retained by the free-list pool.
+///
+/// Reached only if a workload frees that much without re-allocating it; every
+/// pooled byte is memory the process keeps mapped, so the budget is what bounds
+/// the pool's growth.
+pub const DEFAULT_POOL_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Maximum buffers retained in one exact-size bucket.
+///
+/// Stops a single hot size from consuming the whole byte budget and starving
+/// every other size.
+///
+/// Off macOS no allocation ever succeeds, so no pool exists to bound.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MAX_BUFFERS_PER_BUCKET: usize = 16;
+
+/// A size-bucketed free list of released `MTLBuffer`s.
+///
+/// Buckets are keyed on the **exact** byte length, not a rounded-up power of
+/// two. Rounding would let one allocation of `n` bytes serve a later request for
+/// anything in `(n/2, n]`, but it also forces every allocation to physically
+/// reserve its rounded size — up to 2× the requested memory, live, for the whole
+/// lifetime of the handle. On a unified-memory Mac that inflation comes straight
+/// out of the same pool the application is running in, so exact buckets are the
+/// right trade: no waste at all, and they still capture the pattern that
+/// actually dominates (same-shape temporaries allocated and freed every
+/// iteration — `dispatch_reduce_flat`'s scratch buffer is one such caller inside
+/// this very crate).
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct BufferPool {
+    buckets: HashMap<u64, Vec<metal::Buffer>>,
+    pooled_bytes: u64,
+    capacity_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl BufferPool {
+    fn new(capacity_bytes: u64) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            pooled_bytes: 0,
+            capacity_bytes,
+        }
+    }
+
+    /// Remove and return a buffer of exactly `size` bytes, if one is pooled.
+    fn take(&mut self, size: u64) -> Option<metal::Buffer> {
+        let bucket = self.buckets.get_mut(&size)?;
+        let buffer = bucket.pop()?;
+        if bucket.is_empty() {
+            self.buckets.remove(&size);
+        }
+        self.pooled_bytes = self.pooled_bytes.saturating_sub(size);
+        Some(buffer)
+    }
+
+    /// Offer `buffer` (of exactly `size` bytes) to the pool.
+    ///
+    /// Returns `false` when the pool declined it — the caller then simply drops
+    /// the buffer, releasing the memory as before.
+    fn put(&mut self, size: u64, buffer: metal::Buffer) -> bool {
+        if size == 0 || self.pooled_bytes + size > self.capacity_bytes {
+            return false;
+        }
+        let bucket = self.buckets.entry(size).or_default();
+        if bucket.len() >= MAX_BUFFERS_PER_BUCKET {
+            return false;
+        }
+        bucket.push(buffer);
+        self.pooled_bytes += size;
+        true
+    }
+
+    /// Drop every pooled buffer, returning the number of bytes released.
+    fn clear(&mut self) -> u64 {
+        let released = self.pooled_bytes;
+        self.buckets.clear();
+        self.pooled_bytes = 0;
+        released
+    }
 }
 
 // ─── Memory manager ──────────────────────────────────────────────────────────
@@ -61,6 +168,21 @@ pub(crate) struct MetalBufferInfo {
 /// accessible from both CPU and GPU without explicit synchronisation — the same
 /// model used by Metal's unified-memory architecture on Apple Silicon.
 ///
+/// # Buffer reuse
+///
+/// [`free`](Self::free) returns an owned buffer to a bounded, size-bucketed free
+/// list instead of releasing it, and [`alloc`](Self::alloc) reuses a pooled
+/// buffer of the same exact size when one is available — `newBufferWithLength:`
+/// is a driver call that maps fresh pages, and a workload that allocates and
+/// frees the same shapes every iteration pays it on every iteration otherwise.
+/// The pool holds at most [`DEFAULT_POOL_CAPACITY_BYTES`] (configurable via
+/// [`with_pool_capacity`](Self::with_pool_capacity)) and can be emptied at any
+/// time with [`trim_pool`](Self::trim_pool).
+///
+/// A reused buffer is **zeroed** before it is handed out, so `alloc`'s
+/// observable behaviour is exactly what it was before pooling existed and no
+/// caller can accidentally read a previous allocation's data.
+///
 /// All public methods take `&self` so the manager can be shared behind `Arc`.
 pub struct MetalMemoryManager {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -68,15 +190,74 @@ pub struct MetalMemoryManager {
     buffers: Mutex<HashMap<u64, MetalBufferInfo>>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     next_handle: AtomicU64,
+    /// Free list of released owned buffers, keyed by exact byte size.
+    #[cfg(target_os = "macos")]
+    pool: Mutex<BufferPool>,
 }
 
 impl MetalMemoryManager {
-    /// Create a new memory manager backed by `device`.
+    /// Create a new memory manager backed by `device`, with the default
+    /// [`DEFAULT_POOL_CAPACITY_BYTES`] reuse budget.
     pub fn new(device: Arc<MetalDevice>) -> Self {
+        Self::with_pool_capacity(device, DEFAULT_POOL_CAPACITY_BYTES)
+    }
+
+    /// Create a memory manager whose free-list pool retains at most
+    /// `pool_capacity_bytes` of released buffers.
+    ///
+    /// Pass `0` to disable reuse entirely (every [`free`](Self::free) then
+    /// releases its buffer immediately, the pre-pooling behaviour).
+    pub fn with_pool_capacity(device: Arc<MetalDevice>, pool_capacity_bytes: u64) -> Self {
+        // Off macOS there is no Metal and `alloc` never succeeds, so the pool
+        // does not exist and the capacity is accepted-and-ignored.
+        #[cfg(not(target_os = "macos"))]
+        let _ = pool_capacity_bytes;
         Self {
             device,
             buffers: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
+            #[cfg(target_os = "macos")]
+            pool: Mutex::new(BufferPool::new(pool_capacity_bytes)),
+        }
+    }
+
+    /// Bytes currently held in the reuse pool (allocated but not handed out).
+    ///
+    /// Always `0` off macOS, where no allocation ever succeeds.
+    pub fn pooled_bytes(&self) -> u64 {
+        #[cfg(target_os = "macos")]
+        {
+            self.pool.lock().map(|p| p.pooled_bytes).unwrap_or(0)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    /// Release every buffer held in the reuse pool, returning the byte count
+    /// freed.
+    ///
+    /// Live handles are unaffected — only buffers already returned by
+    /// [`free`](Self::free) sit in the pool. Call this to hand memory back to
+    /// the system under pressure, or between phases with very different
+    /// allocation shapes.
+    ///
+    /// # Errors
+    /// [`MetalError::CommandBufferError`] if the pool mutex was poisoned by a
+    /// panic in another thread.
+    pub fn trim_pool(&self) -> MetalResult<u64> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut pool = self
+                .pool
+                .lock()
+                .map_err(|_| MetalError::CommandBufferError("pool mutex poisoned".into()))?;
+            Ok(pool.clear())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(0)
         }
     }
 
@@ -95,13 +276,79 @@ impl MetalMemoryManager {
     /// Allocate `bytes` bytes of shared-mode device memory.
     ///
     /// Returns an opaque handle.  The caller must eventually call [`free`](Self::free).
+    ///
+    /// # Errors
+    /// * [`MetalError::InvalidArgument`] if `bytes == 0` — `newBufferWithLength:`
+    ///   returns nil for a zero length.
+    /// * [`MetalError::OutOfMemory`] if `bytes` exceeds the device's
+    ///   `maxBufferLength`, or if the driver could not satisfy the request.
+    /// * [`MetalError::UnsupportedPlatform`] on non-macOS.
     pub fn alloc(&self, bytes: usize) -> MetalResult<u64> {
         #[cfg(target_os = "macos")]
         {
-            let buffer = self
-                .device
-                .device
-                .new_buffer(bytes as u64, metal::MTLResourceOptions::StorageModeShared);
+            // These guards MUST run *before* `new_buffer`: metal-rs builds its
+            // `Buffer` with `NonNull::new_unchecked`, so a nil return from
+            // `newBufferWithLength:options:` is already wrapped in a null
+            // `NonNull` by the time it reaches us and the later
+            // `contents()` memcpy would write to address 0. `newBufferWithLength:`
+            // returns nil for length 0, for length > maxBufferLength, and on a
+            // genuine allocation failure — the first two are checkable up front.
+            if bytes == 0 {
+                return Err(MetalError::InvalidArgument(
+                    "allocation size must be > 0".into(),
+                ));
+            }
+            let max_len = self.device.max_buffer_length();
+            if bytes as u64 > max_len {
+                tracing::warn!(
+                    requested = bytes,
+                    max_buffer_length = max_len,
+                    "Metal allocation exceeds the device's maximum buffer length"
+                );
+                return Err(MetalError::OutOfMemory);
+            }
+            // Reuse an identically-sized buffer from the free list when one is
+            // available, so a workload that cycles the same shapes pays the
+            // driver's `newBufferWithLength:` cost once rather than per
+            // iteration.
+            let pooled = self
+                .pool
+                .lock()
+                .map_err(|_| MetalError::CommandBufferError("pool mutex poisoned".into()))?
+                .take(bytes as u64);
+            let buffer = match pooled {
+                Some(buffer) => {
+                    // Zero the reused pages so `alloc` looks exactly as it did
+                    // before pooling existed: no caller can observe a previous
+                    // allocation's bytes. `length() == bytes` holds because the
+                    // buckets are keyed on the exact size.
+                    // SAFETY: the buffer came from this manager's own `alloc`,
+                    // so it is a live Shared-storage buffer of exactly `bytes`
+                    // bytes with a non-null `contents()`.
+                    unsafe {
+                        std::ptr::write_bytes(buffer.contents() as *mut u8, 0, bytes);
+                    }
+                    publish_host_write(&buffer, metal::MTLStorageMode::Shared, bytes);
+                    tracing::trace!(bytes, "reused a pooled Metal buffer");
+                    buffer
+                }
+                None => self
+                    .device
+                    .device
+                    .new_buffer(bytes as u64, metal::MTLResourceOptions::StorageModeShared),
+            };
+            // Defence in depth for the third case (a genuine driver-side
+            // failure), which cannot be predicted from the request alone:
+            // messaging a nil Objective-C receiver yields 0 / null, so a nil
+            // buffer reports length 0 and null contents. Reject it here rather
+            // than handing the caller a handle that segfaults on first copy.
+            if buffer.length() < bytes as u64 || buffer.contents().is_null() {
+                tracing::warn!(
+                    requested = bytes,
+                    "Metal buffer allocation failed (driver returned a nil or short buffer)"
+                );
+                return Err(MetalError::OutOfMemory);
+            }
             let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
             self.buffers
                 .lock()
@@ -112,6 +359,7 @@ impl MetalMemoryManager {
                         buffer,
                         size: bytes as u64,
                         ownership: BufferOwnership::Owned,
+                        storage_mode: metal::MTLStorageMode::Shared,
                     },
                 );
             Ok(handle)
@@ -174,6 +422,7 @@ impl MetalMemoryManager {
                     buffer: retained,
                     size: len_bytes as u64,
                     ownership: BufferOwnership::External,
+                    storage_mode: mode,
                 },
             );
         Ok(handle)
@@ -199,6 +448,24 @@ impl MetalMemoryManager {
             // (external); in the external case the caller's buffer survives.
             match info.ownership {
                 BufferOwnership::Owned => {
+                    // Offer the buffer to the reuse pool instead of releasing it.
+                    // ONLY owned buffers are poolable: an external import's
+                    // memory belongs to the caller, who may free or mutate it the
+                    // moment we hand the handle back, so retaining it in a pool
+                    // and later serving it to an unrelated `alloc` would alias
+                    // someone else's live memory.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let pooled = match self.pool.lock() {
+                            Ok(mut pool) => pool.put(info.size, info.buffer.to_owned()),
+                            Err(_) => {
+                                tracing::warn!("pool mutex poisoned; releasing buffer directly");
+                                false
+                            }
+                        };
+                        tracing::trace!(handle, pooled, "released owned Metal buffer");
+                    }
+                    #[cfg(not(target_os = "macos"))]
                     tracing::trace!(handle, "freed owned Metal buffer");
                 }
                 BufferOwnership::External => {
@@ -209,7 +476,9 @@ impl MetalMemoryManager {
                 }
             }
             // `info` (and its `metal::Buffer`, on macOS) drops at the end of this
-            // block, releasing the manager's single retain.
+            // block, releasing the manager's single retain. When the pool
+            // accepted the buffer it holds an independent retain of its own, so
+            // the memory survives for the next `alloc`.
         }
         Ok(())
     }
@@ -241,7 +510,7 @@ impl MetalMemoryManager {
             // section — concurrent alloc/free/copy on unrelated handles are not
             // serialised behind this transfer, and the retain guarantees the
             // buffer cannot be freed out from under the copy.
-            let buffer = {
+            let (buffer, mode) = {
                 let buffers = self
                     .buffers
                     .lock()
@@ -256,7 +525,7 @@ impl MetalMemoryManager {
                         info.size
                     )));
                 }
-                info.buffer.to_owned()
+                (info.buffer.to_owned(), info.storage_mode)
             };
             // SAFETY: Metal Shared/Managed buffers are CPU-accessible; `contents()`
             // returns a valid `*mut c_void` for the buffer's lifetime, which the
@@ -269,6 +538,9 @@ impl MetalMemoryManager {
                     src.len(),
                 );
             }
+            // Publish the write for Managed (Intel / discrete Mac) buffers; a
+            // no-op for the Shared buffers `alloc` produces.
+            publish_host_write(&buffer, mode, src.len());
             Ok(())
         }
         #[cfg(not(target_os = "macos"))]
@@ -346,7 +618,7 @@ impl MetalMemoryManager {
             }
             // Resolve + validate under the lock, retain both buffers, then copy
             // outside the critical section (see `copy_to_device`).
-            let (src_buf, dst_buf) = {
+            let (src_buf, dst_buf, dst_mode) = {
                 let buffers = self
                     .buffers
                     .lock()
@@ -369,7 +641,11 @@ impl MetalMemoryManager {
                         dst_info.size
                     )));
                 }
-                (src_info.buffer.to_owned(), dst_info.buffer.to_owned())
+                (
+                    src_info.buffer.to_owned(),
+                    dst_info.buffer.to_owned(),
+                    dst_info.storage_mode,
+                )
             };
             let src_ptr = src_buf.contents() as *const u8;
             let dst_ptr = dst_buf.contents() as *mut u8;
@@ -393,6 +669,9 @@ impl MetalMemoryManager {
                     std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len_bytes);
                 }
             }
+            // The copy runs on the CPU, so the destination needs the same
+            // Managed-mode publication as a host upload.
+            publish_host_write(&dst_buf, dst_mode, len_bytes);
             Ok(())
         }
         #[cfg(not(target_os = "macos"))]
@@ -470,5 +749,254 @@ mod tests {
         let mm = MetalMemoryManager::new(dev);
         let s = format!("{mm:?}");
         assert!(s.contains("MetalMemoryManager"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn alloc_zero_bytes_rejected() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let mm = MetalMemoryManager::new(dev);
+        // `newBufferWithLength:0` returns nil, which metal-rs wraps in a null
+        // NonNull — reject it before the call instead.
+        let err = mm.alloc(0).expect_err("zero-byte alloc must fail");
+        assert!(matches!(err, MetalError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn alloc_oversized_returns_out_of_memory_instead_of_crashing() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let max_len = dev.max_buffer_length();
+        let mm = MetalMemoryManager::new(dev);
+        // One byte past the device limit, and the pathological usize::MAX: both
+        // used to yield a nil MTLBuffer wrapped in NonNull that segfaulted on
+        // the next `contents()` memcpy.
+        for request in [max_len as usize + 1, usize::MAX] {
+            let err = mm
+                .alloc(request)
+                .expect_err("an oversized allocation must fail");
+            assert!(matches!(err, MetalError::OutOfMemory), "{err:?}");
+        }
+        // A copy into the (never issued) handle must also fail cleanly.
+        let mut dst = [0u8; 4];
+        assert!(mm.copy_from_device(&mut dst, 1).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn allocated_buffers_are_shared_mode() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let mm = MetalMemoryManager::new(dev);
+        let h = mm.alloc(64).expect("alloc");
+        {
+            let buffers = mm.lock_buffers().expect("lock");
+            let info = buffers.get(&h).expect("tracked");
+            assert_eq!(info.storage_mode, metal::MTLStorageMode::Shared);
+            assert_eq!(info.buffer.storage_mode(), metal::MTLStorageMode::Shared);
+        }
+        mm.free(h).expect("free");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn imported_buffer_records_its_storage_mode() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let raw = dev
+            .device
+            .new_buffer(128, metal::MTLResourceOptions::StorageModeShared);
+        let mm = MetalMemoryManager::new(dev);
+        let h = mm.import_external(&raw, 128).expect("import");
+        {
+            let buffers = mm.lock_buffers().expect("lock");
+            let info = buffers.get(&h).expect("tracked");
+            assert_eq!(info.storage_mode, raw.storage_mode());
+        }
+        // A host write through the imported handle still round-trips (the
+        // Managed publication path is a no-op for Shared storage).
+        mm.copy_to_device(h, &[7u8; 8]).expect("upload");
+        let mut back = [0u8; 8];
+        mm.copy_from_device(&mut back, h).expect("download");
+        assert_eq!(back, [7u8; 8]);
+        mm.free(h).expect("free");
+    }
+
+    // ─── Buffer reuse pool ───────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn free_pools_owned_buffers_and_alloc_reuses_them() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let mm = MetalMemoryManager::new(dev);
+        assert_eq!(mm.pooled_bytes(), 0, "a fresh manager pools nothing");
+
+        let h1 = mm.alloc(4096).expect("alloc");
+        // The physical buffer identity is what must be reused; capture it
+        // before the handle goes away.
+        let first = {
+            let buffers = mm.lock_buffers().expect("lock");
+            buffers.get(&h1).expect("tracked").buffer.to_owned()
+        };
+        mm.free(h1).expect("free");
+        assert_eq!(
+            mm.pooled_bytes(),
+            4096,
+            "free must return the buffer to the pool"
+        );
+
+        let h2 = mm.alloc(4096).expect("alloc");
+        let second = {
+            let buffers = mm.lock_buffers().expect("lock");
+            buffers.get(&h2).expect("tracked").buffer.to_owned()
+        };
+        assert_eq!(
+            mm.pooled_bytes(),
+            0,
+            "the pooled buffer was handed back out"
+        );
+        assert!(
+            std::ptr::eq(
+                first.as_ref() as *const metal::BufferRef,
+                second.as_ref() as *const metal::BufferRef
+            ),
+            "alloc must reuse the pooled buffer rather than asking the driver again"
+        );
+        // Handles are still distinct: reuse is about the physical buffer.
+        assert_ne!(h1, h2);
+        mm.free(h2).expect("free");
+    }
+
+    /// A pooled buffer must never leak the previous allocation's bytes.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn reused_buffers_are_zeroed() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let mm = MetalMemoryManager::new(dev);
+        let h1 = mm.alloc(64).expect("alloc");
+        mm.copy_to_device(h1, &[0xABu8; 64]).expect("upload");
+        mm.free(h1).expect("free");
+
+        let h2 = mm.alloc(64).expect("alloc");
+        let mut back = [0xFFu8; 64];
+        mm.copy_from_device(&mut back, h2).expect("download");
+        assert_eq!(back, [0u8; 64], "a reused buffer must be handed out zeroed");
+        mm.free(h2).expect("free");
+    }
+
+    /// A different size must not be served from another size's bucket.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pool_buckets_are_exact_size() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let mm = MetalMemoryManager::new(dev);
+        let h = mm.alloc(1024).expect("alloc");
+        mm.free(h).expect("free");
+        assert_eq!(mm.pooled_bytes(), 1024);
+
+        // 512 must come from the driver, leaving the 1024 bucket untouched.
+        let smaller = mm.alloc(512).expect("alloc");
+        assert_eq!(
+            mm.pooled_bytes(),
+            1024,
+            "a 512-byte request must not drain the 1024 bucket"
+        );
+        let info_len = {
+            let buffers = mm.lock_buffers().expect("lock");
+            buffers.get(&smaller).expect("tracked").buffer.length()
+        };
+        assert_eq!(info_len, 512, "an exact-size pool never over-allocates");
+        mm.free(smaller).expect("free");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trim_pool_releases_everything_and_is_idempotent() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let mm = MetalMemoryManager::new(dev);
+        for size in [256usize, 512, 256] {
+            let h = mm.alloc(size).expect("alloc");
+            mm.free(h).expect("free");
+        }
+        // Only two distinct sizes are held: the third allocation *reused* the
+        // pooled 256-byte buffer rather than adding a second one, which is
+        // exactly the behaviour the pool exists for.
+        assert_eq!(mm.pooled_bytes(), 256 + 512);
+        assert_eq!(mm.trim_pool().expect("trim"), 768);
+        assert_eq!(mm.pooled_bytes(), 0);
+        assert_eq!(mm.trim_pool().expect("trim"), 0, "trim is idempotent");
+    }
+
+    /// The pool must be bounded: past its byte budget, `free` releases directly.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pool_growth_is_bounded_by_its_byte_budget() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let mm = MetalMemoryManager::with_pool_capacity(dev, 4096);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(mm.alloc(1024).expect("alloc"));
+        }
+        for h in handles {
+            mm.free(h).expect("free");
+        }
+        assert_eq!(
+            mm.pooled_bytes(),
+            4096,
+            "the pool must stop accepting buffers at its budget"
+        );
+        assert_eq!(mm.trim_pool().expect("trim"), 4096);
+    }
+
+    /// A zero budget disables reuse entirely — the pre-pooling behaviour.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn zero_capacity_disables_the_pool() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let mm = MetalMemoryManager::with_pool_capacity(dev, 0);
+        let h = mm.alloc(256).expect("alloc");
+        mm.free(h).expect("free");
+        assert_eq!(mm.pooled_bytes(), 0);
+    }
+
+    /// Imported buffers belong to the caller; pooling one would hand the
+    /// caller's live memory to an unrelated later `alloc`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn external_imports_are_never_pooled() {
+        let Some(dev) = try_get_device() else {
+            return;
+        };
+        let raw = dev
+            .device
+            .new_buffer(2048, metal::MTLResourceOptions::StorageModeShared);
+        let mm = MetalMemoryManager::new(Arc::clone(&dev));
+        let h = mm.import_external(&raw, 2048).expect("import");
+        mm.free(h).expect("free");
+        assert_eq!(
+            mm.pooled_bytes(),
+            0,
+            "an external import must never enter the reuse pool"
+        );
+        // The caller's buffer is untouched and still usable.
+        assert_eq!(raw.length(), 2048);
     }
 }

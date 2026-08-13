@@ -127,6 +127,35 @@ impl GemmTemplate {
         )
     }
 
+    /// Returns `true` if [`generate`](Self::generate) emits a kernel that
+    /// stages A/B tiles through shared memory (`.shared` declaration +
+    /// `ld.shared`/`st.shared` in the hot loop), and therefore has a genuine
+    /// dynamic-shared-memory *requirement* a launcher must budget for.
+    ///
+    /// [`generate`](Self::generate) currently does not: it is a one-thread-
+    /// per-output-element grid-stride kernel that reads every `A`/`B`
+    /// element directly from global memory on every `K`-step, with no
+    /// `.shared` declaration anywhere in its output (the
+    /// `gemm_naive_ptx_assembles_for_sm86` / structural tests below pin
+    /// this). A caller that requests
+    /// `(tile_m*tile_k + tile_k*tile_n) * elem_size * stages` bytes of
+    /// dynamic shared memory for it anyway -- sizing the launch as if the
+    /// tile dimensions meant something to this kernel -- pays pure CTA-
+    /// occupancy tax for zero benefit (measured: dropping that phantom
+    /// request alone recovered real throughput on a 1024^3 F32 GEMM).
+    ///
+    /// This is a capability flag on the *template*, not a hardcoded `false`
+    /// at every call site, precisely so a future kernel that genuinely tiles
+    /// through shared memory (e.g. a real implementation behind
+    /// [`generate_pipelined_skeleton`](Self::generate_pipelined_skeleton),
+    /// which already emits `.shared` and `cp.async` but is not numerically
+    /// functional yet -- see its doc comment) only has to flip this one
+    /// place to make its launcher honestly request the memory it needs.
+    #[must_use]
+    pub const fn uses_shared_memory_tiles(&self) -> bool {
+        false
+    }
+
     /// Generates the complete PTX module text for a naive GEMM kernel.
     ///
     /// This is a simple triple-loop implementation intended for correctness
@@ -282,23 +311,57 @@ impl GemmTemplate {
             "    cvt.u64.u32 %rd11, %r13;  // total_threads (grid stride)"
         )
         .map_err(PtxGenError::FormatError)?;
+        // row/col recovery: strength-reduced instead of a 64-bit div/rem of
+        // `idx` on every loop iteration. `ptxas` has no native 64-bit
+        // integer divide; `div.u64`/`rem.u64` each lower to a `CALL.REL`
+        // software long-division subroutine (tens of instructions), and the
+        // old code paid that cost once *per output element*.
+        //
+        // `row`/`col` individually always fit u32 (they are bounded by M/N,
+        // which are themselves u32 kernel parameters) -- the problem was
+        // never their range, it was deriving them from `idx`, which *can*
+        // need the full 64 bits when M*N >= 2^32 (the exact shapes the
+        // 64-bit loop bound above exists to handle correctly). Truncating
+        // `idx` to u32 before a plain `div.u32`/`rem.u32` would silently
+        // reintroduce that bug, so instead: compute row/col for the first
+        // element (`global_id`, which fits u32 since it is one of
+        // `total_threads`-many launched threads and `total_threads` itself
+        // is computed 32-bit above) with a single one-time 32-bit div/rem,
+        // then advance them in lockstep with `idx` each iteration using the
+        // *stride's own* one-time-computed row/col decomposition:
+        //   idx_new = idx + stride
+        //           = (row*N + col) + (stride_div_n*N + stride_rem_n)
+        //           = (row + stride_div_n)*N + (col + stride_rem_n)
+        // `col + stride_rem_n` can exceed N by at most N (both addends are
+        // already < N), so at most one carry into row is ever needed -- a
+        // handful of cheap `add`/`setp`/`selp` instructions replacing a
+        // subroutine call, on every iteration instead of just the first.
         writeln!(
             ptx,
-            "    cvt.u64.u32 %rd12, %r9;   // N (for 64-bit div/rem)"
+            "    // row0 = global_id / N ; col0 = global_id % N (one-time 32-bit \
+             div/rem; global_id fits u32)"
         )
         .map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    div.u32 %r16, %r12, %r9;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    rem.u32 %r17, %r12, %r9;").map_err(PtxGenError::FormatError)?;
+        writeln!(
+            ptx,
+            "    // stride_div_n / stride_rem_n = total_threads / N, % N \
+             (one-time 32-bit div/rem; total_threads fits u32)"
+        )
+        .map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    div.u32 %r19, %r13, %r9;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    rem.u32 %r20, %r13, %r9;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx).map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "$TILE_LOOP:").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    setp.ge.u64 %p0, %rd10, %rd9;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    @%p0 bra $GEMM_DONE;").map_err(PtxGenError::FormatError)?;
         writeln!(
             ptx,
-            "    // row = idx / N ; col = idx % N (64-bit; both fit back into u32)"
+            "    // row (%r16) / col (%r17) already hold idx/N, idx%N for this \
+             element -- advanced per-iteration below, not re-derived here."
         )
         .map_err(PtxGenError::FormatError)?;
-        writeln!(ptx, "    div.u64 %rd13, %rd10, %rd12;").map_err(PtxGenError::FormatError)?;
-        writeln!(ptx, "    rem.u64 %rd14, %rd10, %rd12;").map_err(PtxGenError::FormatError)?;
-        writeln!(ptx, "    cvt.u32.u64 %r16, %rd13;").map_err(PtxGenError::FormatError)?;
-        writeln!(ptx, "    cvt.u32.u64 %r17, %rd14;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx).map_err(PtxGenError::FormatError)?;
 
         // Accumulator init
@@ -393,8 +456,24 @@ impl GemmTemplate {
         }
         writeln!(ptx).map_err(PtxGenError::FormatError)?;
 
-        // Advance to the next element handled by this thread (64-bit stride).
+        // Advance to the next element handled by this thread (64-bit stride
+        // for `idx`, which stays the loop-continuation test above) and, in
+        // lockstep, advance row/col by strength-reduction instead of
+        // re-deriving them with a fresh div/rem -- see the comment above
+        // `$TILE_LOOP` for the derivation.
         writeln!(ptx, "    add.u64 %rd10, %rd10, %rd11;").map_err(PtxGenError::FormatError)?;
+        writeln!(
+            ptx,
+            "    // row/col advance: col_sum = col + stride_rem_n (may reach N..2N-1)"
+        )
+        .map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    add.u32 %r21, %r17, %r20;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    add.u32 %r16, %r16, %r19;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    setp.ge.u32 %p2, %r21, %r9;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    selp.u32 %r22, 1, 0, %p2;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    add.u32 %r16, %r16, %r22;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    sub.u32 %r23, %r21, %r9;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    selp.u32 %r17, %r23, %r21, %p2;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    bra $TILE_LOOP;").map_err(PtxGenError::FormatError)?;
 
         writeln!(ptx, "$GEMM_DONE:").map_err(PtxGenError::FormatError)?;
@@ -479,11 +558,30 @@ impl GemmTemplate {
         Ok(())
     }
 
-    /// Generates a multi-stage pipelined GEMM PTX module.
+    /// Generates a multi-stage software-pipeline **skeleton** -- structurally
+    /// shaped like a real `cp.async`-pipelined tensor-core GEMM, but **not
+    /// numerically functional**. Do not dispatch this for actual computation.
     ///
-    /// Emits a software-pipelined kernel template that uses `cp.async` for
-    /// prefetching shared-memory tiles, `mma.sync.aligned` (or `wmma.mma`) for
-    /// tensor-core computation, and `bar.sync` for intra-CTA synchronization.
+    /// # This is not a working kernel
+    ///
+    /// The emitted `mma.sync`/FMA compute section reads fixed placeholder
+    /// operand registers (e.g. `%r4`-`%r9` for the tensor-core path) that are
+    /// never loaded from the staged shared-memory tiles this method also
+    /// emits -- they are declared but never written, so PTX leaves them
+    /// zero-initialized and the "accumulator" the epilogue stores is not a
+    /// GEMM result. Nothing here computes `C = alpha*A*B + beta*C`.
+    ///
+    /// What it *is* useful for -- and the only thing it is validated for, in
+    /// `oxicuda-blas`'s `gpu_tests.rs` -- is exercising the **instruction
+    /// schedule** a real pipelined kernel would need: a correct `cp.async`
+    /// prologue/steady-state/drain schedule, `cp.async.commit_group` /
+    /// `cp.async.wait_group` fencing, `bar.sync` placement, and (with
+    /// `use_tensor_core: true`) a real `mma.sync.aligned` HMMA instruction
+    /// that assembles under `ptxas` and launches fault-free on real hardware.
+    /// If a future implementation stages A/B tiles into shared memory and
+    /// loads genuine `mma` operands from them, promote this back to a
+    /// `generate`-style numerically-complete method (and update
+    /// [`GemmTemplate::uses_shared_memory_tiles`] to match).
     ///
     /// The pipeline depth is controlled by `self.stages` (must be >= 2).
     /// For each stage, the generated code contains:
@@ -493,8 +591,8 @@ impl GemmTemplate {
     /// - A `mma.sync.aligned` (or `wmma.mma`) compute section
     /// - A `bar.sync` barrier
     ///
-    /// This method does **not** require GPU hardware; it generates the PTX text
-    /// for structural correctness verification.
+    /// This method does **not** require GPU hardware; it generates the PTX
+    /// text for structural / instruction-schedule verification.
     ///
     /// # Errors
     ///
@@ -503,11 +601,11 @@ impl GemmTemplate {
     /// - `stages < 2` (single-stage pipeline is handled by [`generate`](Self::generate))
     /// - Formatting fails
     #[allow(clippy::too_many_lines)]
-    pub fn generate_pipelined(&self) -> Result<String, PtxGenError> {
+    pub fn generate_pipelined_skeleton(&self) -> Result<String, PtxGenError> {
         self.validate()?;
         if self.stages < 2 {
             return Err(PtxGenError::GenerationFailed(
-                "generate_pipelined requires stages >= 2; use generate() for single-stage GEMM"
+                "generate_pipelined_skeleton requires stages >= 2; use generate() for single-stage GEMM"
                     .to_string(),
             ));
         }
@@ -742,6 +840,64 @@ mod tests {
         assert_eq!(t.kernel_name(), "gemm_128x128x32_f32_f32_naive");
     }
 
+    /// `generate()` never stages tiles through shared memory today (see the
+    /// method's own doc comment), so the capability flag must always report
+    /// `false` regardless of tile shape, precision, or tensor-core request
+    /// -- a caller must not be able to talk this flag into `true` by
+    /// picking template fields that merely *look* tile-shaped.
+    #[test]
+    fn uses_shared_memory_tiles_is_false_for_every_config() {
+        let configs = [
+            GemmTemplate {
+                tile_m: 128,
+                tile_n: 128,
+                tile_k: 16,
+                warp_m: 64,
+                warp_n: 64,
+                precision: PtxType::F32,
+                accumulator: PtxType::F32,
+                use_tensor_core: false,
+                stages: 1,
+                target: SmVersion::Sm86,
+                epilogue: EpilogueKind::LinearCombination,
+            },
+            GemmTemplate {
+                tile_m: 256,
+                tile_n: 128,
+                tile_k: 64,
+                warp_m: 64,
+                warp_n: 64,
+                precision: PtxType::F16,
+                accumulator: PtxType::F32,
+                use_tensor_core: true,
+                stages: 4,
+                target: SmVersion::Sm90,
+                epilogue: EpilogueKind::LinearCombinationRelu,
+            },
+        ];
+        for t in configs {
+            assert!(
+                !t.uses_shared_memory_tiles(),
+                "generate() does not stage shared-memory tiles yet; \
+                 uses_shared_memory_tiles() must stay false until it does"
+            );
+        }
+    }
+
+    /// The capability flag and the PTX `generate()` actually emits must
+    /// agree: no `.shared` declaration when the flag is `false`.
+    #[test]
+    fn uses_shared_memory_tiles_matches_generated_ptx() {
+        let t = gemm_template(PtxType::F32, PtxType::F32);
+        let ptx = t.generate().expect("GEMM PTX generation should succeed");
+        assert_eq!(
+            t.uses_shared_memory_tiles(),
+            ptx.contains(".shared"),
+            "uses_shared_memory_tiles() disagrees with the emitted PTX's \
+             .shared declaration:\n{ptx}"
+        );
+    }
+
     #[test]
     fn kernel_name_tensor_core() {
         let t = GemmTemplate {
@@ -844,10 +1000,10 @@ mod tests {
             target: SmVersion::Sm86,
             epilogue: EpilogueKind::LinearCombination,
         };
-        if let Ok(ptx) = pipelined.generate_pipelined() {
+        if let Ok(ptx) = pipelined.generate_pipelined_skeleton() {
             assert!(
                 ptx.is_ascii(),
-                "generate_pipelined() emitted non-ASCII: {:?}",
+                "generate_pipelined_skeleton() emitted non-ASCII: {:?}",
                 ptx.lines().find(|l| !l.is_ascii()),
             );
         }
@@ -893,7 +1049,7 @@ mod tests {
     fn test_3stage_pipeline_gemm_ptx_structure() {
         let t = make_pipelined_template(3, false);
         let ptx = t
-            .generate_pipelined()
+            .generate_pipelined_skeleton()
             .expect("3-stage pipelined GEMM should generate");
 
         // Must contain the entry point
@@ -939,7 +1095,7 @@ mod tests {
     fn test_4stage_pipeline_gemm_ptx_structure() {
         let t = make_pipelined_template(4, false);
         let ptx = t
-            .generate_pipelined()
+            .generate_pipelined_skeleton()
             .expect("4-stage pipelined GEMM should generate");
 
         assert!(
@@ -973,7 +1129,7 @@ mod tests {
     fn test_3stage_pipeline_tensor_core_contains_mma() {
         let t = make_pipelined_template(3, true);
         let ptx = t
-            .generate_pipelined()
+            .generate_pipelined_skeleton()
             .expect("3-stage TC pipelined GEMM should generate");
 
         // Tensor core path must emit mma.sync instructions
@@ -992,10 +1148,10 @@ mod tests {
     #[test]
     fn test_pipeline_requires_stages_ge_2() {
         let t = make_pipelined_template(1, false);
-        let result = t.generate_pipelined();
+        let result = t.generate_pipelined_skeleton();
         assert!(
             result.is_err(),
-            "generate_pipelined should reject stages < 2"
+            "generate_pipelined_skeleton should reject stages < 2"
         );
     }
 
@@ -1003,8 +1159,12 @@ mod tests {
     fn test_pipeline_smem_declaration_scales_with_stages() {
         let t3 = make_pipelined_template(3, false);
         let t4 = make_pipelined_template(4, false);
-        let ptx3 = t3.generate_pipelined().expect("3-stage should generate");
-        let ptx4 = t4.generate_pipelined().expect("4-stage should generate");
+        let ptx3 = t3
+            .generate_pipelined_skeleton()
+            .expect("3-stage should generate");
+        let ptx4 = t4
+            .generate_pipelined_skeleton()
+            .expect("4-stage should generate");
 
         // The shared memory array size for 4 stages should be larger than for 3 stages.
         // We verify by checking that both contain .shared declarations.
@@ -1481,4 +1641,137 @@ mod tests {
             );
         }
     }
+
+    // ── row/col strength-reduction (replaces the per-element div.u64/rem.u64) ─
+
+    /// Pins the fix: `generate()` must never emit a 64-bit integer
+    /// divide/remainder. Before the strength-reduction, `div.u64`/`rem.u64`
+    /// appeared once per K-loop-guarded output element (inside
+    /// `$TILE_LOOP`); each lowers to a `CALL.REL` software long-division
+    /// subroutine under `ptxas` on every architecture this crate targets
+    /// (no NVIDIA GPU has a native 64-bit integer divider).
+    #[test]
+    fn gemm_row_col_decomposition_has_no_64bit_divide() {
+        let ptx = gemm_template(PtxType::F32, PtxType::F32)
+            .generate()
+            .expect("GEMM PTX generation should succeed");
+        assert!(
+            !ptx.contains("div.u64") && !ptx.contains("rem.u64"),
+            "generate() must not emit a 64-bit divide/remainder \
+             (CALL.REL subroutine on every ptxas target) in the per-element \
+             row/col recovery -- row/col must be strength-reduced instead:\n{ptx}"
+        );
+        // The one-time 32-bit init and the branch-free per-iteration advance
+        // must both be present.
+        assert!(
+            ptx.contains("div.u32") && ptx.contains("rem.u32"),
+            "expected the one-time 32-bit row0/col0 and \
+             stride_div_n/stride_rem_n init:\n{ptx}"
+        );
+        assert!(
+            ptx.contains("selp.u32"),
+            "expected a branch-free selp-based carry in the per-iteration \
+             row/col advance:\n{ptx}"
+        );
+    }
+
+    /// The 64-bit loop-continuation guard (`setp.ge.u64`) and the 64-bit
+    /// `idx += stride` advance (`add.u64 %rd10, %rd10, %rd11`) that keep
+    /// `generate()` correct for `M*N >= 2^32` shapes must survive the
+    /// strength-reduction untouched -- only the row/col *recovery* changed,
+    /// not the loop-bound arithmetic `gemm_uses_64bit_loop_and_offsets`
+    /// already pins.
+    #[test]
+    fn gemm_row_col_strength_reduction_preserves_64bit_loop_guard() {
+        let ptx = gemm_template(PtxType::F32, PtxType::F32)
+            .generate()
+            .expect("GEMM PTX generation should succeed");
+        assert!(ptx.contains("setp.ge.u64 %p0, %rd10, %rd9;"));
+        assert!(ptx.contains("add.u64 %rd10, %rd10, %rd11;"));
+    }
+
+    /// Rust-level model of the exact PTX strength-reduction algorithm
+    /// (one-time `row0 = id/N, col0 = id%N, stride_div_n = stride/N,
+    /// stride_rem_n = stride%N`, then per-iteration `col += stride_rem_n`
+    /// with a carry into `row`), swept against a fresh `idx/N, idx%N`
+    /// division at every step across many `(id, stride, n, iterations)`
+    /// combinations -- including `idx` values beyond `u32::MAX`, which is
+    /// exactly the range the 64-bit loop-bound fix exists to cover
+    /// correctly and that a naive "just use `div.u32`/`rem.u32` on a
+    /// truncated `idx`" fix would have silently reintroduced.
+    #[test]
+    fn row_col_strength_reduction_matches_fresh_division_swept() {
+        /// Mirrors the PTX: one-time init, then a branch-free carry advance.
+        fn advance(row: &mut u64, col: &mut u64, n: u64, stride_div_n: u64, stride_rem_n: u64) {
+            let col_sum = *col + stride_rem_n;
+            let mut row_next = *row + stride_div_n;
+            let col_next = if col_sum >= n {
+                row_next += 1;
+                col_sum - n
+            } else {
+                col_sum
+            };
+            *row = row_next;
+            *col = col_next;
+        }
+
+        // (id, stride, n, iterations) -- `id < stride` always (id is a
+        // `global_id < total_threads == stride`), mirroring the PTX
+        // invariant. Includes small values, values that don't divide
+        // evenly, and `idx` sequences that cross 2^32 (the case a
+        // truncating 32-bit division would get wrong).
+        let cases: &[(u64, u64, u64, u64)] = &[
+            (0, 1, 1, 50),
+            (0, 16, 29, 200), // matches gemm_gpu_tests's on-device case
+            (5, 7, 3, 100),
+            (0, 128, 128, 10), // stride is an exact multiple of n
+            (127, 128, 100, 500),
+            (0, 3, 1_000_000_007, 20),
+            // idx crosses 2^32 partway through the sweep: id + iterations*stride
+            // must exceed u32::MAX while id and stride individually still fit
+            // u32 (mirroring the PTX's own "id/stride fit u32, idx might not"
+            // invariant).
+            (
+                4_000_000_000,
+                200_000_000,
+                999_999_937, // a large prime, so stride % n varies richly
+                40,
+            ),
+            (u64::from(u32::MAX) - 3, 7, 5, 30),
+        ];
+
+        for &(id, stride, n, iterations) in cases {
+            assert!(n > 0, "test case bug: n must be positive");
+            let stride_div_n = stride / n;
+            let stride_rem_n = stride % n;
+            let mut row = id / n;
+            let mut col = id % n;
+            let mut idx = id;
+
+            for step in 0..iterations {
+                let fresh_row = idx / n;
+                let fresh_col = idx % n;
+                assert_eq!(
+                    (row, col),
+                    (fresh_row, fresh_col),
+                    "case (id={id}, stride={stride}, n={n}) step {step}: \
+                     strength-reduced (row={row}, col={col}) diverged from \
+                     fresh division (row={fresh_row}, col={fresh_col}) at \
+                     idx={idx} (idx fits u32: {})",
+                    u32::try_from(idx).is_ok(),
+                );
+                idx += stride;
+                advance(&mut row, &mut col, n, stride_div_n, stride_rem_n);
+            }
+        }
+    }
 }
+
+// On-device numeric coverage for the row/col strength-reduction above,
+// deliberately forcing multiple grid-stride iterations per thread (see the
+// module doc comment in `gemm_gpu_tests.rs` for why this is complementary
+// to, not redundant with, `oxicuda-blas`'s production-launch-geometry GPU
+// tests).
+#[cfg(all(test, feature = "gpu-tests"))]
+#[path = "gemm_gpu_tests.rs"]
+mod gemm_gpu_tests;

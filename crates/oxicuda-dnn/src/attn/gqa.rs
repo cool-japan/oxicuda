@@ -17,16 +17,14 @@
 //! The mapping from Q head to KV head is: `kv_head = q_head / group_size`
 //! where `group_size = num_q_heads / num_kv_heads`.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{Dim3, LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key_with;
 
 // ---------------------------------------------------------------------------
 // GqaConfig
@@ -159,9 +157,18 @@ pub fn gqa_forward<T: GpuFloat>(
 
     // Generate and launch the GQA kernel.
     let kernel_name = format!("gqa_forward_{}", T::NAME);
-    let ptx = generate_gqa_ptx::<T>(&kernel_name, handle.sm_version(), config, group_size)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    // `config.causal` gates an extra masking block inside the generated PTX
+    // but is absent from the entry name, so it has to be part of the key. The
+    // remaining config fields are runtime kernel parameters.
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(
+            &kernel_name,
+            handle.sm_version(),
+            &format!("causal={}", config.causal),
+        ),
+        &kernel_name,
+        || generate_gqa_ptx::<T>(&kernel_name, handle.sm_version(), config, group_size),
+    )?;
 
     let total_q_heads = (batch * config.num_q_heads) as u32;
     let block_dim = 256u32;
@@ -173,7 +180,7 @@ pub fn gqa_forward<T: GpuFloat>(
         .shared_mem(0)
         .build();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &params,
         handle.stream(),
         &(

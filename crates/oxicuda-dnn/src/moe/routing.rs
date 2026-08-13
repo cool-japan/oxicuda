@@ -15,16 +15,14 @@
 //! - **`moe_sort_by_expert`**: Builds a permutation array that groups tokens
 //!   by expert ID and computes prefix-sum offsets for each expert's token range.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams};
+use oxicuda_launch::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key_with;
 use crate::ptx_helpers;
 use crate::types::{Activation, TensorDesc};
 
@@ -68,6 +66,27 @@ pub struct MoeConfig {
 }
 
 impl MoeConfig {
+    /// Returns a compiled-module cache discriminator covering every field.
+    ///
+    /// The MoE kernel generators take the whole config and specialise on it
+    /// (expert counts, `top_k`, the two feature dimensions and the activation
+    /// all reach code generation), while the kernel entry names encode only
+    /// the element type. Every field here is a discrete model-architecture
+    /// constant -- none is a per-call runtime quantity -- so keying on all of
+    /// them is both faithful and bounded.
+    #[must_use]
+    pub(crate) fn codegen_key(&self) -> String {
+        format!(
+            "e{},k{},h{},i{},act{:?},p{}",
+            self.num_experts,
+            self.top_k,
+            self.hidden_dim,
+            self.intermediate_dim,
+            self.activation,
+            self.precision.as_ptx_str(),
+        )
+    }
+
     /// Validates that the configuration is consistent.
     pub(crate) fn validate(&self) -> DnnResult<()> {
         if self.num_experts == 0 {
@@ -373,11 +392,12 @@ fn moe_topk_softmax<T: GpuFloat>(
     num_tokens: u32,
     config: &MoeConfig,
 ) -> DnnResult<()> {
-    let ptx = generate_topk_softmax_ptx::<T>(config)?;
     let kernel_name = format!("moe_topk_softmax_{}", T::NAME);
-
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(&kernel_name, config.sm_version, &config.codegen_key()),
+        &kernel_name,
+        || generate_topk_softmax_ptx::<T>(config),
+    )?;
 
     let block_size = TOPK_WARPS_PER_BLOCK * WARP_SIZE;
     let threads_needed = num_tokens * WARP_SIZE;
@@ -393,7 +413,7 @@ fn moe_topk_softmax<T: GpuFloat>(
         config.top_k,
     );
 
-    kernel.launch(&params, handle.stream(), &args)?;
+    kernel.kernel().launch(&params, handle.stream(), &args)?;
     Ok(())
 }
 
@@ -465,11 +485,12 @@ fn moe_sort_by_expert(
     num_tokens: u32,
     config: &MoeConfig,
 ) -> DnnResult<()> {
-    let ptx = generate_sort_by_expert_ptx(config)?;
     let kernel_name = "moe_sort_by_expert";
-
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(kernel_name, config.sm_version, &config.codegen_key()),
+        kernel_name,
+        || generate_sort_by_expert_ptx(config),
+    )?;
 
     let total = num_tokens * config.top_k;
     let grid = total.div_ceil(SORT_BLOCK_SIZE);
@@ -484,7 +505,7 @@ fn moe_sort_by_expert(
         config.top_k,
     );
 
-    kernel.launch(&params, handle.stream(), &args)?;
+    kernel.kernel().launch(&params, handle.stream(), &args)?;
     Ok(())
 }
 

@@ -35,7 +35,11 @@ use crate::handle::DnnHandle;
 // Subsystem submodules (one per discovery cluster).
 mod attn;
 mod conv_fprop;
+mod conv_fused;
 mod conv_other;
+mod conv_tiled;
+mod conv_winograd;
+mod handle_sync;
 mod moe_linear;
 mod norm;
 mod pool_resize;
@@ -120,6 +124,33 @@ pub(crate) fn assert_close_f32(gpu: &[f32], cpu: &[f32], rel: f32, abs: f32, tag
             close_f32(g, c, rel, abs),
             "{tag}: element {i} mismatch gpu={g} cpu={c} (rel={rel:e} abs={abs:e})"
         );
+    }
+}
+
+/// Relative L2 error `||got - want||_2 / ||want||_2` between an FP32 result and
+/// an FP64 reference, falling back to the absolute norm when the reference is
+/// identically zero.
+///
+/// The right metric for a kernel that computes the *same* mathematical result
+/// by a *different* association of the sum (Winograd, split-K, any tree
+/// reduction): such a kernel can differ from the reference by an unbounded
+/// relative amount on a single catastrophically-cancelling element while the
+/// tensor as a whole is accurate to several digits. An element-wise bound
+/// either fails spuriously there or has to be loosened until it stops
+/// detecting real bugs.
+pub(crate) fn rel_l2_error(got: &[f32], want: &[f64]) -> f64 {
+    assert_eq!(got.len(), want.len(), "rel_l2_error: length mismatch");
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for (&g, &w) in got.iter().zip(want.iter()) {
+        let d = f64::from(g) - w;
+        num += d * d;
+        den += w * w;
+    }
+    if den == 0.0 {
+        num.sqrt()
+    } else {
+        (num / den).sqrt()
     }
 }
 

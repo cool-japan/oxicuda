@@ -12,7 +12,7 @@
 //! |-----------|----------|-----------|
 //! | [`ImplicitGemm`](fprop::implicit_gemm) | General-purpose | None |
 //! | [`Im2colGemm`](fprop::im2col_gemm) | Medium feature maps | Yes |
-//! | [`Winograd`](fprop::winograd) | 3x3 kernels, stride 1 | Yes |
+//! | [`Winograd`](fprop::winograd) | 3x3 NCHW FP32, stride 1, pad <= 1, above the profitability threshold | Yes |
 //! | [`Direct`](fprop::direct) | 1x1 and depthwise | None |
 //! | [`FftConv2d`](fft_conv::FftConv2dPlan) | Large kernels (7x7+) | Yes |
 //!
@@ -23,7 +23,9 @@
 //! - [`conv_forward`] — forward convolution
 //! - [`conv_backward_data`] — gradient w.r.t. input
 //! - [`conv_backward_filter`] — gradient w.r.t. weights
-//! - [`conv_bn_relu`] — fused convolution + batch norm + ReLU
+//! - [`conv_bn_relu`] — convolution + batch norm + activation, via a
+//!   decomposed real-convolution-plus-combined-epilogue-kernel dispatch
+//!   (not literally fused into one kernel; see [`fused`] module docs)
 
 pub mod algo_select;
 pub mod api;

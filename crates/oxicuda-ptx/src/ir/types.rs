@@ -372,10 +372,20 @@ pub enum RoundingMode {
     Ru,
     /// Round towards negative infinity.
     Rd,
+    /// Round to nearest, ties away from zero.
+    ///
+    /// This is a distinct rounding mode from [`Rn`](Self::Rn) (round to
+    /// nearest, ties *to even*), and is the **only** rounding mode `ptxas`
+    /// accepts for `cvt` to `.tf32`: the PTX ISA defines `cvt.rna.tf32.f32`
+    /// but has no `cvt.rn.tf32.f32` on Ampere/Ada (`sm_80`-`sm_89`) --
+    /// `ptxas` rejects `.rn` there with "not supported". A `cvt.rn.tf32.f32`
+    /// form does exist, but only from `sm_90` onward; code that must run on
+    /// `sm_86` (this workspace's primary target) needs `Rna`.
+    Rna,
 }
 
 impl RoundingMode {
-    /// Returns the PTX modifier string (e.g., `".rn"`, `".rz"`).
+    /// Returns the PTX modifier string (e.g., `".rn"`, `".rz"`, `".rna"`).
     #[must_use]
     pub const fn as_ptx_str(&self) -> &'static str {
         match self {
@@ -383,6 +393,7 @@ impl RoundingMode {
             Self::Rz => ".rz",
             Self::Ru => ".ru",
             Self::Rd => ".rd",
+            Self::Rna => ".rna",
         }
     }
 }
@@ -718,6 +729,7 @@ mod tests {
         assert_eq!(RoundingMode::Rz.as_ptx_str(), ".rz");
         assert_eq!(RoundingMode::Ru.as_ptx_str(), ".ru");
         assert_eq!(RoundingMode::Rd.as_ptx_str(), ".rd");
+        assert_eq!(RoundingMode::Rna.as_ptx_str(), ".rna");
     }
 
     #[test]

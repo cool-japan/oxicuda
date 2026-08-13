@@ -1,35 +1,45 @@
 //! On-device GPU validation for the GEMM PTX emitted by `oxicuda-blas`.
 //!
-//! The production dispatcher (`level3::gemm::dispatch::GemmDispatcher`) compiles
-//! its kernels from [`GemmTemplate`]: `GemmTemplate { .. }.generate()` for the
-//! work-horse SIMT path and `.generate_pipelined()` for the `cp.async` +
-//! `mma.sync` tensor-core path. These unit-test suites previously only checked
-//! the emitted PTX *as a string* (instruction presence). This module instead
-//! JIT-compiles the PTX for the live device via `Module::from_ptx`, launches it
-//! on the real CUDA GPU through `oxicuda-launch`, copies the results back, and
-//! asserts equivalence to an independent CPU re-derivation.
+//! The production dispatcher (`level3::gemm::dispatch::GemmDispatcher`)
+//! compiles its `Template`-launch-kind kernels *exclusively* from
+//! [`GemmTemplate::generate`] (the grid-stride SIMT path); its `Simt`-launch-
+//! kind kernels (transposed operands, triangle-masked SYRK/SYR2K writes) come
+//! from a separate builder, `super::simt::SimtGemmBuilder`, not from
+//! `GemmTemplate` at all. Neither dispatcher path calls
+//! [`GemmTemplate::generate_pipelined_skeleton`] -- as the name says, it is a
+//! structural skeleton (see its own doc comment), not a second production
+//! kernel; this suite exercises it directly, independent of the dispatcher,
+//! precisely because nothing else ever launches it. These unit-test suites
+//! previously only checked the emitted PTX *as a string* (instruction
+//! presence). This module instead JIT-compiles the PTX for the live device
+//! via `Module::from_ptx`, launches it on the real CUDA GPU through
+//! `oxicuda-launch`, copies the results back, and asserts equivalence to an
+//! independent CPU re-derivation.
 //!
 //! ## Honest kernel accounting
 //!
 //! * **Validated against a CPU oracle (numerically complete).** The SIMT kernel
 //!   from [`GemmTemplate::generate`] — this is the exact PTX the production
-//!   dispatcher launches (`dispatch.rs` slow path). It performs a full
-//!   grid-stride `C = alpha * A*B + beta * C` with per-element K-reduction and
-//!   precision conversion. Validated here for `F32` and `F64` across square /
-//!   non-square shapes, non-trivial `alpha`/`beta`, and a deliberate-corruption
-//!   probe that proves the launch reads device memory (non-vacuous).
+//!   dispatcher launches (`dispatch.rs` `Template` launch kind). It performs a
+//!   full grid-stride `C = alpha * A*B + beta * C` with per-element
+//!   K-reduction and precision conversion. Validated here for `F32` and `F64`
+//!   across square / non-square shapes, non-trivial `alpha`/`beta`, and a
+//!   deliberate-corruption probe that proves the launch reads device memory
+//!   (non-vacuous).
 //!
 //! * **Structural launch only (no numeric oracle).** The pipelined kernel from
-//!   [`GemmTemplate::generate_pipelined`] is a software-pipeline *skeleton*: it
-//!   emits a correct `cp.async` prologue / steady-state / drain schedule and an
-//!   `mma.sync.aligned.m16n8k16` (or an FMA placeholder), but the `mma` operand
-//!   registers are not loaded from the staged shared-memory tiles and the store
-//!   writes a single accumulator lane. It therefore does **not** compute a
-//!   complete GEMM, and asserting a numeric result would be dishonest. We
-//!   instead validate that (a) every config assembles under `ptxas` for the live
-//!   architecture, and (b) both the f32-FMA and the real Ampere f16 `mma.sync`
-//!   variants JIT-load and launch fault-free on the device. This validates the
-//!   async-copy machinery and the HMMA instruction itself execute on hardware.
+//!   [`GemmTemplate::generate_pipelined_skeleton`] is a software-pipeline
+//!   *skeleton*, dispatched by nothing in production: it emits a correct
+//!   `cp.async` prologue / steady-state / drain schedule and an
+//!   `mma.sync.aligned.m16n8k16` (or an FMA placeholder), but the `mma`
+//!   operand registers are not loaded from the staged shared-memory tiles and
+//!   the store writes a single accumulator lane. It therefore does **not**
+//!   compute a complete GEMM, and asserting a numeric result would be
+//!   dishonest. We instead validate that (a) every config assembles under
+//!   `ptxas` for the live architecture, and (b) both the f32-FMA and the real
+//!   Ampere f16 `mma.sync` variants JIT-load and launch fault-free on the
+//!   device. This validates the async-copy machinery and the HMMA instruction
+//!   itself execute on hardware.
 //!
 //! Every device test returns early (skips) when no CUDA device is present, so
 //! the suite stays green on CPU-only machines.
@@ -307,7 +317,9 @@ fn ptxas_prescreen_all_gemm_configs() {
         t.tile_k = 16;
         t.stages = stages;
         t.use_tensor_core = false;
-        let ptx = t.generate_pipelined().expect("pipelined fma generate");
+        let ptx = t
+            .generate_pipelined_skeleton()
+            .expect("pipelined fma generate");
         check(&ptx, &format!("pipe_fma_{stages}stage"));
 
         for (prec, tag) in [(PtxType::F16, "f16"), (PtxType::BF16, "bf16")] {
@@ -318,7 +330,9 @@ fn ptxas_prescreen_all_gemm_configs() {
             tc.warp_n = 8;
             tc.stages = stages;
             tc.use_tensor_core = true;
-            let ptx = tc.generate_pipelined().expect("pipelined mma generate");
+            let ptx = tc
+                .generate_pipelined_skeleton()
+                .expect("pipelined mma generate");
             check(&ptx, &format!("pipe_mma_{tag}_{stages}stage"));
         }
     }
@@ -537,7 +551,7 @@ fn pipelined_cp_async_fma_launches_on_device() {
     t.warp_n = 8;
     t.stages = 3;
     t.use_tensor_core = false;
-    let ptx = t.generate_pipelined().expect("pipelined ptx");
+    let ptx = t.generate_pipelined_skeleton().expect("pipelined ptx");
     let kernel = load_kernel(&ptx, &entry_name(&ptx));
 
     // Staging tiles: A(16x16), B(16x8); C holds the single written accumulator.
@@ -597,7 +611,7 @@ fn pipelined_tensor_core_mma_f16_launches_on_device() {
     t.warp_n = 8;
     t.stages = 3;
     t.use_tensor_core = true;
-    let ptx = t.generate_pipelined().expect("pipelined mma ptx");
+    let ptx = t.generate_pipelined_skeleton().expect("pipelined mma ptx");
     assert!(
         ptx.contains("mma.sync.aligned.m16n8k16"),
         "expected Ampere m16n8k16 HMMA in pipelined tensor-core PTX"

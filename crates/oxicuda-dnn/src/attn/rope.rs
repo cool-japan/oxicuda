@@ -20,16 +20,14 @@
 //! x_rot[2i+1] = x[2i]   * sin_val + x[2i+1] * cos_val
 //! ```
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{Dim3, LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key_with;
 use crate::tensor_util::attn_dims_mut;
 use crate::types::TensorDescMut;
 
@@ -99,9 +97,14 @@ pub fn apply_rope<T: GpuFloat>(
     let half_dim = head_dim / 2;
 
     let kernel_name = format!("rope_{}", T::NAME);
-    let ptx = generate_rope_ptx::<T>(&kernel_name, sm, head_dim)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    // `head_dim` is passed to the generator, so it joins the key even though
+    // the current body reads the dimension as a runtime parameter — the key
+    // must not silently go stale if the emitter starts specialising on it.
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(&kernel_name, sm, &format!("hd={head_dim}")),
+        &kernel_name,
+        || generate_rope_ptx::<T>(&kernel_name, sm, head_dim),
+    )?;
 
     let block_dim = 256u32;
 
@@ -115,7 +118,7 @@ pub fn apply_rope<T: GpuFloat>(
         .shared_mem(0)
         .build();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &q_params,
         handle.stream(),
         &(
@@ -140,7 +143,7 @@ pub fn apply_rope<T: GpuFloat>(
         .shared_mem(0)
         .build();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &k_params,
         handle.stream(),
         &(

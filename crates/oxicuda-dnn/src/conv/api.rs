@@ -18,7 +18,7 @@ use super::fprop::direct::{Conv1x1, DepthwiseConv};
 use super::fprop::im2col_gemm::Im2colGemmConv;
 use super::fprop::implicit_gemm::ImplicitGemmConv;
 use super::fprop::winograd::WinogradConv;
-use super::fused::{FusedBnParams, FusedConvBnAct};
+use super::fused::{FusedBnParams, apply_fused_bn_activation};
 use super::wgrad::implicit_gemm::WgradImplicitGemm;
 
 // ---------------------------------------------------------------------------
@@ -251,11 +251,35 @@ pub fn conv_backward_filter<T: GpuFloat>(
 // conv_bn_relu
 // ---------------------------------------------------------------------------
 
-/// Performs fused convolution + batch normalisation + ReLU.
+/// Performs fused convolution + batch normalisation + activation.
 ///
-/// This fusion eliminates two extra memory round-trips compared to running
-/// convolution, BN, and ReLU as separate operations. The BN parameters
-/// must be pre-computed into fused scale/bias form.
+/// # Implementation note: decomposed, not single-kernel
+///
+/// The single-kernel implementation of this fusion
+/// ([`FusedConvBnAct`](super::fused::FusedConvBnAct)) is currently a
+/// structural skeleton -- its PTX body emits only step-marker comments and
+/// never actually convolves, loads, or stores anything (see that type's
+/// docs). Calling it would silently return `Ok(())` while leaving `output`
+/// completely untouched, which is unacceptable for a function callers rely
+/// on for a real numeric result.
+///
+/// Until the single-kernel path exists, this function instead **decomposes**
+/// into two real, independently-verified dispatches:
+///
+/// 1. [`conv_forward`] (with an internally-managed workspace, since this
+///    function's signature has none of its own) computes the convolution
+///    into `output`.
+/// 2. `apply_fused_bn_activation` (crate-private, in `super::fused`)
+///    applies `output = activation(output * fused_scale[c] + fused_bias[c])`
+///    in place, in a single elementwise kernel pass.
+///
+/// This still saves one memory round-trip relative to three fully separate
+/// conv / BN / activation kernels (the BN affine and activation share one
+/// load-compute-store pass), even though it is not the zero-round-trip
+/// single-kernel fusion the name aspires to. Once `FusedConvBnAct` grows a
+/// real kernel body (verified against the same CPU oracle used for this
+/// decomposition), this function can switch back to the single-kernel path
+/// without changing its signature or behaviour.
 ///
 /// # Arguments
 ///
@@ -269,7 +293,8 @@ pub fn conv_backward_filter<T: GpuFloat>(
 ///
 /// # Errors
 ///
-/// Same as [`conv_forward`].
+/// Same as [`conv_forward`]. Also returns [`DnnError::UnsupportedOperation`]
+/// for tensor layouts other than NCHW/NHWC.
 pub fn conv_bn_relu<T: GpuFloat>(
     handle: &DnnHandle,
     input: &TensorDesc<T>,
@@ -289,8 +314,45 @@ pub fn conv_bn_relu<T: GpuFloat>(
         )));
     }
 
-    let engine = FusedConvBnAct::new(problem, activation, handle.sm_version());
-    engine.execute(handle, input, filter, output, bn_params)
+    // Step 1: the real convolution, written directly into `output`.
+    conv_forward_with_auto_workspace(handle, input, filter, output, conv_desc)?;
+
+    // Step 2: BN affine + activation epilogue, applied to `output` in place.
+    apply_fused_bn_activation(handle, output, &problem, bn_params, activation)
+}
+
+/// Runs [`conv_forward`], allocating and supplying a workspace buffer
+/// internally when the selected algorithm needs one.
+///
+/// `conv_bn_relu` has no workspace parameter of its own (it is meant to be
+/// a simple, convenience, fully-owned-buffers entry point), so it probes
+/// `conv_forward` the same way `oxicuda-dnn`'s own regression coverage does
+/// (`gpu_tests::conv_fprop::conv_forward_winograd_eligible_shape_matches_cpu_oracle`):
+/// call once with no workspace, and if the dispatcher reports how many
+/// bytes it needs via [`DnnError::WorkspaceRequired`], allocate exactly
+/// that much and retry. Algorithms that need no workspace (`Direct`,
+/// `ImplicitGemm`) succeed on the first call and never allocate anything.
+fn conv_forward_with_auto_workspace<T: GpuFloat>(
+    handle: &DnnHandle,
+    input: &TensorDesc<T>,
+    filter: &TensorDesc<T>,
+    output: &mut TensorDescMut<T>,
+    conv_desc: &ConvolutionDescriptor,
+) -> DnnResult<()> {
+    match conv_forward(handle, input, filter, output, conv_desc, None) {
+        Err(DnnError::WorkspaceRequired(bytes)) => {
+            let mut workspace = DeviceBuffer::<u8>::alloc(bytes)?;
+            conv_forward(
+                handle,
+                input,
+                filter,
+                output,
+                conv_desc,
+                Some(&mut workspace),
+            )
+        }
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------

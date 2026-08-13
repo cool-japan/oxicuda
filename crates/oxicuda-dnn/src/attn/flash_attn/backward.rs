@@ -17,16 +17,14 @@
 //!    - `dQ_i += dS_ij @ K_j`
 //!    - `dK_j += dS_ij^T @ Q_i`
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams};
+use oxicuda_launch::{Dim3, LaunchParams};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key_with;
 use crate::tensor_util::attn_dims;
 use crate::types::{TensorDesc, TensorDescMut};
 
@@ -76,10 +74,18 @@ pub fn flash_attention_backward<T: GpuFloat>(
     let (batch, num_heads, _seq_q, _head_dim) = attn_dims(q)?;
 
     // --- Step 1: Compute D_i = rowsum(dO * O) ---
-    let di_ptx =
-        generate_rowsum_dot_ptx::<T>("flash_bwd_rowsum_dot", config.sm_version, config.head_dim)?;
-    let di_module = Arc::new(Module::from_ptx(&di_ptx)?);
-    let di_kernel = Kernel::from_module(di_module, "flash_bwd_rowsum_dot")?;
+    // The entry name is a fixed literal, so `head_dim` and the element type —
+    // the generator's other inputs — have to discriminate the cache key.
+    let di_name = "flash_bwd_rowsum_dot";
+    let di_kernel = handle.get_or_compile_kernel(
+        &cache_key_with(
+            di_name,
+            config.sm_version,
+            &format!("hd={},{}", config.head_dim, T::NAME),
+        ),
+        di_name,
+        || generate_rowsum_dot_ptx::<T>(di_name, config.sm_version, config.head_dim),
+    )?;
 
     let total_rows = batch * num_heads * config.seq_len_q;
     let di_threads = 256u32.min(config.head_dim);
@@ -89,7 +95,7 @@ pub fn flash_attention_backward<T: GpuFloat>(
         .shared_mem(0)
         .build();
 
-    di_kernel.launch(
+    di_kernel.kernel().launch(
         &di_params,
         handle.stream(),
         &(
@@ -102,13 +108,21 @@ pub fn flash_attention_backward<T: GpuFloat>(
     )?;
 
     // --- Step 2: Main backward kernel ---
-    let bwd_ptx = generate_backward_ptx::<T>(config)?;
     let bwd_kernel_name = format!(
         "flash_attn_bwd_d{}_bm{}_bn{}",
         config.head_dim, config.block_m, config.block_n
     );
-    let bwd_module = Arc::new(Module::from_ptx(&bwd_ptx)?);
-    let bwd_kernel = Kernel::from_module(bwd_module, &bwd_kernel_name)?;
+    // The name omits `causal`, `num_warps` (both code-gen constants) and the
+    // element type; `codegen_key` supplies the first two.
+    let bwd_kernel = handle.get_or_compile_kernel(
+        &cache_key_with(
+            &bwd_kernel_name,
+            config.sm_version,
+            &format!("{},{}", config.codegen_key(), T::NAME),
+        ),
+        &bwd_kernel_name,
+        || generate_backward_ptx::<T>(config),
+    )?;
 
     let num_kv_tiles = config.num_kv_tiles();
     let threads_per_block = config.num_warps * 32;
@@ -126,7 +140,7 @@ pub fn flash_attention_backward<T: GpuFloat>(
         .shared_mem(smem)
         .build();
 
-    bwd_kernel.launch(
+    bwd_kernel.kernel().launch(
         &bwd_params,
         handle.stream(),
         &(

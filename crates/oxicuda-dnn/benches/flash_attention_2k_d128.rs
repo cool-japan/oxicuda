@@ -160,11 +160,24 @@ fn bench_flash_attention_2k_d128(c: &mut Criterion) {
 
     let tokens_per_call = u64::from(BATCH * NUM_HEADS * SEQ_LEN);
 
+    // Warm-up call outside the timed loop, plus `.expect()` inside it below:
+    // a silently-discarded `Result` here would let a future regression (or a
+    // future workspace requirement, mirroring the `conv_forward` bug this
+    // repository has already hit) time an early-return-on-error instead of
+    // the kernel this benchmark claims to measure.
+    flash_attention_forward(&handle, &q, &k, &v, &mut o, &mut lse_buf, &config)
+        .expect("flash_attention_forward warm-up call must succeed");
+    handle
+        .stream()
+        .synchronize()
+        .expect("synchronize after warm-up");
+
     let mut group = c.benchmark_group("dnn_p2_flash_attention_2k_d128");
     group.throughput(Throughput::Elements(tokens_per_call));
     group.bench_function("oxicuda_f32_seq2048_d128_h16", |b| {
         b.iter(|| {
-            let _ = flash_attention_forward(&handle, &q, &k, &v, &mut o, &mut lse_buf, &config);
+            flash_attention_forward(&handle, &q, &k, &v, &mut o, &mut lse_buf, &config)
+                .expect("flash_attention_forward");
         });
     });
     group.finish();

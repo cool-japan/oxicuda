@@ -14,17 +14,15 @@
 //! 3. Use online softmax to combine partial results across pages.
 //! 4. Store the final output.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
 use oxicuda_driver::ffi::CUdeviceptr;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams};
+use oxicuda_launch::{Dim3, LaunchParams};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::tensor_util::{attn_dims, attn_dims_mut};
 use crate::types::{TensorDesc, TensorDescMut};
 
@@ -239,13 +237,18 @@ pub fn paged_attention_decode<T: GpuFloat>(
 
     let (batch, _heads, _seq, _hdim) = attn_dims(q)?;
 
-    let ptx = config.generate_ptx()?;
+    // `generate_ptx` specialises on `head_dim`, `block_size` (shared-memory
+    // tile sizes) and `threads_per_block()`, which is itself a function of
+    // `head_dim` — all three are captured by the entry name.
     let kernel_name = format!(
         "paged_attn_decode_d{}_bs{}",
         config.head_dim, config.block_size
     );
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, config.sm_version),
+        &kernel_name,
+        || config.generate_ptx(),
+    )?;
 
     let max_pages_per_seq = if batch > 0 {
         page_table.len() / batch as usize
@@ -266,7 +269,7 @@ pub fn paged_attention_decode<T: GpuFloat>(
 
     let sm_scale = 1.0f32 / (config.head_dim as f32).sqrt();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &params,
         handle.stream(),
         &(

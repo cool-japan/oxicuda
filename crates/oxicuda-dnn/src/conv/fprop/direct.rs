@@ -13,17 +13,14 @@
 //! Both cases are common in modern architectures (MobileNet, EfficientNet,
 //! ResNet bottleneck blocks).
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::builder::{BodyBuilder, KernelBuilder};
 use oxicuda_ptx::ir::{PtxType, Register};
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut, TensorLayout};
 
 use super::super::descriptor::ConvProblem;
@@ -62,7 +59,19 @@ impl Conv1x1 {
         })
     }
 
-    /// Returns the kernel name encoding precision and layout.
+    /// Returns the kernel name encoding precision, layout, and the
+    /// channels-per-group counts.
+    ///
+    /// # Why the group counts are in the name
+    ///
+    /// [`Self::generate_ptx`] bakes `C_in / groups` and `C_out / groups` into
+    /// the instruction stream as immediates (they drive the group routing and
+    /// the filter row stride), so two problems that differ only in channel
+    /// count produce *different* PTX. The name is the compiled-module cache key
+    /// (see `crate::kernel_cache`), so leaving them out would let one
+    /// problem's module be handed to another shape — a silent wrong-results
+    /// bug, not a compile error. Encoding them here keeps the key faithful and
+    /// makes the emitted PTX self-describing.
     #[must_use]
     pub fn kernel_name(&self) -> String {
         let prec = self.problem.input_type.as_ptx_str().trim_start_matches('.');
@@ -71,7 +80,19 @@ impl Conv1x1 {
         } else {
             "nchw"
         };
-        format!("conv1x1_{prec}_{layout}")
+        let (in_cpg, out_cpg) = self.channels_per_group();
+        format!("conv1x1_{prec}_{layout}_g{in_cpg}x{out_cpg}")
+    }
+
+    /// `(C_in / groups, C_out / groups)`, saturating at zero groups so the
+    /// name is always well-formed; `generate_ptx` rejects the degenerate case
+    /// with a proper error.
+    fn channels_per_group(&self) -> (u32, u32) {
+        let groups = self.problem.groups.max(1);
+        (
+            self.problem.in_channels / groups,
+            self.problem.out_channels / groups,
+        )
     }
 
     /// Generates the PTX for the 1x1 convolution kernel.
@@ -142,6 +163,15 @@ impl Conv1x1 {
     /// (cross-correlation, no kernel flip), honouring padding/groups exactly as
     /// the descriptor specifies.
     ///
+    /// # Performance
+    ///
+    /// The module is fetched from the handle's compiled-kernel cache, so a
+    /// repeated call (the common case in a per-frame inference pipeline) skips
+    /// both PTX generation and the `cuModuleLoadData` JIT. The launch geometry
+    /// comes from an occupancy query against the compiled function rather than
+    /// a hard-coded block size; the grid still covers every output element
+    /// (see `CachedKernel::launch_1d`).
+    ///
     /// # Errors
     ///
     /// Returns errors from PTX generation, module loading, or kernel launch.
@@ -152,9 +182,11 @@ impl Conv1x1 {
         filter: &TensorDesc<T>,
         output: &mut TensorDescMut<T>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_ptx()?;
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &self.kernel_name())?;
+        let entry = self.kernel_name();
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&entry, self.sm_version), &entry, || {
+                self.generate_ptx()
+            })?;
 
         let out_dims = self.problem.output_dims()?;
         let out_h = out_dims.first().copied().unwrap_or(1);
@@ -166,9 +198,7 @@ impl Conv1x1 {
             .saturating_mul(out_h)
             .saturating_mul(out_w);
 
-        let block_size = 256u32;
-        let grid = grid_size_for(total_outputs, block_size);
-        let params = LaunchParams::new(grid, block_size);
+        let params = kernel.launch_1d(total_outputs);
 
         let args = (
             input.ptr,
@@ -191,6 +221,7 @@ impl Conv1x1 {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -237,6 +268,12 @@ impl DepthwiseConv {
     }
 
     /// Returns the kernel name.
+    ///
+    /// [`Self::generate_ptx`] bakes exactly three things into the instruction
+    /// stream — the filter extent `R`, `S` (the tap loops are unrolled) and the
+    /// element type — and all three appear here, so this name is a complete
+    /// compiled-module cache key for a given target architecture. Everything
+    /// else (dims, padding, stride, dilation) is a runtime kernel parameter.
     #[must_use]
     pub fn kernel_name(&self) -> String {
         let prec = self.problem.input_type.as_ptx_str().trim_start_matches('.');
@@ -302,18 +339,18 @@ impl DepthwiseConv {
         filter: &TensorDesc<T>,
         output: &mut TensorDescMut<T>,
     ) -> DnnResult<()> {
-        let ptx = self.generate_ptx()?;
-        let module = Arc::new(Module::from_ptx(&ptx)?);
-        let kernel = Kernel::from_module(module, &self.kernel_name())?;
+        let entry = self.kernel_name();
+        let kernel =
+            handle.get_or_compile_kernel(&cache_key(&entry, self.sm_version), &entry, || {
+                self.generate_ptx()
+            })?;
 
         let out_dims = self.problem.output_dims()?;
         let out_h = out_dims.first().copied().unwrap_or(1);
         let out_w = out_dims.get(1).copied().unwrap_or(1);
         let total_outputs = self.problem.batch * self.problem.in_channels * out_h * out_w;
 
-        let block_size = 256u32;
-        let grid = grid_size_for(total_outputs, block_size);
-        let params = LaunchParams::new(grid, block_size);
+        let params = kernel.launch_1d(total_outputs);
 
         let args = (
             input.ptr,
@@ -338,6 +375,7 @@ impl DepthwiseConv {
         );
 
         kernel
+            .kernel()
             .launch(&params, handle.stream(), &args)
             .map_err(|e| DnnError::LaunchFailed(e.to_string()))?;
 
@@ -588,6 +626,43 @@ mod tests {
         assert!(c.is_ok());
         if let Ok(conv) = c {
             assert_eq!(conv.workspace_bytes(), 0);
+        }
+    }
+
+    /// The kernel name is the compiled-module cache key. Two 1x1 problems that
+    /// share precision and layout but differ in channels-per-group emit
+    /// *different* PTX (the group counts are code-gen immediates), so they must
+    /// not share a name — otherwise one problem's compiled module would be
+    /// handed to the other and silently produce wrong results.
+    #[test]
+    fn conv1x1_name_discriminates_channels_per_group() {
+        let base = make_1x1_problem();
+        let mut wider = base.clone();
+        wider.in_channels = 128;
+        let mut grouped = base.clone();
+        grouped.groups = 2;
+
+        let n_base = Conv1x1::new(base, SmVersion::Sm80).map(|c| c.kernel_name());
+        let n_wider = Conv1x1::new(wider, SmVersion::Sm80).map(|c| c.kernel_name());
+        let n_grouped = Conv1x1::new(grouped, SmVersion::Sm80).map(|c| c.kernel_name());
+
+        assert!(n_base.is_ok() && n_wider.is_ok() && n_grouped.is_ok());
+        assert_ne!(n_base.as_ref().ok(), n_wider.as_ref().ok());
+        assert_ne!(n_base.as_ref().ok(), n_grouped.as_ref().ok());
+    }
+
+    /// Whatever the name encodes, it must still be the entry point actually
+    /// emitted into the PTX — the cache looks the function up by this name.
+    #[test]
+    fn conv1x1_name_is_the_emitted_entry() {
+        let conv = Conv1x1::new(make_1x1_problem(), SmVersion::Sm80);
+        assert!(conv.is_ok());
+        if let Ok(conv) = conv {
+            let ptx = conv.generate_ptx().unwrap_or_default();
+            assert!(
+                ptx.contains(&format!(".visible .entry {}", conv.kernel_name())),
+                "kernel_name() must name the emitted entry point"
+            );
         }
     }
 

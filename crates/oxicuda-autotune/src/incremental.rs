@@ -42,16 +42,43 @@ use crate::result_db::ResultDb;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HardwareFingerprint {
     /// GPU model name (e.g. `"NVIDIA RTX 4090"`).
+    ///
+    /// On macOS (no discrete GPU/CUDA driver) this instead holds the Apple
+    /// Silicon SoC name read from `sysctl machdep.cpu.brand_string`, e.g.
+    /// `"Apple M3 Pro"` — the closest available analogue, since the GPU is
+    /// integrated into the SoC and named after it.
     pub gpu_name: String,
     /// Driver version string (e.g. `"535.104.05"`).
+    ///
+    /// On macOS this instead holds the macOS product version (`sysctl
+    /// kern.osproductversion`, e.g. `"15.1"`), since the Metal shader
+    /// compiler ships with the OS rather than as an installable driver.
+    /// This is a plain, non-numeric string on both platforms; nothing in
+    /// this crate parses it, only compares it for equality.
     pub driver_version: String,
     /// Compute capability (e.g. `"8.9"`).
+    ///
+    /// Apple Silicon has no CUDA compute capability. On macOS this field
+    /// instead holds the Mac model identifier (`sysctl hw.model`, e.g.
+    /// `"Mac15,3"`) purely as an extra identity discriminator — it is not a
+    /// `major.minor` compute capability on that platform and is never
+    /// parsed as one; it is only compared for equality and hashed.
     pub compute_capability: String,
     /// Total GPU memory in megabytes.
+    ///
+    /// On macOS this is the total physical (unified) memory read from
+    /// `sysctl hw.memsize`, since the GPU shares memory with the CPU on
+    /// Apple Silicon.
     pub total_memory_mb: u64,
     /// GPU clock speed in MHz.
+    ///
+    /// Always `0` on macOS: Apple Silicon has no stable public equivalent
+    /// exposed via `sysctl`, and this is documented as unavailable rather
+    /// than estimated.
     pub clock_mhz: u32,
     /// Number of streaming multiprocessors.
+    ///
+    /// Always `0` on macOS, for the same reason as `clock_mhz`.
     pub sm_count: u32,
     /// Precomputed hash of all fields for quick comparison.
     pub fingerprint_hash: u64,
@@ -60,7 +87,9 @@ pub struct HardwareFingerprint {
 impl HardwareFingerprint {
     /// Queries the current GPU hardware and builds a fingerprint.
     ///
-    /// On macOS (or when no GPU is available), returns a synthetic
+    /// On macOS this queries Apple hardware identity via `sysctl`
+    /// (`try_from_device`, below); if that fails too (or on a non-macOS
+    /// system with no GPU available), falls back to a fully synthetic
     /// fingerprint suitable for testing and development.
     pub fn current() -> Self {
         Self::try_from_device().unwrap_or_else(|_| Self::synthetic())
@@ -101,9 +130,70 @@ impl HardwareFingerprint {
 
         #[cfg(target_os = "macos")]
         {
-            Err(AutotuneError::BenchmarkFailed(
-                "GPU not available on macOS".to_string(),
-            ))
+            // There is no CUDA driver on macOS, but blindly falling back to
+            // `synthetic()` here (as this function used to do
+            // unconditionally) collapses *every* Mac to the exact same
+            // fingerprint. Since the incremental-tuning result database is
+            // keyed on `fingerprint_hash`, that means tuning results
+            // measured on an M1 base would be treated as valid on an M4 Max
+            // and vice versa — precisely the staleness this fingerprint
+            // exists to catch.
+            //
+            // Apple doesn't expose GPU identity/driver info the way the
+            // CUDA driver does, but `sysctl` gives a stable,
+            // dependency-free way to read enough of the Apple Silicon
+            // identity to distinguish machines — a plain process spawn via
+            // `std::process::Command`, no FFI:
+            //   - `machdep.cpu.brand_string` -> SoC name, e.g. "Apple M3
+            //     Pro" (the GPU is integrated into the SoC on Apple
+            //     Silicon and is named after it; there is no separate
+            //     discrete GPU name).
+            //   - `hw.model`                 -> Mac model identifier, e.g.
+            //     "Mac15,3" (further distinguishes machines that share a
+            //     SoC name but differ in thermal/power envelope).
+            //   - `hw.memsize`               -> physical RAM in bytes
+            //     (unified memory, shared with the GPU on Apple Silicon).
+            //   - `kern.osproductversion`    -> macOS version, used for the
+            //     `driver_version` field since the Metal shader compiler
+            //     ships with the OS rather than as an installable driver.
+            //
+            // `clock_mhz` and `sm_count` have no stable public equivalent
+            // on Apple Silicon, so they are left at `0` — matching the
+            // documented "unavailable" convention already used by
+            // `synthetic()` — rather than fabricating plausible-looking
+            // numbers.
+            //
+            // The brand string is the primary identity discriminator: if
+            // even that cannot be read, fall back to the existing
+            // `synthetic()` safety net (via `current()`'s
+            // `unwrap_or_else`) instead of returning a half-populated
+            // fingerprint.
+            let gpu_name = macos_sysctl_string("machdep.cpu.brand_string").ok_or_else(|| {
+                AutotuneError::BenchmarkFailed(
+                    "unable to read machdep.cpu.brand_string via sysctl on macOS".to_string(),
+                )
+            })?;
+
+            let compute_capability =
+                macos_sysctl_string("hw.model").unwrap_or_else(|| "unknown".to_string());
+            let driver_version = macos_sysctl_string("kern.osproductversion")
+                .unwrap_or_else(|| "unknown".to_string());
+            let total_memory_mb = macos_sysctl_string("hw.memsize")
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|bytes| bytes / (1024 * 1024))
+                .unwrap_or(0);
+
+            let mut fp = Self {
+                gpu_name,
+                driver_version,
+                compute_capability,
+                total_memory_mb,
+                clock_mhz: 0,
+                sm_count: 0,
+                fingerprint_hash: 0,
+            };
+            fp.fingerprint_hash = fp.compute_hash();
+            Ok(fp)
         }
     }
 
@@ -147,6 +237,32 @@ impl HardwareFingerprint {
     #[must_use]
     pub fn is_compatible(&self, other: &HardwareFingerprint) -> bool {
         self.gpu_name == other.gpu_name
+    }
+}
+
+/// Reads a `sysctl` value by name as a trimmed UTF-8 string.
+///
+/// Spawns `sysctl -n <name>` via [`std::process::Command`] — a plain
+/// process spawn, no FFI and no new dependency. Returns `None` if the
+/// command cannot be spawned, exits non-zero (e.g. an unknown key), or the
+/// output is not valid UTF-8 or empty, so callers can degrade gracefully to
+/// a stable fallback instead of propagating a hard error for what is
+/// inherently best-effort identity data.
+#[cfg(target_os = "macos")]
+fn macos_sysctl_string(name: &str) -> Option<String> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -699,6 +815,66 @@ mod tests {
         assert_eq!(fp.clock_mhz, 0);
         assert_eq!(fp.sm_count, 0);
         assert_ne!(fp.fingerprint_hash, 0);
+    }
+
+    // -- macOS: real Apple hardware identity, not the synthetic fallback ----
+    //
+    // These pin the fix for the bug where every Mac collapsed to the same
+    // `HardwareFingerprint::synthetic()` cache key (see `try_from_device`'s
+    // macOS branch above). They run for real on macOS CI/dev machines, no
+    // `gpu-tests` feature required, since `sysctl` needs no GPU or driver.
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_sysctl_string_reads_known_key() {
+        let mem = macos_sysctl_string("hw.memsize").expect("hw.memsize should be readable");
+        let parsed: u64 = mem.parse().expect("hw.memsize should be a plain integer");
+        assert!(parsed > 0, "hw.memsize should be nonzero, got {parsed}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_sysctl_string_unknown_key_returns_none() {
+        assert_eq!(macos_sysctl_string("this.oid.does.not.exist"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_fingerprint_uses_real_hardware_identity() {
+        let fp = HardwareFingerprint::try_from_device()
+            .expect("sysctl-based fingerprint should succeed on macOS");
+        assert_ne!(fp.gpu_name, "Synthetic GPU (no driver)");
+        assert!(!fp.gpu_name.is_empty());
+        assert!(
+            fp.total_memory_mb > 0,
+            "expected real physical memory size, got 0"
+        );
+        assert_ne!(fp.fingerprint_hash, 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_fingerprint_is_stable_across_calls() {
+        let fp1 = HardwareFingerprint::try_from_device().expect("first fingerprint should succeed");
+        let fp2 =
+            HardwareFingerprint::try_from_device().expect("second fingerprint should succeed");
+        assert_eq!(fp1.gpu_name, fp2.gpu_name);
+        assert_eq!(fp1.total_memory_mb, fp2.total_memory_mb);
+        assert_eq!(fp1.fingerprint_hash, fp2.fingerprint_hash);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_current_does_not_collapse_to_synthetic() {
+        // This is the core regression test for the fix: before it, every
+        // Mac's `current()` was byte-for-byte `synthetic()`.
+        let current = HardwareFingerprint::current();
+        let synthetic = HardwareFingerprint::synthetic();
+        assert_ne!(
+            current, synthetic,
+            "HardwareFingerprint::current() must not collapse to the synthetic fallback on a \
+             real Mac"
+        );
     }
 
     #[test]

@@ -104,13 +104,34 @@ impl BlasHandle {
             ))
         })?;
 
+        // The real, live streaming-multiprocessor count for *this* device --
+        // compute capability alone cannot give it (see
+        // `GemmDispatcher::sm_count`'s doc comment: sm_86 alone spans GPUs
+        // from 46 SMs to 84+), so it is queried here rather than looked up
+        // from an architecture table. A query failure (or an implausible
+        // non-positive count) falls back to `GemmDispatcher::new`'s
+        // architecture-typical default rather than failing handle
+        // construction over what is ultimately a launch-tuning detail: an
+        // approximate count still produces a *correct* GEMM launch, only a
+        // less precisely occupancy-tuned one.
+        let gemm_dispatcher = match device
+            .multiprocessor_count()
+            .ok()
+            .and_then(|count| u32::try_from(count).ok())
+        {
+            Some(sm_count) if sm_count > 0 => {
+                GemmDispatcher::new_with_sm_count(sm_version, sm_count)
+            }
+            _ => GemmDispatcher::new(sm_version),
+        };
+
         Ok(Self {
             context: Arc::clone(ctx),
             stream,
             math_mode: MathMode::Default,
             pointer_mode: PointerMode::Host,
             sm_version,
-            gemm_dispatcher: GemmDispatcher::new(sm_version),
+            gemm_dispatcher,
             module_cache: RwLock::new(HashMap::new()),
         })
     }
@@ -148,6 +169,25 @@ impl BlasHandle {
     /// instance across `gemm` calls keeps that cache warm.
     pub(crate) fn gemm_dispatcher(&self) -> &GemmDispatcher {
         &self.gemm_dispatcher
+    }
+
+    /// Device memory this handle's GEMM dispatcher is holding in reusable
+    /// split-K reduction workspaces.
+    ///
+    /// Zero until the first skinny GEMM takes the split-K path, and
+    /// monotonically non-decreasing afterwards: those workspaces are kept for
+    /// the handle's lifetime so their device addresses stay stable, which is
+    /// what lets a split-K GEMM be recorded into a CUDA graph and replayed.
+    /// See `GemmDispatcher::split_k_workspace` for the full rationale, and
+    /// `tests/splitk_workspace_gpu.rs` for the regression test that pins it.
+    ///
+    /// The number is a *consequence* of the caching policy, not a knob.
+    ///
+    /// # Errors
+    ///
+    /// [`BlasError::LaunchFailed`] if the workspace cache's lock is poisoned.
+    pub fn split_k_workspace_bytes(&self) -> BlasResult<usize> {
+        self.gemm_dispatcher.split_k_workspace_bytes()
     }
 
     /// Returns a cached compiled [`Module`] for `name`, or generates its PTX

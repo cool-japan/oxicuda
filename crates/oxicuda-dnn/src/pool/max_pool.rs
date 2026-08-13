@@ -4,16 +4,14 @@
 //! the pooling window for the maximum value. Optionally stores the index of
 //! the max element for use in the backward pass.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 use crate::tensor_util::{nchw_dims, nchw_dims_mut};
 use crate::types::{TensorDesc, TensorDescMut, pool_output_size};
@@ -86,10 +84,12 @@ pub fn max_pool2d<T: GpuFloat>(
     }
 
     let has_indices = indices.is_some();
-    let ptx = generate_max_pool2d_ptx::<T>(handle.sm_version(), has_indices)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let kernel_name = max_pool2d_kernel_name::<T>(has_indices);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_max_pool2d_ptx::<T>(handle.sm_version(), has_indices),
+    )?;
 
     let grid = grid_size_for(total_output, POOL_BLOCK_SIZE);
     let params = LaunchParams::new(grid, POOL_BLOCK_SIZE);
@@ -116,6 +116,7 @@ pub fn max_pool2d<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("max_pool2d: {e}")))?;
 
@@ -158,10 +159,12 @@ pub fn max_pool2d_backward<T: GpuFloat>(
         });
     }
 
-    let ptx = generate_max_pool2d_backward_ptx::<T>(handle.sm_version())?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
     let kernel_name = format!("dnn_max_pool2d_bwd_{}", T::NAME);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_max_pool2d_backward_ptx::<T>(handle.sm_version()),
+    )?;
 
     let grid = grid_size_for(total, POOL_BLOCK_SIZE);
     let params = LaunchParams::new(grid, POOL_BLOCK_SIZE);
@@ -180,6 +183,7 @@ pub fn max_pool2d_backward<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("max_pool2d_backward: {e}")))?;
 

@@ -14,17 +14,16 @@
 //! even when the input/output type is f16 or bf16.
 
 use std::fmt::Write as FmtWrite;
-use std::sync::Arc;
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams};
+use oxicuda_launch::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
 use oxicuda_ptx::ir::PtxType;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::{TensorDesc, TensorDescMut};
 
 // ---------------------------------------------------------------------------
@@ -62,14 +61,13 @@ pub fn layer_norm<T: GpuFloat>(
     let (num_rows, hidden_dim) = extract_row_dims(input)?;
     validate_layer_norm_args(input, gamma, beta, output, hidden_dim)?;
 
-    let ptx_source = generate_layer_norm_ptx::<T>(handle.sm_version(), hidden_dim)?;
-    let module = Arc::new(
-        Module::from_ptx(&ptx_source)
-            .map_err(|e| DnnError::LaunchFailed(format!("module load for layer_norm: {e}")))?,
-    );
+    let sm = handle.sm_version();
     let kernel_name = layer_norm_kernel_name::<T>(hidden_dim);
-    let kernel = Kernel::from_module(module, &kernel_name)
-        .map_err(|e| DnnError::LaunchFailed(format!("kernel lookup for {kernel_name}: {e}")))?;
+    let kernel = handle
+        .get_or_compile_kernel(&cache_key(&kernel_name, sm), &kernel_name, || {
+            generate_layer_norm_ptx::<T>(sm, hidden_dim)
+        })
+        .map_err(|e| DnnError::LaunchFailed(format!("compile {kernel_name}: {e}")))?;
 
     let (grid, block) = launch_config_for_row_norm(num_rows, hidden_dim);
     let params = LaunchParams::new(grid, block);
@@ -86,6 +84,7 @@ pub fn layer_norm<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("layer_norm: {e}")))?;
 

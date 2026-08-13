@@ -12,16 +12,14 @@
 //! Dequantization:
 //! `output[i] = (float)input[i] * scale[block_idx]`.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::ptx_helpers::*;
 use crate::types::TensorDesc;
 
@@ -91,10 +89,12 @@ pub fn quantize_block_scaled<T: GpuFloat>(
     }
 
     // Step 1: Per-block absmax + scale computation
-    let scale_ptx = generate_block_scale_ptx::<T>(handle.sm_version())?;
-    let scale_mod = Arc::new(Module::from_ptx(&scale_ptx)?);
     let scale_name = format!("dnn_block_scale_{}", T::NAME);
-    let scale_kernel = Kernel::from_module(scale_mod, &scale_name)?;
+    let scale_kernel = handle.get_or_compile_kernel(
+        &cache_key(&scale_name, handle.sm_version()),
+        &scale_name,
+        || generate_block_scale_ptx::<T>(handle.sm_version()),
+    )?;
 
     // One thread block per quantization block
     let params1 = LaunchParams::new(num_blocks, BS_QUANT_BLOCK.min(block_size));
@@ -107,14 +107,17 @@ pub fn quantize_block_scaled<T: GpuFloat>(
     );
 
     scale_kernel
+        .kernel()
         .launch(&params1, handle.stream(), &args1)
         .map_err(|e| DnnError::LaunchFailed(format!("block_scale: {e}")))?;
 
     // Step 2: Per-element quantization using block scales
-    let quant_ptx = generate_block_quant_ptx::<T>(handle.sm_version())?;
-    let quant_mod = Arc::new(Module::from_ptx(&quant_ptx)?);
     let quant_name = format!("dnn_block_quantize_{}", T::NAME);
-    let quant_kernel = Kernel::from_module(quant_mod, &quant_name)?;
+    let quant_kernel = handle.get_or_compile_kernel(
+        &cache_key(&quant_name, handle.sm_version()),
+        &quant_name,
+        || generate_block_quant_ptx::<T>(handle.sm_version()),
+    )?;
 
     let grid = grid_size_for(n_u32, BS_QUANT_BLOCK);
     let params2 = LaunchParams::new(grid, BS_QUANT_BLOCK);
@@ -127,6 +130,7 @@ pub fn quantize_block_scaled<T: GpuFloat>(
     );
 
     quant_kernel
+        .kernel()
         .launch(&params2, handle.stream(), &args2)
         .map_err(|e| DnnError::LaunchFailed(format!("block_quantize: {e}")))?;
 

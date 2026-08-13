@@ -14,16 +14,14 @@
 //!   order, multiplying each by its routing weight, and accumulates across
 //!   the top-k expert contributions.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams};
+use oxicuda_launch::{Dim3, LaunchParams};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::{cache_key, cache_key_with};
 use crate::ptx_helpers;
 use crate::types::{TensorDesc, TensorDescMut};
 
@@ -155,11 +153,12 @@ pub fn permute_tokens<T: GpuFloat>(
         });
     }
 
-    let ptx = generate_permute_ptx::<T>(handle.sm_version())?;
     let kernel_name = format!("moe_permute_tokens_{}", T::NAME);
-
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_permute_ptx::<T>(handle.sm_version()),
+    )?;
 
     let grid_x = hidden_dim.div_ceil(PERM_BLOCK_X);
     let grid = Dim3::new(grid_x, num_rows, 1);
@@ -174,7 +173,7 @@ pub fn permute_tokens<T: GpuFloat>(
         hidden_dim,
     );
 
-    kernel.launch(&params, handle.stream(), &args)?;
+    kernel.kernel().launch(&params, handle.stream(), &args)?;
     Ok(())
 }
 
@@ -347,11 +346,15 @@ pub fn unpermute_tokens<T: GpuFloat>(
         });
     }
 
-    let ptx = generate_unpermute_ptx::<T>(handle.sm_version(), top_k)?;
+    // `top_k` reaches code generation but not the entry name, so it joins the
+    // key. It is a small architectural constant (typically 1 or 2), so the
+    // extra key dimension cannot grow the cache without bound.
     let kernel_name = format!("moe_unpermute_tokens_{}", T::NAME);
-
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key_with(&kernel_name, handle.sm_version(), &format!("k={top_k}")),
+        &kernel_name,
+        || generate_unpermute_ptx::<T>(handle.sm_version(), top_k),
+    )?;
 
     let grid_x = hidden_dim.div_ceil(PERM_BLOCK_X);
     let grid = Dim3::new(grid_x, num_tokens, 1);
@@ -368,7 +371,7 @@ pub fn unpermute_tokens<T: GpuFloat>(
         top_k,
     );
 
-    kernel.launch(&params, handle.stream(), &args)?;
+    kernel.kernel().launch(&params, handle.stream(), &args)?;
     Ok(())
 }
 

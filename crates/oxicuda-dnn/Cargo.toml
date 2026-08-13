@@ -22,7 +22,7 @@ half = { workspace = true, optional = true }
 
 [features]
 default = []
-f16 = ["dep:half", "oxicuda-blas/f16"]
+f16 = ["dep:half", "oxicuda-blas/f16", "oxicuda-memory/half"]
 # On-device GPU validation tests (`src/gpu_tests/`). Enables `f16` so the
 # mixed-precision kernels can be exercised with real `half::f16` buffers.
 # Requires a CUDA driver + device at runtime; every test skips gracefully when
@@ -62,6 +62,14 @@ harness = false
 
 [[bench]]
 name = "fused_conv_bn_relu"
+harness = false
+
+[[bench]]
+name = "winograd_vs_implicit_gemm"
+harness = false
+
+[[bench]]
+name = "conv_engine_gflops_regression"
 harness = false
 
 [package.metadata.docs.rs]

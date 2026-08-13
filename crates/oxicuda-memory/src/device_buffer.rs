@@ -32,9 +32,65 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 
 use oxicuda_driver::error::{CudaError, CudaResult};
-use oxicuda_driver::ffi::CUdeviceptr;
-use oxicuda_driver::loader::try_driver;
+use oxicuda_driver::ffi::{CUdeviceptr, CUstream};
+use oxicuda_driver::loader::{DriverApi, try_driver};
 use oxicuda_driver::stream::Stream;
+
+// ---------------------------------------------------------------------------
+// Legacy-default-stream synchronisation
+// ---------------------------------------------------------------------------
+
+/// Blocks until the **legacy default stream** has drained, and *only* that
+/// stream.
+///
+/// # Why this exists (and why it is not `cuCtxSynchronize`)
+///
+/// The non-async driver transfer primitives this module uses — `cuMemsetD8_v2`
+/// (see [`DeviceBuffer::zeroed`]) and `cuMemcpyHtoD_v2` from pageable host
+/// memory (see [`DeviceBuffer::copy_from_host`]) — are documented as
+/// *asynchronous with respect to the host*: they enqueue onto the legacy
+/// default stream (the `NULL` stream) and return before the device-side work
+/// has landed. Every OxiCUDA [`Stream`] is created `CU_STREAM_NON_BLOCKING`
+/// (see [`Stream::new`]), which by definition opts **out** of the legacy
+/// stream's implicit ordering, so a consumer stream can observe the buffer
+/// before the memset/DMA completes — a real data race, not a theoretical one.
+/// Something must block until the legacy stream has drained.
+///
+/// `cuCtxSynchronize()` closes that race, but far too widely: it is documented
+/// as blocking "until the device has completed all preceding requested tasks"
+/// in the *current context* — i.e. every stream in the context, including the
+/// non-blocking ones that have nothing to do with this buffer. In a
+/// multi-stream pipeline (independent models on independent streams) that turns
+/// every `zeroed` / `copy_from_host` into a full device barrier and serialises
+/// unrelated work.
+///
+/// `cuStreamSynchronize(hStream)` is documented as waiting "until the device
+/// has completed all operations in the stream specified by `hStream`" — one
+/// stream's queue, not the context's. Passing a `NULL` handle
+/// ([`CUstream::default`], a null pointer) selects the default stream, which
+/// for a driver-API symbol resolved by name (`cuStreamSynchronize`, never the
+/// `_ptsz` per-thread-default alias the CUDA *Runtime* substitutes under
+/// `--default-stream per-thread`) is the legacy default stream — precisely the
+/// stream the memset / DMA above was enqueued on.
+///
+/// That makes this strictly narrower than `cuCtxSynchronize` while closing the
+/// exact same gap. The legacy stream's *implicit synchronisation* rule (an
+/// operation **enqueued into** it first waits for all preceding operations in
+/// the context's *blocking* streams) does not widen this call: that rule
+/// governs enqueued operations, not a host-side wait — and in any case OxiCUDA
+/// creates no blocking streams at all, so the set of streams it could pull in
+/// is empty.
+///
+/// Proven on-device by `tests/legacy_stream_sync_gpu.rs`: the legacy stream is
+/// still awaited (so the race stays closed), and an unrelated non-blocking
+/// stream no longer is (the actual speedup).
+#[inline]
+fn sync_legacy_stream(api: &DriverApi) -> CudaResult<()> {
+    // SAFETY: `cu_stream_synchronize` was resolved from the loaded driver, and
+    // a `NULL` stream handle is the driver API's legacy default stream — always
+    // a valid argument, no allocation of ours is referenced.
+    oxicuda_driver::check(unsafe { (api.cu_stream_synchronize)(CUstream::default()) })
+}
 
 // ---------------------------------------------------------------------------
 // DeviceBuffer<T>
@@ -105,16 +161,20 @@ impl<T: Copy> DeviceBuffer<T> {
     /// asynchronous with respect to the host for device memory, so the returned
     /// buffer would otherwise not be guaranteed zeroed relative to work later
     /// submitted on a `CU_STREAM_NON_BLOCKING` stream (which does *not*
-    /// implicitly synchronise with the default stream). A context synchronise
-    /// after the memset makes the "every byte is 0" postcondition hold for any
-    /// consumer stream, closing a data race where a kernel on a non-blocking
-    /// stream could read/overwrite this buffer concurrently with the pending
-    /// zero-fill.
+    /// implicitly synchronise with the default stream). Draining the legacy
+    /// stream after the memset makes the "every byte is 0" postcondition hold
+    /// for any consumer stream, closing a data race where a kernel on a
+    /// non-blocking stream could read/overwrite this buffer concurrently with
+    /// the pending zero-fill.
+    ///
+    /// The wait is scoped to the legacy default stream alone (see
+    /// `sync_legacy_stream`), so unrelated work in flight on other streams is
+    /// **not** waited on.
     ///
     /// # Errors
     ///
     /// Same as [`alloc`](Self::alloc), plus any error from `cuMemsetD8_v2` or
-    /// the context synchronise.
+    /// the legacy-stream synchronise.
     pub fn zeroed(n: usize) -> CudaResult<Self> {
         let buf = Self::alloc(n)?;
         let api = try_driver()?;
@@ -124,9 +184,9 @@ impl<T: Copy> DeviceBuffer<T> {
         // The non-async memset runs on the legacy default stream and is host
         // asynchronous for device memory; block until it has actually landed so
         // the buffer is zeroed with respect to every stream, not just the
-        // default one. Synchronises the context current on this thread (the
-        // same one `alloc`/memset targeted).
-        oxicuda_driver::check(unsafe { (api.cu_ctx_synchronize)() })?;
+        // default one. Waits on the legacy stream specifically -- the one the
+        // memset was enqueued on -- not the whole context.
+        sync_legacy_stream(api)?;
         Ok(buf)
     }
 
@@ -212,6 +272,17 @@ impl<T: Copy> DeviceBuffer<T> {
     ///
     /// The slice length must exactly match the buffer length.
     ///
+    /// The upload is **fully landed on the device before this function
+    /// returns**, and the wait is scoped to the legacy default stream alone
+    /// (see `sync_legacy_stream`) rather than to the whole context.
+    ///
+    /// # Performance
+    ///
+    /// `src` is ordinary pageable host memory, so the driver must stage it
+    /// through an internal DMA buffer. For a hot path that uploads the same
+    /// tensor shape every frame, a reusable page-locked staging buffer
+    /// ([`crate::StagingBuffer`]) is measurably faster.
+    ///
     /// # Errors
     ///
     /// * [`CudaError::InvalidValue`] if `src.len() != self.len()`.
@@ -233,8 +304,9 @@ impl<T: Copy> DeviceBuffer<T> {
         // `CU_STREAM_NON_BLOCKING`, which by definition does *not* implicitly
         // synchronise with the default stream, so a kernel or copy issued on one
         // can observe this buffer before the upload lands and silently read
-        // zeros. Block until the DMA has completed, mirroring `zeroed`.
-        oxicuda_driver::check(unsafe { (api.cu_ctx_synchronize)() })
+        // zeros. Block until the DMA has completed, mirroring `zeroed` -- on the
+        // legacy stream specifically, not the whole context.
+        sync_legacy_stream(api)
     }
 
     /// Copies this device buffer's contents into a host slice (synchronous).

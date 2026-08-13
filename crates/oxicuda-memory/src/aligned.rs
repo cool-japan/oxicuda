@@ -17,6 +17,17 @@
 //! | `Align4096`      | 4096    | Page-aligned for unified/mapped memory       |
 //! | `Custom(n)`      | n       | User-specified (must be a power of two)      |
 //!
+//! # Platform note (macOS)
+//!
+//! There is no CUDA driver on macOS, so [`AlignedBuffer::alloc`] returns
+//! [`CudaError::NotInitialized`] there — it never fabricates a synthetic
+//! device pointer. This matches `NativeMemoryPool::new` (`pool.rs`) and
+//! `VirtualMemoryReservation::reserve` (`virtual_memory.rs`) elsewhere in
+//! this crate. This is a *different* contract from `host_registered.rs`'s
+//! pinned-host-memory wrappers, which deliberately return a synthetic `Ok`
+//! handle on macOS because pinning already-valid host memory has a sensible
+//! host-only meaning even without a device; see that module's own docs.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -31,7 +42,6 @@ use std::marker::PhantomData;
 
 use oxicuda_driver::error::{CudaError, CudaResult};
 use oxicuda_driver::ffi::CUdeviceptr;
-#[cfg(not(target_os = "macos"))]
 use oxicuda_driver::loader::try_driver;
 
 // ---------------------------------------------------------------------------
@@ -316,18 +326,13 @@ impl<T: Copy> AlignedBuffer<T> {
             .checked_add(extra)
             .ok_or(CudaError::InvalidValue)?;
 
-        #[cfg(target_os = "macos")]
-        let (raw_ptr, aligned_ptr, offset) = {
-            // On macOS there is no CUDA driver.  Simulate with a synthetic
-            // pointer that mimics typical driver behaviour (256-byte aligned
-            // base).  Tests can exercise the alignment arithmetic.
-            let base: CUdeviceptr = 0x0000_0001_0000_0100; // 256-byte aligned
-            let aligned = round_up_to_alignment(base as usize, align_bytes) as CUdeviceptr;
-            let off = (aligned - base) as usize;
-            (base, aligned, off)
-        };
-
-        #[cfg(not(target_os = "macos"))]
+        // `try_driver()` returns `Err(CudaError::NotInitialized)` on macOS
+        // (there is no CUDA driver to load there), so this call fails
+        // naturally on that platform — the same contract already followed
+        // by `NativeMemoryPool::new` (pool.rs) and
+        // `VirtualMemoryReservation::reserve` (virtual_memory.rs) elsewhere
+        // in this crate. No synthetic, unbacked device pointer is
+        // fabricated and returned as a fake success.
         let (raw_ptr, aligned_ptr, offset) = {
             let api = try_driver()?;
             let mut base: CUdeviceptr = 0;
@@ -629,56 +634,122 @@ mod tests {
         assert!(info.is_page_aligned);
     }
 
-    // -- AlignedBuffer tests (macOS synthetic) ------------------------------
+    // -- AlignedBuffer tests (macOS: no CUDA driver) ------------------------
+    //
+    // There is no CUDA driver on macOS, so `AlignedBuffer::alloc` must fail
+    // the same honest way `NativeMemoryPool::new` (pool.rs) and
+    // `VirtualMemoryReservation::reserve` (virtual_memory.rs) do —
+    // `Err(CudaError::NotInitialized)` — rather than fabricating an
+    // unbacked device pointer and returning `Ok`. The pure alignment-
+    // arithmetic helpers (`round_up_to_alignment`, `validate_alignment`,
+    // `coalesce_alignment`, `check_alignment`) are covered by the
+    // platform-independent tests above; the real allocation path (which
+    // needs an actual driver) is covered by `gpu_tests` below.
 
     #[cfg(target_os = "macos")]
     mod buffer_tests {
         use super::super::*;
 
+        /// Asserts that `result` is `Err(CudaError::NotInitialized)`.
+        ///
+        /// Takes the success value by type only (no `Debug` bound) since
+        /// `AlignedBuffer<T>` does not implement `Debug`.
+        fn assert_not_initialized<T>(result: CudaResult<T>) {
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("expected Err(NotInitialized) on macOS, got Ok(_)"),
+            };
+            assert!(
+                matches!(err, CudaError::NotInitialized),
+                "expected NotInitialized, got {err:?}"
+            );
+        }
+
         #[test]
-        fn alloc_default_alignment() {
-            let buf = AlignedBuffer::<f32>::alloc(128, Alignment::Default);
-            assert!(buf.is_ok());
-            let buf = buf.unwrap_or_else(|_| panic!("alloc failed"));
+        fn alloc_default_alignment_fails_without_driver() {
+            assert_not_initialized(AlignedBuffer::<f32>::alloc(128, Alignment::Default));
+        }
+
+        #[test]
+        fn alloc_512_alignment_fails_without_driver() {
+            assert_not_initialized(AlignedBuffer::<f32>::alloc(256, Alignment::Align512));
+        }
+
+        #[test]
+        fn alloc_4096_alignment_fails_without_driver() {
+            assert_not_initialized(AlignedBuffer::<f64>::alloc(64, Alignment::Align4096));
+        }
+
+        /// `n == 0` is rejected before the driver is ever consulted, so this
+        /// stays `InvalidValue` regardless of platform.
+        #[test]
+        fn alloc_zero_elements_fails_with_invalid_value() {
+            let result = AlignedBuffer::<f32>::alloc(0, Alignment::Default);
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("expected an error for zero elements"),
+            };
+            assert!(matches!(err, CudaError::InvalidValue));
+        }
+
+        /// An invalid alignment is likewise rejected before the driver is
+        /// consulted, so this stays `InvalidValue` regardless of platform.
+        #[test]
+        fn alloc_invalid_alignment_fails_with_invalid_value() {
+            let result = AlignedBuffer::<f32>::alloc(64, Alignment::Custom(3));
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("expected an error for invalid alignment"),
+            };
+            assert!(matches!(err, CudaError::InvalidValue));
+        }
+    }
+
+    // -- AlignedBuffer tests (real driver, Linux/Windows + NVIDIA) ----------
+
+    #[cfg(feature = "gpu-tests")]
+    mod gpu_tests {
+        use super::super::*;
+
+        // Each test skips gracefully (rather than failing) when no driver
+        // is available, so this same module is safe to compile under
+        // `gpu-tests` on any platform (matching the pattern used by
+        // `pool.rs`'s and `virtual_memory.rs`'s own `gpu_tests` modules)
+        // while providing real coverage on Linux/Windows + NVIDIA CI.
+
+        #[test]
+        fn alloc_default_alignment_round_trips() {
+            let Ok(buf) = AlignedBuffer::<f32>::alloc(128, Alignment::Default) else {
+                return;
+            };
             assert_eq!(buf.len(), 128);
             assert!(!buf.is_empty());
             assert!(buf.is_aligned());
         }
 
         #[test]
-        fn alloc_512_alignment() {
-            let buf = AlignedBuffer::<f32>::alloc(256, Alignment::Align512);
-            assert!(buf.is_ok());
-            let buf = buf.unwrap_or_else(|_| panic!("alloc failed"));
+        fn alloc_512_alignment_round_trips() {
+            let Ok(buf) = AlignedBuffer::<f32>::alloc(256, Alignment::Align512) else {
+                return;
+            };
             assert!(buf.is_aligned());
             assert_eq!(buf.as_device_ptr() % 512, 0);
         }
 
         #[test]
-        fn alloc_4096_alignment() {
-            let buf = AlignedBuffer::<f64>::alloc(64, Alignment::Align4096);
-            assert!(buf.is_ok());
-            let buf = buf.unwrap_or_else(|_| panic!("alloc failed"));
+        fn alloc_4096_alignment_round_trips() {
+            let Ok(buf) = AlignedBuffer::<f64>::alloc(64, Alignment::Align4096) else {
+                return;
+            };
             assert!(buf.is_aligned());
             assert_eq!(buf.as_device_ptr() % 4096, 0);
         }
 
         #[test]
-        fn alloc_zero_elements_fails() {
-            let result = AlignedBuffer::<f32>::alloc(0, Alignment::Default);
-            assert!(result.is_err());
-        }
-
-        #[test]
-        fn alloc_invalid_alignment_fails() {
-            let result = AlignedBuffer::<f32>::alloc(64, Alignment::Custom(3));
-            assert!(result.is_err());
-        }
-
-        #[test]
-        fn wasted_bytes_at_least_zero() {
-            let buf = AlignedBuffer::<f32>::alloc(128, Alignment::Align512)
-                .unwrap_or_else(|_| panic!("alloc failed"));
+        fn wasted_bytes_bounded_by_alignment() {
+            let Ok(buf) = AlignedBuffer::<f32>::alloc(128, Alignment::Align512) else {
+                return;
+            };
             // Wasted bytes = allocated_bytes - (128 * 4)
             // allocated_bytes = 128*4 + (512 - 1) = 1023
             // wasted = 1023 - 512 = 511
@@ -686,9 +757,10 @@ mod tests {
         }
 
         #[test]
-        fn alignment_accessor() {
-            let buf = AlignedBuffer::<u8>::alloc(64, Alignment::Align1024)
-                .unwrap_or_else(|_| panic!("alloc failed"));
+        fn alignment_accessor_round_trips() {
+            let Ok(buf) = AlignedBuffer::<u8>::alloc(64, Alignment::Align1024) else {
+                return;
+            };
             assert_eq!(*buf.alignment(), Alignment::Align1024);
         }
     }

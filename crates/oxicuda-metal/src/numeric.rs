@@ -13,6 +13,14 @@
 //!   limbs, with the same Dekker/Knuth arithmetic the
 //!   [`crate::msl_nn::gemm_msl_f64_ds`] kernel performs on the GPU.  Used to
 //!   prepare/verify FP64-emulated GEMM operands on the host.
+//!
+//! * [`pack_f16`] / [`unpack_f16`] — host-side IEEE-754 binary16 conversion, so
+//!   a caller of [`crate::msl::gemm_msl_f16`] or
+//!   [`crate::msl::gemm_msl_v2`]`(`[`GemmDtype::F16`](crate::msl::GemmDtype)`)`
+//!   does not have to hand-roll the bit packing for the `half` buffers.
+//!
+//! * [`pack_bf16`] / [`unpack_bf16`] — host-side bfloat16 conversion. See
+//!   [`pack_bf16`] for an honest statement of the device-side status.
 
 use crate::error::{MetalError, MetalResult};
 
@@ -165,10 +173,58 @@ impl DoubleSingle {
     }
 
     /// Split an `f64` into two `f32` limbs (hi = nearest f32, lo = residual).
+    ///
+    /// # Domain
+    ///
+    /// `DoubleSingle` inherits `f32`'s **exponent** range; only the mantissa is
+    /// extended. Values with `|a| > f32::MAX` are therefore not representable:
+    /// `hi` saturates to `±inf`.  Previously `lo` was then computed as
+    /// `(a - inf) as f32 = ∓inf`, so [`to_f64`](Self::to_f64) returned `NaN` and
+    /// [`pack_df64`] wrote that straight into the GPU buffer. The low limb is now
+    /// forced to zero whenever `hi` is not finite, so an out-of-range value
+    /// degrades to a plain `±inf` instead of a `NaN`.
+    ///
+    /// Use [`try_from_f64`](Self::try_from_f64) to reject out-of-range input
+    /// instead of saturating.
     pub fn from_f64(a: f64) -> Self {
         let hi = a as f32;
+        if !hi.is_finite() {
+            // Out of f32's exponent range (or a non-finite input): a residual
+            // limb is meaningless here and `a - inf` would poison it with NaN.
+            return Self { hi, lo: 0.0 };
+        }
         let lo = (a - hi as f64) as f32;
         Self { hi, lo }
+    }
+
+    /// Split an `f64` into two `f32` limbs, rejecting values `DoubleSingle`
+    /// cannot represent.
+    ///
+    /// Returns [`MetalError::InvalidArgument`] for a non-finite `a` and for any
+    /// `|a| > f32::MAX` (which would otherwise saturate the high limb to
+    /// infinity — see [`from_f64`](Self::from_f64)).
+    pub fn try_from_f64(a: f64) -> MetalResult<Self> {
+        if !a.is_finite() {
+            return Err(MetalError::InvalidArgument(format!(
+                "DoubleSingle cannot represent the non-finite value {a}"
+            )));
+        }
+        let hi = a as f32;
+        if !hi.is_finite() {
+            return Err(MetalError::InvalidArgument(format!(
+                "{a} is outside f32's exponent range; DoubleSingle extends the \
+                 mantissa, not the exponent"
+            )));
+        }
+        Ok(Self {
+            hi,
+            lo: (a - f64::from(hi)) as f32,
+        })
+    }
+
+    /// Whether both limbs are finite.
+    pub fn is_finite(self) -> bool {
+        self.hi.is_finite() && self.lo.is_finite()
     }
 
     /// Reconstruct an approximate `f64` from the two limbs.
@@ -214,15 +270,70 @@ impl std::ops::Mul for DoubleSingle {
     }
 }
 
+impl std::ops::Neg for DoubleSingle {
+    type Output = Self;
+
+    /// Exact negation — negating a float never rounds, so both limbs flip sign.
+    fn neg(self) -> Self {
+        Self {
+            hi: -self.hi,
+            lo: -self.lo,
+        }
+    }
+}
+
+impl std::ops::Sub for DoubleSingle {
+    type Output = Self;
+
+    /// Extended-precision subtraction, `self + (-other)`.
+    fn sub(self, other: Self) -> Self {
+        self + (-other)
+    }
+}
+
+impl std::ops::Div for DoubleSingle {
+    type Output = Self;
+
+    /// Extended-precision division by Newton-style quotient refinement.
+    ///
+    /// Three correction terms are accumulated: `q1 = a.hi / b.hi`, then the
+    /// residual `a - q1*b` supplies `q2`, and its residual supplies `q3`. The
+    /// result is renormalised with `two_sum`.
+    ///
+    /// Division by zero follows `f32` semantics: `hi` becomes `±inf` (or `NaN`
+    /// for `0/0`) and the result is no longer [`is_finite`](Self::is_finite).
+    fn div(self, other: Self) -> Self {
+        let q1 = self.hi / other.hi;
+        let r1 = self - Self::from_f32(q1) * other;
+        let q2 = r1.hi / other.hi;
+        let r2 = r1 - Self::from_f32(q2) * other;
+        let q3 = r2.hi / other.hi;
+        let s = Self::two_sum(q1, q2);
+        Self::two_sum(s.hi, s.lo + q3)
+    }
+}
+
 impl std::ops::AddAssign for DoubleSingle {
     fn add_assign(&mut self, other: Self) {
         *self = *self + other;
     }
 }
 
+impl std::ops::SubAssign for DoubleSingle {
+    fn sub_assign(&mut self, other: Self) {
+        *self = *self - other;
+    }
+}
+
 impl std::ops::MulAssign for DoubleSingle {
     fn mul_assign(&mut self, other: Self) {
         *self = *self * other;
+    }
+}
+
+impl std::ops::DivAssign for DoubleSingle {
+    fn div_assign(&mut self, other: Self) {
+        *self = *self / other;
     }
 }
 
@@ -238,6 +349,25 @@ pub fn pack_df64(data: &[f64]) -> Vec<f32> {
     out
 }
 
+/// [`pack_df64`] that rejects values `DoubleSingle` cannot represent.
+///
+/// [`pack_df64`] saturates out-of-range values to `±inf` (see
+/// [`DoubleSingle::from_f64`]); this variant returns
+/// [`MetalError::InvalidArgument`] naming the offending index instead, so a bad
+/// operand is caught on the host rather than becoming an infinity in a GPU
+/// buffer.
+pub fn pack_df64_checked(data: &[f64]) -> MetalResult<Vec<f32>> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    for (idx, &v) in data.iter().enumerate() {
+        let ds = DoubleSingle::try_from_f64(v).map_err(|e| {
+            MetalError::InvalidArgument(format!("df64 element {idx} is not representable: {e}"))
+        })?;
+        out.push(ds.hi);
+        out.push(ds.lo);
+    }
+    Ok(out)
+}
+
 /// Reconstruct a slice of `f64` from interleaved `[hi, lo]` `f32` pairs.
 ///
 /// Returns [`MetalError::InvalidArgument`] if the input length is odd.
@@ -251,6 +381,146 @@ pub fn unpack_df64(data: &[f32]) -> MetalResult<Vec<f64>> {
         .chunks_exact(2)
         .map(|c| DoubleSingle { hi: c[0], lo: c[1] }.to_f64())
         .collect())
+}
+
+// ─── Half precision (IEEE-754 binary16) ────────────────────────────────────────
+
+/// `2^-24` — the value of the least-significant bit of a binary16 subnormal.
+const F16_SUBNORMAL_ULP: f32 = 1.0 / 16_777_216.0;
+
+/// Convert an `f32` to the IEEE-754 **binary16** bit pattern MSL's `half` uses.
+///
+/// Rounds to nearest, ties to even, exactly as the hardware conversion does.
+/// Subnormal results are produced correctly, values above binary16's range
+/// saturate to `±inf`, and NaNs stay NaNs (with a non-zero payload, so a
+/// signalling NaN never degrades into an infinity).
+///
+/// The layout is byte-compatible with `half::f16::to_bits`, so a caller already
+/// using the `half` crate can interoperate without a conversion.
+pub fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x007f_ffff;
+
+    if exp == 0xff {
+        return if mantissa == 0 {
+            sign | 0x7c00
+        } else {
+            // Preserve NaN-ness; force a non-zero payload so it cannot alias inf.
+            sign | 0x7e00 | ((mantissa >> 13) as u16 & 0x03ff)
+        };
+    }
+
+    // Re-bias: binary32 bias 127 -> binary16 bias 15.
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 0x1f {
+        return sign | 0x7c00; // overflow -> +-inf
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return sign; // magnitude below half of the smallest subnormal
+        }
+        // Subnormal: restore the implicit leading 1 and shift into place.
+        let m = mantissa | 0x0080_0000;
+        let shift = (14 - new_exp) as u32; // 14..=24
+        let half = 1u32 << (shift - 1);
+        let mut result = m >> shift;
+        let rem = m & ((1u32 << shift) - 1);
+        if rem > half || (rem == half && (result & 1) == 1) {
+            result += 1; // may carry into the smallest normal — that is correct
+        }
+        return sign | result as u16;
+    }
+
+    let mut h = ((new_exp as u32) << 10) | (mantissa >> 13);
+    let rem = mantissa & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
+        h += 1; // a carry out of the mantissa correctly bumps the exponent
+    }
+    sign | h as u16
+}
+
+/// Convert an IEEE-754 binary16 bit pattern back to `f32` (always exact).
+pub fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign_bit = bits & 0x8000;
+    let exp = u32::from((bits >> 10) & 0x1f);
+    let mant = u32::from(bits & 0x03ff);
+    let sign = u32::from(sign_bit) << 16;
+
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign); // +-0
+        }
+        let magnitude = mant as f32 * F16_SUBNORMAL_ULP;
+        return if sign_bit != 0 { -magnitude } else { magnitude };
+    }
+    if exp == 0x1f {
+        return f32::from_bits(sign | 0x7f80_0000 | (mant << 13));
+    }
+    // Normal: bias 15 -> 127.
+    f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+}
+
+/// Pack `f32` data into the binary16 buffer an MSL `half` kernel expects.
+///
+/// This is the missing host half of [`crate::msl::gemm_msl_f16`] and of
+/// [`crate::msl::gemm_msl_v2`] with
+/// [`GemmDtype::F16`](crate::msl::GemmDtype::F16): both kernels declare
+/// `device const half*` operands, so every caller previously had to hand-roll
+/// binary16 bit packing.
+pub fn pack_f16(data: &[f32]) -> Vec<u16> {
+    data.iter().copied().map(f32_to_f16_bits).collect()
+}
+
+/// Unpack a binary16 buffer produced by an MSL `half` kernel back to `f32`.
+pub fn unpack_f16(data: &[u16]) -> Vec<f32> {
+    data.iter().copied().map(f16_bits_to_f32).collect()
+}
+
+// ─── bfloat16 ──────────────────────────────────────────────────────────────────
+
+/// Convert an `f32` to a **bfloat16** bit pattern (the top 16 bits, rounded to
+/// nearest with ties to even).
+///
+/// # Device-side status (honest)
+///
+/// These helpers are host-side only. MSL gained a native `bfloat` scalar type in
+/// **Metal 3.1 (macOS 14 / iOS 17)**; this crate ships **no** `bfloat` kernel
+/// today — a grep for `bfloat` across `msl.rs`/`msl_nn.rs` finds nothing, and
+/// neither [`crate::msl::GemmDtype`] nor any dispatcher offers a bf16 path. A
+/// `bfloat` GEMM would additionally need a device-family/Metal-version gate,
+/// because a kernel using `bfloat` fails to *compile* on an older stack rather
+/// than failing at dispatch. What these functions are good for right now is
+/// converting bf16 weights (the common storage format for transformer
+/// checkpoints) to `f32` or `half` before uploading them to a kernel this crate
+/// actually has.
+pub fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() {
+        // Truncation alone can clear every payload bit and turn a NaN into an
+        // infinity; force a quiet-NaN payload bit.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let rounding = 0x7fff + ((bits >> 16) & 1);
+    ((bits.wrapping_add(rounding)) >> 16) as u16
+}
+
+/// Convert a bfloat16 bit pattern back to `f32` (always exact — bf16 is a
+/// truncated `f32`).
+pub fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// Pack `f32` data into bfloat16 bit patterns. See [`f32_to_bf16_bits`] for the
+/// device-side status.
+pub fn pack_bf16(data: &[f32]) -> Vec<u16> {
+    data.iter().copied().map(f32_to_bf16_bits).collect()
+}
+
+/// Unpack bfloat16 bit patterns back to `f32`.
+pub fn unpack_bf16(data: &[u16]) -> Vec<f32> {
+    data.iter().copied().map(bf16_bits_to_f32).collect()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -401,5 +671,212 @@ mod tests {
     #[test]
     fn unpack_df64_odd_length_errors() {
         assert!(unpack_df64(&[1.0, 2.0, 3.0]).is_err());
+    }
+
+    // ── DoubleSingle: overflow domain ──
+    #[test]
+    fn df64_from_f64_saturates_instead_of_producing_nan() {
+        // |a| > f32::MAX: hi saturates to inf. The low limb must stay 0 so
+        // to_f64() yields inf, not the NaN the old `a - inf` residual produced.
+        for a in [1e40f64, -1e40] {
+            let d = DoubleSingle::from_f64(a);
+            assert!(d.hi.is_infinite());
+            assert_eq!(d.lo, 0.0);
+            assert!(d.to_f64().is_infinite(), "to_f64 must not be NaN");
+            assert!(!d.is_finite());
+            assert!(DoubleSingle::try_from_f64(a).is_err());
+        }
+        assert!(DoubleSingle::try_from_f64(f64::NAN).is_err());
+        assert!(DoubleSingle::try_from_f64(f64::INFINITY).is_err());
+        let ok = DoubleSingle::try_from_f64(1.0 + 1e-9).expect("in range");
+        assert!(ok.is_finite());
+        assert!((ok.to_f64() - (1.0 + 1e-9)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn pack_df64_checked_reports_the_offending_index() {
+        assert!(pack_df64_checked(&[1.0, 2.0]).is_ok());
+        let err = pack_df64_checked(&[1.0, 1e40, 3.0]).expect_err("out of range");
+        assert!(err.to_string().contains("element 1"), "{err}");
+        // The unchecked variant still saturates rather than erroring.
+        let packed = pack_df64(&[1e40]);
+        assert!(packed[0].is_infinite());
+        assert_eq!(packed[1], 0.0);
+    }
+
+    // ── DoubleSingle: Neg / Sub / Div ──
+    #[test]
+    fn df64_neg_is_exact_and_sub_is_add_of_the_negation() {
+        let a = DoubleSingle::from_f64(1.0 + 1e-9);
+        let n = -a;
+        assert_eq!(n.hi, -a.hi);
+        assert_eq!(n.lo, -a.lo);
+        assert_eq!(a + n, DoubleSingle::ZERO);
+
+        let b = DoubleSingle::from_f64(1.0);
+        let diff = a - b;
+        // A plain f32 subtraction of these two loses the difference entirely.
+        assert!(
+            (diff.to_f64() - 1e-9).abs() < 1e-16,
+            "df64 sub error: {}",
+            diff.to_f64() - 1e-9
+        );
+        let mut acc = a;
+        acc -= b;
+        assert_eq!(acc, diff);
+    }
+
+    #[test]
+    fn df64_div_beats_f32_and_round_trips_through_mul() {
+        let a = DoubleSingle::from_f64(1.0);
+        let b = DoubleSingle::from_f64(3.0);
+        let q = a / b;
+        let err = (q.to_f64() - (1.0f64 / 3.0)).abs();
+        assert!(err < 1e-13, "df64 div error too large: {err}");
+        // f32 alone is ~6e-8 off, so this is a real improvement.
+        assert!(err < ((1.0f32 / 3.0) as f64 - 1.0f64 / 3.0).abs());
+
+        // (a / b) * b must recover a to df64 precision.
+        let back = q * b;
+        assert!((back.to_f64() - 1.0).abs() < 1e-13);
+
+        let mut acc = DoubleSingle::from_f64(10.0);
+        acc /= DoubleSingle::from_f64(4.0);
+        assert!((acc.to_f64() - 2.5).abs() < 1e-15);
+
+        // Division by zero follows f32 semantics rather than panicking.
+        let inf = DoubleSingle::from_f64(1.0) / DoubleSingle::ZERO;
+        assert!(!inf.is_finite());
+    }
+
+    // ── binary16 ──
+    #[test]
+    fn f16_round_trips_exactly_representable_values() {
+        // Only values whose mantissa fits binary16's 10 bits round-trip exactly.
+        for &v in &[
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -2.5,
+            65504.0,
+            -65504.0,
+            2.0f32.powi(-14),
+        ] {
+            let back = f16_bits_to_f32(f32_to_f16_bits(v));
+            assert_eq!(back, v, "binary16 round trip failed for {v}");
+        }
+        // The two zeros keep their sign.
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+        assert!(f16_bits_to_f32(0x8000).is_sign_negative());
+        // Known bit patterns.
+        assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
+        assert_eq!(f32_to_f16_bits(-2.0), 0xc000);
+    }
+
+    #[test]
+    fn f16_handles_subnormals_overflow_and_nan() {
+        // Smallest positive subnormal: 2^-24.
+        let tiny = 2.0f32.powi(-24);
+        assert_eq!(f32_to_f16_bits(tiny), 0x0001);
+        assert_eq!(f16_bits_to_f32(0x0001), tiny);
+        // Largest subnormal: 1023 * 2^-24.
+        assert_eq!(f32_to_f16_bits(1023.0 * tiny), 0x03ff);
+        // Half of the smallest subnormal rounds to even => zero.
+        assert_eq!(f32_to_f16_bits(tiny * 0.5), 0x0000);
+        // Just above half rounds up.
+        assert_eq!(f32_to_f16_bits(tiny * 0.51), 0x0001);
+        // Rounding a subnormal up into the smallest normal.
+        assert_eq!(f32_to_f16_bits(1023.5 * tiny), 0x0400);
+
+        // Overflow saturates to infinity, not to a finite maximum.
+        assert!(f16_bits_to_f32(f32_to_f16_bits(1e30)).is_infinite());
+        assert!(f16_bits_to_f32(f32_to_f16_bits(-1e30)).is_sign_negative());
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xfc00);
+        // 65520 is the round-to-inf threshold; 65504 is the largest finite.
+        assert_eq!(f32_to_f16_bits(65504.0), 0x7bff);
+        assert!(f16_bits_to_f32(f32_to_f16_bits(65536.0)).is_infinite());
+
+        // NaN stays NaN (never collapses into infinity).
+        assert!(f16_bits_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
+    }
+
+    #[test]
+    fn f16_rounds_to_nearest_even() {
+        // 1 + 2^-11 sits exactly between 1.0 (0x3c00) and 1 + 2^-10 (0x3c01);
+        // ties-to-even must pick the one with an even mantissa, i.e. 0x3c00.
+        assert_eq!(f32_to_f16_bits(1.0 + 2.0f32.powi(-11)), 0x3c00);
+        // 1 + 3*2^-11 ties between 0x3c01 and 0x3c02 -> the even one.
+        assert_eq!(f32_to_f16_bits(1.0 + 3.0 * 2.0f32.powi(-11)), 0x3c02);
+    }
+
+    #[test]
+    fn pack_unpack_f16_roundtrip() {
+        let data = [1.0f32, -2.5, 0.125, 100.0, -0.0];
+        let packed = pack_f16(&data);
+        assert_eq!(packed.len(), data.len());
+        let unpacked = unpack_f16(&packed);
+        for (got, want) in unpacked.iter().zip(data.iter()) {
+            assert_eq!(got, want);
+        }
+        assert!(pack_f16(&[]).is_empty());
+    }
+
+    // ── bfloat16 ──
+    #[test]
+    fn bf16_round_trips_and_rounds_to_nearest_even() {
+        // bf16 keeps only 8 mantissa bits, so pick values that fit in them.
+        for &v in &[0.0f32, -0.0, 1.0, -2.0, 0.5, 1.5, -256.0, 2.0f32.powi(120)] {
+            assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(v)), v, "bf16 rt {v}");
+        }
+        // bf16 keeps f32's exponent range, so no overflow to infinity.
+        assert!(bf16_bits_to_f32(f32_to_bf16_bits(1e30)).is_finite());
+        assert!(f32_to_bf16_bits(f32::INFINITY) == 0x7f80);
+        assert!(bf16_bits_to_f32(f32_to_bf16_bits(f32::NAN)).is_nan());
+
+        // bf16 has 7 explicit mantissa bits, so consecutive values near 1.0 are
+        // 2^-7 apart and the tie point is 1 + 2^-8.
+        let step = 2.0f32.powi(-7);
+        // Below the midpoint: rounds down.
+        assert_eq!(
+            bf16_bits_to_f32(f32_to_bf16_bits(1.0 + 2.0f32.powi(-9))),
+            1.0
+        );
+        // Exactly the midpoint, and 1.0's mantissa is even: stays 1.0.
+        assert_eq!(
+            bf16_bits_to_f32(f32_to_bf16_bits(1.0 + 2.0f32.powi(-8))),
+            1.0
+        );
+        // Past the midpoint: rounds up one step.
+        let up = bf16_bits_to_f32(f32_to_bf16_bits(1.0 + 3.0 * 2.0f32.powi(-9)));
+        assert_eq!(up, 1.0 + step, "bf16 must round past the midpoint up");
+        // A tie whose lower neighbour has an ODD mantissa must round up.
+        let tie_up = bf16_bits_to_f32(f32_to_bf16_bits(1.0 + step + 2.0f32.powi(-8)));
+        assert_eq!(
+            tie_up,
+            1.0 + 2.0 * step,
+            "ties must go to the even mantissa"
+        );
+        // Precision is 8 mantissa bits, so relative error stays under 2^-8.
+        for &v in &[1.234f32, -56.78, 9.87e10] {
+            let back = bf16_bits_to_f32(f32_to_bf16_bits(v));
+            assert!(
+                (back - v).abs() <= v.abs() * 2.0f32.powi(-8),
+                "{v} -> {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_unpack_bf16_roundtrip() {
+        let data = [1.0f32, -2.0, 0.25, 2.0f32.powi(60)];
+        let unpacked = unpack_bf16(&pack_bf16(&data));
+        for (got, want) in unpacked.iter().zip(data.iter()) {
+            assert_eq!(got, want);
+        }
+        assert!(pack_bf16(&[]).is_empty());
     }
 }

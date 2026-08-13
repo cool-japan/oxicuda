@@ -35,7 +35,74 @@
 //! └──────────────────────────────────────────────┘
 //! ```
 //!
-//! ## Quick Start
+//! ## Quick Start — portable compute (works on macOS)
+//!
+//! [`compute::default_backend`] probes the machine and returns the best
+//! backend it can actually open, already initialized: an NVIDIA GPU through
+//! CUDA, an Apple GPU through Metal (feature `metal`), and otherwise the
+//! pure-Rust [`CpuBackend`](backend::CpuBackend). It never returns
+//! `NotInitialized` just because there is no NVIDIA driver.
+//!
+//! ```
+//! use oxicuda::backend::{ComputeBackend, UnaryOp};
+//!
+//! fn main() -> oxicuda::backend::BackendResult<()> {
+//!     let backend = oxicuda::compute::default_backend()?;
+//!     println!("computing on the {} backend", backend.name());
+//!
+//!     let values = [-1.5f32, 0.0, 2.5, 4.0];
+//!     let bytes = std::mem::size_of_val(&values);
+//!     let host: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+//!
+//!     let input = backend.alloc(bytes)?;
+//!     let output = backend.alloc(bytes)?;
+//!     backend.copy_htod(input, &host)?;
+//!     backend.unary(UnaryOp::Relu, input, output, values.len())?;
+//!     backend.synchronize()?;
+//!
+//!     let mut result = vec![0u8; bytes];
+//!     backend.copy_dtoh(&mut result, output)?;
+//!     let relu: Vec<f32> = result
+//!         .chunks_exact(4)
+//!         .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+//!         .collect();
+//!     assert_eq!(relu, vec![0.0, 0.0, 2.5, 4.0]);
+//!
+//!     backend.free(input)?;
+//!     backend.free(output)?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## macOS
+//!
+//! The CUDA driver API does not exist on macOS: [`init`] and every
+//! `oxicuda-driver` entry point return `Err(CudaError::NotInitialized)` there.
+//! The compute-backend path above is the supported way to use a Mac's GPU:
+//!
+//! ```toml
+//! [dependencies]
+//! oxicuda = { version = "0.5", features = ["metal"] }
+//! ```
+//!
+//! With that feature, [`compute::default_backend`] returns a
+//! `MetalBackend` bound to the Apple GPU. Honest scope, as of this release:
+//!
+//! * **GPU-executed through Metal**: `gemm`, `batched_gemm`, the element-wise
+//!   `unary` / `binary` ops, and the axis `reduce` ops.
+//! * **Not accelerated**: `conv2d_forward` and `attention` currently run on the
+//!   host inside the Metal backend, and `softmax`, `gather`, `scatter`,
+//!   `gemm_mixed_precision` and the `conv2d` backward passes return
+//!   [`BackendError::Unsupported`](backend::BackendError).
+//! * **Not routed through Metal at all**: the `blas`, `dnn`, `fft`, `sparse`,
+//!   `solver` and `rand` features are built on the CUDA driver path, so on
+//!   macOS they still fail with `NotInitialized`. Use the
+//!   [`ComputeBackend`](backend::ComputeBackend) API for GPU work on a Mac.
+//!
+//! Without the `metal` feature nothing breaks — selection simply falls through
+//! to the CPU backend, which computes correctly everywhere.
+//!
+//! ## Quick Start — CUDA driver API
 //!
 //! ```no_run
 //! use oxicuda::prelude::*;
@@ -78,7 +145,12 @@
 //! | `solver` | cuSOLVER equivalent | No |
 //! | `rand` | cuRAND equivalent | No |
 //! | `pool` | Stream-ordered memory pool | No |
-//! | `backend` | Abstract compute backend trait | No |
+//! | `metal` | Apple Metal compute backend (macOS GPU) | No |
+//! | `webgpu` | WebGPU / `wgpu` compute backend | No |
+//! | `vulkan` | Vulkan compute backend | No |
+//! | `rocm` | AMD ROCm/HIP compute backend | No |
+//! | `level-zero` | Intel Level Zero compute backend | No |
+//! | `backend` | No-op; the [`backend`] module is always available | No |
 //! | `full` | Enable all features | No |
 //!
 //! (C) 2026 COOLJAPAN OU (Team KitaSan)
@@ -122,10 +194,23 @@ pub mod device_pool;
 /// Abstract compute backend for GPU-accelerated operations.
 ///
 /// Provides the [`ComputeBackend`](backend::ComputeBackend) trait that
-/// higher-level crates use for GPU dispatch without coupling to a
-/// specific GPU API.
-#[cfg(feature = "backend")]
+/// higher-level crates use for GPU dispatch without coupling to a specific
+/// GPU API, the always-available [`CpuBackend`](backend::CpuBackend), the
+/// [`BackendRegistry`](backend::BackendRegistry) control plane, and the
+/// concrete backends enabled by feature flags.
+///
+/// Always available: `oxicuda-backend` is a mandatory dependency, so the
+/// abstraction costs nothing to expose. (The `backend` feature is kept as a
+/// no-op for compatibility with dependants that name it.)
 pub mod backend;
+
+/// Ready-to-use backend selection: probe this machine and return the best
+/// initialised [`ComputeBackend`](backend::ComputeBackend).
+///
+/// See [`compute::default_backend`] — the one call that turns
+/// `cargo add oxicuda` into a working compute path on any platform,
+/// including macOS.
+pub mod compute;
 
 /// ONNX GPU inference backend.
 ///
@@ -319,7 +404,12 @@ pub mod features {
     /// Whether random number generation is available.
     pub const HAS_RAND: bool = cfg!(feature = "rand");
     /// Whether the abstract compute backend is available.
-    pub const HAS_BACKEND: bool = cfg!(feature = "backend");
+    ///
+    /// Always `true`: `oxicuda-backend` is a mandatory dependency, so
+    /// [`crate::backend`] and [`crate::compute`] are compiled unconditionally.
+    /// The `backend` feature is retained as a no-op for dependants that
+    /// still name it.
+    pub const HAS_BACKEND: bool = true;
     /// Whether the ONNX inference backend is available.
     pub const HAS_ONNX_BACKEND: bool = cfg!(feature = "onnx-backend");
     /// Whether the ToRSh tensor backend is available.
@@ -350,12 +440,30 @@ pub mod features {
 // ComputeBackend auto-selection threshold
 // ---------------------------------------------------------------------------
 
-/// Auto-selection threshold for the compute backend.
+/// Auto-selection threshold for the compute backend, in bytes.
 ///
-/// Tensors or data buffers larger than this threshold (in bytes) will be
-/// dispatched to the GPU backend; smaller workloads use the CPU backend.
-/// The 64 KB default is tuned for SciRS2 workloads where GPU launch overhead
-/// dominates for small matrices.
+/// [`compute::backend_for_workload`] sends a workload whose total buffer
+/// footprint is **below** this threshold to the CPU backend, and one at or
+/// above it to the best GPU backend available. The 64 KiB default is tuned for
+/// SciRS2 workloads, where the host↔device copies and the dispatch round-trip
+/// cost more than the kernel saves for small matrices.
+///
+/// # Why this is a selection-time and not a per-operation decision
+///
+/// A device pointer belongs to the backend that allocated it: the CPU backend
+/// cannot read a Metal buffer handle and vice versa. Routing individual
+/// operations by size would therefore require every buffer to exist on both
+/// backends and be kept in sync — far more traffic than the threshold saves.
+/// So the choice is made **once**, before anything is allocated, and the whole
+/// workload (buffers included) runs on the backend that was picked.
+///
+/// ```
+/// use oxicuda::backend::{BackendKind, SelectionRequest};
+///
+/// // The same policy is available on any registry, not just the default one.
+/// let small = SelectionRequest::any().for_workload(4096, oxicuda::AUTO_SELECT_THRESHOLD_BYTES);
+/// assert_eq!(small.pin, Some(BackendKind::Cpu));
+/// ```
 pub const AUTO_SELECT_THRESHOLD_BYTES: usize = 64 * 1024; // 65536 bytes
 
 // ---------------------------------------------------------------------------
@@ -403,30 +511,43 @@ mod umbrella_tests {
 
     #[test]
     fn small_tensor_uses_cpu_backend() {
-        // A tensor with < 64 KB data is below the threshold → CPU backend selected.
-        let small_data_bytes: usize = 1024; // 1 KB
-        assert!(
-            small_data_bytes < AUTO_SELECT_THRESHOLD_BYTES,
-            "1 KB should be below threshold → CPU backend"
+        // A 1 KB tensor is below the threshold, so the selector must really
+        // hand back the host backend — not merely compare two integers.
+        let selected =
+            compute::backend_for_workload(1024).expect("a backend must always be available");
+        assert_eq!(
+            selected.kind(),
+            backend::BackendKind::Cpu,
+            "1 KB is below the threshold → CPU backend, got {}",
+            selected.name()
         );
     }
 
     #[test]
     fn large_tensor_uses_gpu_backend() {
-        // A tensor with > 64 KB data is above the threshold → GPU backend attempted.
-        let large_data_bytes: usize = 1024 * 1024; // 1 MB
-        assert!(
-            large_data_bytes > AUTO_SELECT_THRESHOLD_BYTES,
-            "1 MB should be above threshold → GPU backend"
+        // A 1 MB tensor is above the threshold, so selection must be exactly
+        // the unconstrained one (a GPU where this machine has one).
+        let large =
+            compute::backend_for_workload(1024 * 1024).expect("a backend must always be available");
+        let default = compute::default_backend().expect("a backend must always be available");
+        assert_eq!(
+            large.kind(),
+            default.kind(),
+            "1 MB is above the threshold → the best available backend"
         );
     }
 
     #[test]
     fn threshold_boundary_values() {
-        // Exactly at threshold: not above → CPU backend.
-        const { assert!(AUTO_SELECT_THRESHOLD_BYTES <= AUTO_SELECT_THRESHOLD_BYTES) }
-        // One byte above threshold → GPU backend.
-        const { assert!(AUTO_SELECT_THRESHOLD_BYTES + 1 > AUTO_SELECT_THRESHOLD_BYTES) }
+        // Exactly at the threshold is *not* below it → GPU side.
+        let at = compute::backend_for_workload(AUTO_SELECT_THRESHOLD_BYTES)
+            .expect("a backend must always be available");
+        let default = compute::default_backend().expect("a backend must always be available");
+        assert_eq!(at.kind(), default.kind());
+        // One byte below → host side.
+        let below = compute::backend_for_workload(AUTO_SELECT_THRESHOLD_BYTES - 1)
+            .expect("a backend must always be available");
+        assert_eq!(below.kind(), backend::BackendKind::Cpu);
     }
 
     // -----------------------------------------------------------------------
@@ -589,6 +710,12 @@ pub mod prelude {
     pub use crate::global_init::{
         default_context, default_device, default_stream, is_initialized, lazy_init,
     };
+
+    // Portable compute backend (works without an NVIDIA driver, e.g. on macOS)
+    pub use crate::backend::{
+        BackendError, BackendKind, BackendResult, ComputeBackend, SelectionRequest,
+    };
+    pub use crate::compute::{SelectedBackend, backend_for_workload, default_backend, gpu_backend};
 
     // Parallel primitives (feature = "primitives")
     #[cfg(feature = "primitives")]

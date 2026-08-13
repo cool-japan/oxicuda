@@ -13,16 +13,15 @@
 //! InstanceNorm (num_groups = C) and LayerNorm (num_groups = 1).
 
 use std::fmt::Write as FmtWrite;
-use std::sync::Arc;
 
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Kernel, LaunchParams};
+use oxicuda_launch::LaunchParams;
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::arch::SmVersion;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 #[cfg(test)]
 use crate::types::TensorLayout;
 use crate::types::{TensorDesc, TensorDescMut};
@@ -73,14 +72,13 @@ pub fn group_norm<T: GpuFloat>(
     let channels_per_group = channels / num_groups;
     let group_size = channels_per_group * spatial; // elements per group per sample
 
-    let ptx_source = generate_group_norm_ptx::<T>(handle.sm_version(), group_size)?;
+    let sm = handle.sm_version();
     let kernel_name = group_norm_kernel_name::<T>(group_size);
-    let module = Arc::new(
-        Module::from_ptx(&ptx_source)
-            .map_err(|e| DnnError::LaunchFailed(format!("module load for group_norm: {e}")))?,
-    );
-    let kernel = Kernel::from_module(module, &kernel_name)
-        .map_err(|e| DnnError::LaunchFailed(format!("kernel lookup for {kernel_name}: {e}")))?;
+    let kernel = handle
+        .get_or_compile_kernel(&cache_key(&kernel_name, sm), &kernel_name, || {
+            generate_group_norm_ptx::<T>(sm, group_size)
+        })
+        .map_err(|e| DnnError::LaunchFailed(format!("compile {kernel_name}: {e}")))?;
 
     // Grid: one block per (sample, group) pair
     let num_blocks = batch * num_groups;
@@ -103,6 +101,7 @@ pub fn group_norm<T: GpuFloat>(
     );
 
     kernel
+        .kernel()
         .launch(&params, handle.stream(), &args)
         .map_err(|e| DnnError::LaunchFailed(format!("group_norm: {e}")))?;
 

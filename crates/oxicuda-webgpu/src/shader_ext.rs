@@ -114,8 +114,11 @@ fn main(
     let tid = lid.x;
     let base = row * params.cols;
 
-    // Pass 1: per-thread partial max over a strided slice of the row.
-    var local_max: f32 = f32(-1e38);
+    // Pass 1: per-thread partial max over a strided slice of the row.  True
+    // negative infinity (not a finite `-1e38` sentinel), so a row whose real
+    // maximum lies below that magnitude is never masked by the neutral
+    // element.
+    var local_max: f32 = bitcast<f32>(0xFF800000u);
     var i: u32 = tid;
     loop {
         if (i >= params.cols) { break; }
@@ -199,15 +202,29 @@ pub enum ScanKind {
 pub fn scan_wgsl(block_size: u32, kind: ScanKind) -> String {
     let threads = (block_size / 2).max(1);
     // Inclusive = exclusive scan plus the original element added back.
+    //
+    // Each of the two elements a thread owns (`2*tid`, `2*tid + 1`) is
+    // bounds-checked *independently* against `params.n`.  A single shared
+    // guard on just the first element would let the second write land one
+    // element past `n` whenever the block's tail is odd-length (i.e. `n`
+    // falls strictly between `base + 2*tid` and `base + 2*tid + 1`).
     let inclusive_fixup = match kind {
         ScanKind::Inclusive => {
             "    // Inclusive: add the original input back to the exclusive result.\n    \
-             output[base + 2u * tid]      = shared_data[2u * tid]      + input[base + 2u * tid];\n    \
-             output[base + 2u * tid + 1u] = shared_data[2u * tid + 1u] + input[base + 2u * tid + 1u];"
+             if (base + 2u * tid < params.n) {\n        \
+             output[base + 2u * tid] = shared_data[2u * tid] + input[base + 2u * tid];\n    \
+             }\n    \
+             if (base + 2u * tid + 1u < params.n) {\n        \
+             output[base + 2u * tid + 1u] = shared_data[2u * tid + 1u] + input[base + 2u * tid + 1u];\n    \
+             }"
         }
         ScanKind::Exclusive => {
-            "    output[base + 2u * tid]      = shared_data[2u * tid];\n    \
-             output[base + 2u * tid + 1u] = shared_data[2u * tid + 1u];"
+            "    if (base + 2u * tid < params.n) {\n        \
+             output[base + 2u * tid] = shared_data[2u * tid];\n    \
+             }\n    \
+             if (base + 2u * tid + 1u < params.n) {\n        \
+             output[base + 2u * tid + 1u] = shared_data[2u * tid + 1u];\n    \
+             }"
         }
     };
     let kind_comment = match kind {
@@ -278,9 +295,8 @@ fn main(
     workgroupBarrier();
 
     // Write results (exclusive in shared_data; inclusive adds input back).
-    if (base + i0 < params.n) {{
+    // Bounds-checked per-element inside `inclusive_fixup` (see above).
 {inclusive_fixup}
-    }}
 }}
 "#,
         bs = block_size,
@@ -415,8 +431,8 @@ fn main(
 #[must_use]
 pub fn subgroup_reduction_wgsl(op: &str, chromium_experimental: bool) -> String {
     let (subgroup_fn, neutral) = match op {
-        "max" => ("subgroupMax", "f32(-1e38)"),
-        "min" => ("subgroupMin", "f32(1e38)"),
+        "max" => ("subgroupMax", "bitcast<f32>(0xFF800000u)"),
+        "min" => ("subgroupMin", "bitcast<f32>(0x7F800000u)"),
         _ => ("subgroupAdd", "f32(0.0)"),
     };
     // Combine across subgroup leaders in shared memory.
@@ -633,16 +649,51 @@ mod tests {
         let src = scan_wgsl(256, ScanKind::Inclusive);
         assert!(src.contains("inclusive"));
         // Inclusive = exclusive + original element.
-        assert!(src.contains("shared_data[2u * tid]      + input[base + 2u * tid]"));
+        assert!(src.contains("shared_data[2u * tid] + input[base + 2u * tid]"));
+        assert!(src.contains("shared_data[2u * tid + 1u] + input[base + 2u * tid + 1u]"));
     }
 
     #[test]
     fn wgsl_scan_exclusive_writes_shared_directly() {
         let src = scan_wgsl(256, ScanKind::Exclusive);
         assert!(src.contains("exclusive"));
-        assert!(src.contains("output[base + 2u * tid]      = shared_data[2u * tid];"));
+        assert!(src.contains("output[base + 2u * tid] = shared_data[2u * tid];"));
         // Exclusive must NOT add the input back.
-        assert!(!src.contains("shared_data[2u * tid]      + input[base + 2u * tid]"));
+        assert!(!src.contains("shared_data[2u * tid] + input[base + 2u * tid]"));
+    }
+
+    #[test]
+    fn wgsl_scan_write_stage_guards_each_element_independently() {
+        // Regression for the odd-length-tail bug: the write stage previously
+        // wrapped BOTH `output[base + 2*tid]` and `output[base + 2*tid + 1]`
+        // in a single `if (base + 2*tid < n)` guard, so whenever
+        // `base + 2*tid < n <= base + 2*tid + 1` (an odd remainder within the
+        // block) the second write landed one element past `n`.  Each element
+        // must now carry its own bound.
+        for kind in [ScanKind::Inclusive, ScanKind::Exclusive] {
+            let src = scan_wgsl(256, kind);
+            assert!(
+                src.contains("if (base + 2u * tid < params.n) {"),
+                "{kind:?} scan lacks an independent guard for the first element"
+            );
+            assert!(
+                src.contains("if (base + 2u * tid + 1u < params.n) {"),
+                "{kind:?} scan lacks an independent guard for the second element"
+            );
+            // Structural count: the (unrelated, always-correct) load stage
+            // contributes exactly 2 `if (base + ...)` guards (`i0`, `i1`).
+            // The old buggy write stage added exactly 1 more (one shared
+            // guard for both writes) for a total of 3; the fix adds 2 (one
+            // per write) for a total of 4.  A regression back to the shared
+            // guard would drop this count to 3.
+            let guard_count = src.matches("if (base + ").count();
+            assert_eq!(
+                guard_count, 4,
+                "{kind:?} scan: expected 2 load guards + 2 independent write \
+                 guards (4 total), got {guard_count} — the write stage may have \
+                 regressed to a single shared guard"
+            );
+        }
     }
 
     #[test]
@@ -715,7 +766,8 @@ mod tests {
         let src = subgroup_reduction_wgsl("max", false);
         assert!(src.contains("subgroupMax(v)"));
         assert!(src.contains("max(acc, val)"));
-        assert!(src.contains("f32(-1e38)"));
+        // True negative infinity, not a finite `-1e38` sentinel.
+        assert!(src.contains("bitcast<f32>(0xFF800000u)"));
     }
 
     #[test]

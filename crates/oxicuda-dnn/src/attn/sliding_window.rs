@@ -11,16 +11,14 @@
 //!
 //! - Q, K, V, Output: `[batch, num_heads, seq_len, head_dim]`
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{Dim3, LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 
 // ---------------------------------------------------------------------------
 // SlidingWindowConfig
@@ -123,9 +121,14 @@ pub fn sliding_window_attention<T: GpuFloat>(
     validate_sw_buffer::<T>("output", output.len(), total_elems)?;
 
     let kernel_name = format!("sliding_window_attn_{}", T::NAME);
-    let ptx = generate_sw_ptx::<T>(&kernel_name, handle.sm_version(), config)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    // `generate_sw_ptx` ignores the config entirely (every dimension and the
+    // window size are runtime kernel parameters), so the entry name plus the
+    // target architecture is a complete key.
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_sw_ptx::<T>(&kernel_name, handle.sm_version(), config),
+    )?;
 
     let total_heads = (batch * config.num_heads) as u32;
     let block_dim = 256u32;
@@ -137,7 +140,7 @@ pub fn sliding_window_attention<T: GpuFloat>(
         .shared_mem(0)
         .build();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &params,
         handle.stream(),
         &(

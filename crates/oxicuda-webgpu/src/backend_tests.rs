@@ -103,12 +103,28 @@ fn backend_not_initialized_copy_dtoh() {
 
 /// These tests exercise the "no-op for zero size" branches.  We need the
 /// backend to be initialised, but if no GPU is available we skip.
+///
+/// Skipping keeps the suite green on headless CI, but it also means a device
+/// that silently stops initialising turns every GPU test into a vacuous pass.
+/// Set `OXICUDA_REQUIRE_GPU=1` to make that condition a failure instead — see
+/// `gpu_device_is_live_when_required`.
 fn try_init() -> Option<WebGpuBackend> {
     let mut b = WebGpuBackend::new();
     match b.init() {
         Ok(()) => Some(b),
-        Err(_) => None,
+        Err(_) => {
+            assert!(
+                !require_gpu(),
+                "OXICUDA_REQUIRE_GPU=1 but no WebGPU adapter initialised"
+            );
+            None
+        }
     }
+}
+
+/// Whether the caller demands that the GPU tests really run on a device.
+fn require_gpu() -> bool {
+    std::env::var("OXICUDA_REQUIRE_GPU").is_ok_and(|v| v == "1")
 }
 
 #[test]
@@ -447,6 +463,77 @@ fn binary_mul_small() {
 
     b.free(a_h).expect("free");
     b.free(b_h).expect("free");
+    b.free(out_h).expect("free");
+}
+
+// ── Aliased input/output rejection ──────────────────────────────────────
+//
+// `elementwise_wgsl`/`binary_wgsl` bind their output as `read_write` at a
+// different binding than the (`read`-only) input(s); wgpu's usage-scope
+// validation rejects the same buffer being bound as both within one
+// dispatch. Before this check existed, an aliased call would still return
+// `Ok(())` (the validation error only ever reached the non-fatal
+// uncaptured-error slot, see `WebGpuDevice::poll_error`) and the failure
+// would surface later, misattributed, from whatever unrelated `alloc`/
+// `copy_*`/`synchronize()` call happened to be the next one to drain that
+// slot. Rejecting it here — before any dispatch — makes it a clean,
+// correctly attributed error at the call that actually caused it.
+
+#[test]
+fn unary_rejects_aliased_input_and_output() {
+    let Some(b) = try_init() else { return };
+    let h = b.alloc(16).expect("alloc");
+
+    let err = b.unary(UnaryOp::Relu, h, h, 4).unwrap_err();
+    assert!(
+        matches!(err, BackendError::InvalidArgument(_)),
+        "got {err:?}"
+    );
+
+    b.free(h).expect("free");
+}
+
+#[test]
+fn binary_rejects_output_aliased_with_either_input() {
+    let Some(b) = try_init() else { return };
+    let a_h = b.alloc(16).expect("alloc a");
+    let b_h = b.alloc(16).expect("alloc b");
+
+    let err_a = b.binary(BinaryOp::Add, a_h, b_h, a_h, 4).unwrap_err();
+    assert!(
+        matches!(err_a, BackendError::InvalidArgument(_)),
+        "a_ptr aliased with output_ptr: got {err_a:?}"
+    );
+
+    let err_b = b.binary(BinaryOp::Add, a_h, b_h, b_h, 4).unwrap_err();
+    assert!(
+        matches!(err_b, BackendError::InvalidArgument(_)),
+        "b_ptr aliased with output_ptr: got {err_b:?}"
+    );
+
+    b.free(a_h).expect("free a");
+    b.free(b_h).expect("free b");
+}
+
+#[test]
+fn binary_allows_the_two_inputs_to_alias_each_other() {
+    // `a_ptr == b_ptr` (neither aliased with `output_ptr`) binds the same
+    // buffer to two `read`-only bindings, which does not conflict — only
+    // aliasing with the `read_write` output is rejected.
+    let Some(b) = try_init() else { return };
+    let a_h = upload_f32(&b, &[1.0f32, 2.0, 3.0, 4.0]);
+    let out_h = b.alloc(16).expect("alloc output");
+
+    b.binary(BinaryOp::Add, a_h, a_h, out_h, 4)
+        .expect("binary with both inputs aliased to each other must be allowed");
+
+    let result = download_f32(&b, out_h, 4);
+    let expected = [2.0f32, 4.0, 6.0, 8.0];
+    for (r, e) in result.iter().zip(expected.iter()) {
+        assert!((r - e).abs() < 1e-6, "got {r}, expected {e}");
+    }
+
+    b.free(a_h).expect("free");
     b.free(out_h).expect("free");
 }
 
@@ -890,8 +977,9 @@ fn gemm_tt() {
 
 #[test]
 fn gemm_transpose_larger_than_tile() {
-    // Dimensions exceeding the 8×8 tile size exercise multi-tile k loops
-    // for every transpose combination.
+    // Dimensions exceeding the 16×16 tile size (see `gpu_limits`/
+    // `planner::plan_workgroup_square`) exercise multi-tile k loops for
+    // every transpose combination.
     for &ta in &[BackendTranspose::NoTrans, BackendTranspose::Trans] {
         for &tb in &[BackendTranspose::NoTrans, BackendTranspose::Trans] {
             run_gemm_transpose_case(ta, tb, 17, 13, 23);
@@ -1430,7 +1518,7 @@ fn batched_gemm_tt() {
 
 #[test]
 fn batched_gemm_transpose_larger_than_tile() {
-    // Dimensions exceeding the 8×8 tile force multi-tile k loops per batch.
+    // Dimensions exceeding the 16×16 tile force multi-tile k loops per batch.
     for &ta in &[BackendTranspose::NoTrans, BackendTranspose::Trans] {
         for &tb in &[BackendTranspose::NoTrans, BackendTranspose::Trans] {
             run_batched_gemm_transpose_case(ta, tb, 11, 19, 23, 2);
@@ -1443,16 +1531,40 @@ fn batched_gemm_transpose_larger_than_tile() {
 #[test]
 fn gemm_f16_not_initialized() {
     let b = WebGpuBackend::new();
-    let result = b.gemm_f16(4, 4, 4, 1.0, 0, 0, 0.0, 0);
+    let result = b.gemm_f16(
+        BackendTranspose::NoTrans,
+        BackendTranspose::NoTrans,
+        4,
+        4,
+        4,
+        1.0,
+        0,
+        4,
+        0,
+        4,
+        0.0,
+        0,
+        4,
+    );
     assert_eq!(result, Err(BackendError::NotInitialized));
 }
 
 #[test]
 fn gemm_f16_zero_dims_noop() {
     let Some(b) = try_init() else { return };
-    assert_eq!(b.gemm_f16(0, 4, 4, 1.0, 0, 0, 0.0, 0), Ok(()));
-    assert_eq!(b.gemm_f16(4, 0, 4, 1.0, 0, 0, 0.0, 0), Ok(()));
-    assert_eq!(b.gemm_f16(4, 4, 0, 1.0, 0, 0, 0.0, 0), Ok(()));
+    let nt = BackendTranspose::NoTrans;
+    assert_eq!(
+        b.gemm_f16(nt, nt, 0, 4, 4, 1.0, 0, 4, 0, 4, 0.0, 0, 4),
+        Ok(())
+    );
+    assert_eq!(
+        b.gemm_f16(nt, nt, 4, 0, 4, 1.0, 0, 4, 0, 4, 0.0, 0, 4),
+        Ok(())
+    );
+    assert_eq!(
+        b.gemm_f16(nt, nt, 4, 4, 0, 1.0, 0, 4, 0, 4, 0.0, 0, 4),
+        Ok(())
+    );
 }
 
 #[test]
@@ -1472,7 +1584,8 @@ fn gemm_f16_real_dims_never_panics() {
     b.copy_htod(bm, &zeros).expect("htod b");
     b.copy_htod(c, &zeros).expect("htod c");
 
-    match b.gemm_f16(2, 2, 2, 1.0, a, bm, 0.0, c) {
+    let nt = BackendTranspose::NoTrans;
+    match b.gemm_f16(nt, nt, 2, 2, 2, 1.0, a, 2, bm, 2, 0.0, c, 2) {
         Ok(()) => {}
         Err(BackendError::Unsupported(_)) => {}
         Err(e) => panic!("unexpected gemm_f16 error: {e:?}"),
@@ -1481,6 +1594,127 @@ fn gemm_f16_real_dims_never_panics() {
     b.free(a).expect("free");
     b.free(bm).expect("free");
     b.free(c).expect("free");
+}
+
+/// Upload an f32 slice to the GPU as f16 (half-precision), return the handle.
+fn upload_f16(b: &WebGpuBackend, data: &[f32]) -> u64 {
+    let bytes: Vec<u8> = data
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+    let h = b.alloc(bytes.len()).expect("alloc f16");
+    b.copy_htod(h, &bytes).expect("copy_htod f16");
+    h
+}
+
+/// Download `n` f16 values from a GPU buffer handle, widened back to f32.
+fn download_f16(b: &WebGpuBackend, h: u64, n: usize) -> Vec<f32> {
+    let mut bytes = vec![0u8; n * 2];
+    b.copy_dtoh(&mut bytes, h).expect("copy_dtoh f16");
+    bytes
+        .chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
+#[test]
+fn gemm_f16_matches_reference_2x3_times_3x2() {
+    let Some(b) = try_init() else { return };
+    if !b.supports_f16() {
+        return; // Adapter lacks SHADER_F16; nothing to exercise.
+    }
+    // Same shape/values as the f32 `gemm_2x3_times_3x2` test.
+    let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let bm = [7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0];
+    let c_init = [0.0f32; 4];
+
+    let a_h = upload_f16(&b, &a);
+    let b_h = upload_f16(&b, &bm);
+    let c_h = upload_f16(&b, &c_init);
+
+    let nt = BackendTranspose::NoTrans;
+    b.gemm_f16(nt, nt, 2, 2, 3, 1.0, a_h, 3, b_h, 2, 0.0, c_h, 2)
+        .expect("gemm_f16");
+
+    let result = download_f16(&b, c_h, 4);
+    let expected = [58.0f32, 64.0, 139.0, 154.0];
+    for (r, e) in result.iter().zip(expected.iter()) {
+        // f16 has ~3 decimal digits of precision; these exact integer-valued
+        // products are still representable, so a loose tolerance suffices.
+        assert!((r - e).abs() < 0.5, "got {r}, expected {e}");
+    }
+
+    b.free(a_h).expect("free");
+    b.free(b_h).expect("free");
+    b.free(c_h).expect("free");
+}
+
+#[test]
+fn gemm_f16_honours_transpose_and_lda() {
+    // Mirrors `gemm_transpose_known_values`: A stored transposed (TN), lda
+    // padded, proving the f16 kernel's `load_a`/`load_b` (added to fix
+    // finding webgpu-14) are actually wired up rather than ignored.
+    let Some(b) = try_init() else { return };
+    if !b.supports_f16() {
+        return;
+    }
+    // A_logical = [[1,2,3],[4,5,6]] (2×3), stored transposed (3×2) with a
+    // padded lda of 3 (one padding column per stored row).
+    let a_transposed_padded = [1.0f32, 4.0, 99.0, 2.0, 5.0, 99.0, 3.0, 6.0, 99.0];
+    let bm = [1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let c_init = [0.0f32; 4];
+
+    let a_h = upload_f16(&b, &a_transposed_padded);
+    let b_h = upload_f16(&b, &bm);
+    let c_h = upload_f16(&b, &c_init);
+
+    b.gemm_f16(
+        BackendTranspose::Trans,
+        BackendTranspose::NoTrans,
+        2,
+        2,
+        3,
+        1.0,
+        a_h,
+        3, // lda > packed extent (m=2): one padding column per row
+        b_h,
+        2,
+        0.0,
+        c_h,
+        2,
+    )
+    .expect("gemm_f16 TN with padded lda");
+
+    let result = download_f16(&b, c_h, 4);
+    let expected = [4.0f32, 5.0, 10.0, 11.0];
+    for (r, e) in result.iter().zip(expected.iter()) {
+        assert!((r - e).abs() < 0.5, "got {r}, expected {e}");
+    }
+
+    b.free(a_h).expect("free");
+    b.free(b_h).expect("free");
+    b.free(c_h).expect("free");
+}
+
+#[test]
+fn gemm_f16_rejects_too_small_lda() {
+    let Some(b) = try_init() else { return };
+    if !b.supports_f16() {
+        return;
+    }
+    let a_h = upload_f16(&b, &[1.0f32, 2.0, 3.0, 4.0]);
+    let b_h = upload_f16(&b, &[1.0f32, 0.0, 0.0, 1.0]);
+    let c_h = upload_f16(&b, &[0.0f32; 4]);
+
+    let nt = BackendTranspose::NoTrans;
+    let err = b
+        .gemm_f16(nt, nt, 2, 2, 2, 1.0, a_h, 1, b_h, 2, 0.0, c_h, 2)
+        .unwrap_err();
+    assert!(matches!(err, BackendError::InvalidArgument(_)));
+
+    b.free(a_h).expect("free");
+    b.free(b_h).expect("free");
+    b.free(c_h).expect("free");
 }
 
 // ── N-D reduce tests ──────────────────────────────────────────────────
@@ -1686,3 +1920,22 @@ fn attention_dominant_key() {
     b.free(v_h).expect("free");
     b.free(o_h).expect("free");
 }
+
+// GPU-vs-CPU dispatch-wiring regression tests (attention/conv2d oracle
+// comparisons, batched_gemm/reduce validation) — split into a sibling file to
+// keep this one under the 2 000-line refactoring policy.  See that file's
+// module doc for what it covers.
+#[path = "backend_tests_gpu_ops.rs"]
+mod gpu_ops_tests;
+
+// Dispatch-ordering / caching regression tests (zero host sync between
+// chained ops) — split into a sibling file for the same reason as
+// `gpu_ops_tests` above.  See that file's module doc for what it covers.
+#[path = "backend_tests_pipeline.rs"]
+mod pipeline_tests;
+
+// Multi-tile numeric correctness tests for the tiled `gemm_f16` kernel —
+// split into a sibling file for the same reason as `gpu_ops_tests` above.
+// See that file's module doc for what it covers.
+#[path = "backend_tests_gemm_f16.rs"]
+mod gemm_f16_tests;

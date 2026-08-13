@@ -15,16 +15,14 @@
 //! activation function is applied in-register before writing to global
 //! memory. This avoids an extra kernel launch and memory round-trip.
 
-use std::sync::Arc;
-
 use oxicuda_blas::GpuFloat;
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams, grid_size_for};
+use oxicuda_launch::{Dim3, LaunchParams, grid_size_for};
 use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::prelude::*;
 
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
+use crate::kernel_cache::cache_key;
 use crate::types::Activation;
 
 // ---------------------------------------------------------------------------
@@ -151,14 +149,16 @@ pub fn fused_linear<T: GpuFloat>(
     }
 
     // Generate and launch the fused linear kernel.
-    let kernel_name = format!(
-        "fused_linear_{}_{}",
-        activation_suffix(&config.activation),
-        T::NAME
-    );
-    let ptx = generate_fused_linear_ptx::<T>(&kernel_name, handle.sm_version(), config)?;
-    let module = Arc::new(Module::from_ptx(&ptx)?);
-    let kernel = Kernel::from_module(module, &kernel_name)?;
+    // The entry name is the compiled-module cache key (see
+    // `crate::kernel_cache`), so it must move with every code-generation
+    // constant `generate_fused_linear_ptx` branches on: the activation *and*
+    // `use_bias`, which decides whether the bias parameter is loaded at all.
+    let kernel_name = fused_linear_kernel_name::<T>(config);
+    let kernel = handle.get_or_compile_kernel(
+        &cache_key(&kernel_name, handle.sm_version()),
+        &kernel_name,
+        || generate_fused_linear_ptx::<T>(&kernel_name, handle.sm_version(), config),
+    )?;
 
     // Launch grid: one thread per output element.
     let total_outputs = (batch * out_features) as u32;
@@ -174,7 +174,7 @@ pub fn fused_linear<T: GpuFloat>(
         .shared_mem(0)
         .build();
 
-    kernel.launch(
+    kernel.kernel().launch(
         &params,
         handle.stream(),
         &(
@@ -214,6 +214,21 @@ fn activation_suffix(act: &Activation) -> &'static str {
         Activation::Sigmoid => "sigmoid",
         Activation::Tanh => "tanh",
     }
+}
+
+/// Entry-point name for the fused-linear kernel.
+///
+/// Encodes both code-generation branches taken by
+/// [`generate_fused_linear_ptx`] -- the activation and whether a bias is
+/// folded in -- plus the element type, so the name is a complete
+/// compiled-module cache key for a given target architecture.
+fn fused_linear_kernel_name<T: GpuFloat>(config: &FusedLinearConfig) -> String {
+    let bias = if config.use_bias { "bias" } else { "nobias" };
+    format!(
+        "fused_linear_{}_{bias}_{}",
+        activation_suffix(&config.activation),
+        T::NAME
+    )
 }
 
 /// Generates PTX for the fused linear kernel.
