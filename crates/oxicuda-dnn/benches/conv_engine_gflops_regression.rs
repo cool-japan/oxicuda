@@ -39,6 +39,13 @@
 //! - **SCRFD Conv1x1 56->88 @80x80** (`Conv_37`): an unpadded, unit-stride
 //!   1x1 convolution, `engine=Conv1x1` (per `pick_engine`'s own rule and the
 //!   dump's recorded classification).
+//! - **Synthetic 1x1 256->512 @64x64**: `pick_engine` routes every unpadded
+//!   unit-stride 1x1 convolution to `Conv1x1`, but the tiled implicit-GEMM
+//!   kernel claims this one too. Included so the two are measured against each
+//!   other on a shape big enough for the question to matter -- the real
+//!   pipeline's own 1x1 layers (e.g. SCRFD's 56->88 @80x80, also in this list)
+//!   are all below the tiling's `MIN_GEMM_K`, so none of them can answer it.
+//!   Labelled SYNTHETIC for the same reason as the depthwise row below.
 //! - **Synthetic depthwise 256ch @32x32**: neither SCRFD, ArcFace, nor
 //!   InSwapper contains a single genuine depthwise convolution (`groups ==
 //!   in_channels == out_channels`) -- zero `engine=Depthwise` nodes appear
@@ -56,6 +63,26 @@
 //! all three engines report a directly comparable "raw conv compute only"
 //! number).
 //!
+//! # Kernel variants
+//!
+//! Since the CTA-tiled implicit-GEMM kernel landed, an `ImplicitGemm` shape is
+//! not one kernel but a choice between up to three, so the harness measures
+//! every one that claims the shape and prints them side by side rather than
+//! reporting only whatever the dispatcher currently picks:
+//!
+//! * **scalar** -- the one-thread-per-output-element kernel
+//!   (`ImplicitGemmConv::scalar_only`), the pre-tiling baseline and still the
+//!   numeric oracle;
+//! * **tiled** -- the CTA-tiled, shared-memory-staged mainloop
+//!   (`TiledImplicitGemmConv`), what `ImplicitGemmConv::execute` now dispatches
+//!   to wherever it claims the shape;
+//! * **winograd** -- `WinogradConv` F(2x2,3x3), where the shape is eligible
+//!   (3x3, stride 1, pad <= 1, NCHW f32).
+//!
+//! The `speedup` column is against the scalar baseline for the same shape, so
+//! the dispatch order in `ImplicitGemmConv` / `algo_select` can be read off the
+//! table rather than assumed.
+//!
 //! On macOS / no-GPU systems this binary prints a skip notice and exits 0
 //! (`init()` reports `UnsupportedPlatform` / no device found).
 
@@ -64,6 +91,8 @@ use std::sync::Arc;
 use oxicuda_dnn::conv::descriptor::ConvProblem;
 use oxicuda_dnn::conv::fprop::direct::{Conv1x1, DepthwiseConv};
 use oxicuda_dnn::conv::fprop::implicit_gemm::ImplicitGemmConv;
+use oxicuda_dnn::conv::fprop::tiled_implicit_gemm::TiledImplicitGemmConv;
+use oxicuda_dnn::conv::fprop::winograd::WinogradConv;
 use oxicuda_dnn::handle::DnnHandle;
 use oxicuda_dnn::types::{TensorDesc, TensorDescMut, TensorLayout};
 use oxicuda_driver::{Context, Device, Event, Module, Stream};
@@ -176,16 +205,6 @@ enum Engine {
     ImplicitGemm,
 }
 
-impl Engine {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Conv1x1 => "Conv1x1",
-            Self::Depthwise => "DepthwiseConv",
-            Self::ImplicitGemm => "ImplicitGemmConv",
-        }
-    }
-}
-
 /// One conv shape to benchmark: NCHW input `[1, cin, h, w]`, filter
 /// `[cout, cin/groups, r, s]`, `pad`/`stride` (symmetric, both spatial
 /// dims), and which engine `pick_engine` would select for it.
@@ -283,6 +302,19 @@ const SHAPES: &[ConvShape] = &[
         groups: 1,
     },
     ConvShape {
+        tag: "[SYNTHETIC] 1x1 256->512 pad0 @64x64 (Conv1x1 vs tiled)",
+        engine: Engine::Conv1x1,
+        cin: 256,
+        h: 64,
+        w: 64,
+        cout: 512,
+        r: 1,
+        s: 1,
+        pad: 0,
+        stride: 1,
+        groups: 1,
+    },
+    ConvShape {
         tag: "[SYNTHETIC, not from a real pipeline] depthwise 256ch 3x3 pad1 @32x32",
         engine: Engine::Depthwise,
         cin: 256,
@@ -335,11 +367,61 @@ impl ConvShape {
     }
 }
 
-/// Runs one shape through its `pick_engine`-selected engine, returning the
-/// measured GFLOPS.
-fn bench_shape(handle: &DnnHandle, sm: SmVersion, shape: &ConvShape) -> f64 {
+/// Which kernel a measured row was produced by.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// The `pick_engine`-selected non-implicit-GEMM engine (`Conv1x1` /
+    /// `DepthwiseConv`), which has only one kernel.
+    Fixed,
+    /// One thread per output element -- the pre-tiling baseline.
+    Scalar,
+    /// CTA-tiled, shared-memory-staged mainloop.
+    Tiled,
+    /// Winograd F(2x2, 3x3).
+    Winograd,
+}
+
+impl Variant {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Fixed => "engine",
+            Self::Scalar => "scalar",
+            Self::Tiled => "tiled",
+            Self::Winograd => "winograd",
+        }
+    }
+}
+
+/// One measured (shape, kernel) pair.
+struct Measurement {
+    variant: Variant,
+    gflops: f64,
+}
+
+/// Times `run` over [`ITERS`] iterations on the handle's stream and converts to
+/// GFLOPS for `flops`.
+fn time_gflops(handle: &DnnHandle, flops: u64, mut run: impl FnMut()) -> f64 {
+    run();
+    handle.stream().synchronize().expect("post warm-up sync");
+    let start = Event::new().expect("start event");
+    let end = Event::new().expect("end event");
+    start.record(handle.stream()).expect("record start");
+    for _ in 0..ITERS {
+        run();
+    }
+    end.record(handle.stream()).expect("record end");
+    end.synchronize().expect("sync end");
+    let secs = f64::from(Event::elapsed_time(&start, &end).expect("elapsed_time"))
+        / f64::from(ITERS)
+        / 1000.0;
+    flops as f64 / secs / 1e9
+}
+
+/// Measures every kernel that claims `shape`.
+fn bench_shape(handle: &DnnHandle, sm: SmVersion, shape: &ConvShape) -> Vec<Measurement> {
     let problem = shape.problem();
     let (oh, ow) = shape.out_hw();
+    let flops = shape.flops();
 
     let in_buf = DeviceBuffer::<f32>::zeroed((shape.cin * shape.h * shape.w) as usize)
         .expect("input buffer");
@@ -361,57 +443,77 @@ fn bench_shape(handle: &DnnHandle, sm: SmVersion, shape: &ConvShape) -> f64 {
     let mut output = TensorDescMut::<f32>::nchw(&mut out_buf, 1, shape.cout, oh, ow)
         .expect("output tensor desc");
 
-    let mut run: Box<dyn FnMut()> = match shape.engine {
+    let mut out = Vec::new();
+
+    match shape.engine {
         Engine::Conv1x1 => {
-            let engine = Conv1x1::new(problem, sm).expect("Conv1x1::new");
-            engine
-                .execute(handle, &input, &filter, &mut output)
-                .expect("Conv1x1 warm-up execute");
-            Box::new(move || {
-                engine
-                    .execute(handle, &input, &filter, &mut output)
-                    .expect("Conv1x1 execute");
-            })
+            let engine = Conv1x1::new(problem.clone(), sm).expect("Conv1x1::new");
+            out.push(Measurement {
+                variant: Variant::Fixed,
+                gflops: time_gflops(handle, flops, || {
+                    engine
+                        .execute(handle, &input, &filter, &mut output)
+                        .expect("Conv1x1 execute");
+                }),
+            });
         }
         Engine::Depthwise => {
-            let engine = DepthwiseConv::new(problem, sm).expect("DepthwiseConv::new");
-            engine
-                .execute(handle, &input, &filter, &mut output)
-                .expect("DepthwiseConv warm-up execute");
-            Box::new(move || {
-                engine
-                    .execute(handle, &input, &filter, &mut output)
-                    .expect("DepthwiseConv execute");
-            })
+            let engine = DepthwiseConv::new(problem.clone(), sm).expect("DepthwiseConv::new");
+            out.push(Measurement {
+                variant: Variant::Fixed,
+                gflops: time_gflops(handle, flops, || {
+                    engine
+                        .execute(handle, &input, &filter, &mut output)
+                        .expect("DepthwiseConv execute");
+                }),
+            });
         }
-        Engine::ImplicitGemm => {
-            let engine = ImplicitGemmConv::new(problem, sm);
-            engine
-                .execute(handle, &input, &filter, None, &mut output)
-                .expect("ImplicitGemmConv warm-up execute");
-            Box::new(move || {
-                engine
-                    .execute(handle, &input, &filter, None, &mut output)
-                    .expect("ImplicitGemmConv execute");
-            })
-        }
-    };
-
-    handle.stream().synchronize().expect("post warm-up sync");
-
-    let start = Event::new().expect("start event");
-    let end = Event::new().expect("end event");
-    start.record(handle.stream()).expect("record start");
-    for _ in 0..ITERS {
-        run();
+        Engine::ImplicitGemm => {}
     }
-    end.record(handle.stream()).expect("record end");
-    end.synchronize().expect("sync end");
-    let secs = f64::from(Event::elapsed_time(&start, &end).expect("elapsed_time"))
-        / f64::from(ITERS)
-        / 1000.0;
 
-    shape.flops() as f64 / secs / 1e9
+    if shape.engine == Engine::ImplicitGemm {
+        let scalar = ImplicitGemmConv::scalar_only(problem.clone(), sm);
+        out.push(Measurement {
+            variant: Variant::Scalar,
+            gflops: time_gflops(handle, flops, || {
+                scalar
+                    .execute(handle, &input, &filter, None, &mut output)
+                    .expect("scalar implicit-GEMM execute");
+            }),
+        });
+    }
+
+    // The tiled kernel is measured wherever it claims the shape, including the
+    // 1x1 shape `pick_engine` currently routes to `Conv1x1`: that is exactly
+    // the comparison a future dispatch change needs.
+    if let Some(tiled) = TiledImplicitGemmConv::new(problem.clone(), sm) {
+        out.push(Measurement {
+            variant: Variant::Tiled,
+            gflops: time_gflops(handle, flops, || {
+                tiled
+                    .execute(handle, &input, &filter, None, &mut output)
+                    .expect("tiled implicit-GEMM execute");
+            }),
+        });
+    }
+
+    if WinogradConv::supports(&problem) {
+        let wino = WinogradConv::new(problem, sm).expect("WinogradConv::new");
+        // A short workspace makes `execute` return before touching the GPU,
+        // which would time an early return -- allocate exactly what it asks
+        // for.
+        let ws_bytes = wino.workspace_bytes().expect("winograd workspace_bytes");
+        let mut ws = DeviceBuffer::<u8>::zeroed(ws_bytes).expect("winograd workspace");
+        out.push(Measurement {
+            variant: Variant::Winograd,
+            gflops: time_gflops(handle, flops, || {
+                wino.execute(handle, &input, &filter, &mut output, &mut ws)
+                    .expect("winograd execute");
+            }),
+        });
+    }
+
+    out
 }
 
 fn main() {
@@ -457,18 +559,31 @@ fn main() {
     );
     println!("measured FP32 FFMA issue-rate peak: {ffma_peak:8.1} GFLOPS");
     println!(
-        "{:<55} {:>10} {:>12} {:>10}",
-        "shape", "engine", "GFLOPS", "% of peak"
+        "{:<48} {:>9} {:>12} {:>10} {:>9}",
+        "shape", "kernel", "GFLOPS", "% of peak", "speedup"
     );
 
     for shape in SHAPES {
-        let gflops = bench_shape(&handle, sm, shape);
-        println!(
-            "{:<55} {:>10} {:>12.1} {:>9.2}%",
-            shape.tag,
-            shape.engine.label(),
-            gflops,
-            100.0 * gflops / ffma_peak,
-        );
+        let measurements = bench_shape(&handle, sm, shape);
+        let baseline = measurements
+            .iter()
+            .find(|m| m.variant == Variant::Scalar)
+            .map(|m| m.gflops);
+        for (i, m) in measurements.iter().enumerate() {
+            let speedup = match baseline {
+                Some(b) if b > 0.0 && m.variant != Variant::Scalar => {
+                    format!("{:.2}x", m.gflops / b)
+                }
+                _ => "-".to_string(),
+            };
+            println!(
+                "{:<48} {:>9} {:>12.1} {:>9.2}% {:>9}",
+                if i == 0 { shape.tag } else { "" },
+                m.variant.label(),
+                m.gflops,
+                100.0 * m.gflops / ffma_peak,
+                speedup,
+            );
+        }
     }
 }

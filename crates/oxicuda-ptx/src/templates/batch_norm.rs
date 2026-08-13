@@ -417,7 +417,7 @@ impl BatchNormTemplate {
         writeln!(ptx, "    add.u64 %rd12, %rd10, %rd11;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    ld.global{ty} %f5, [%rd12];").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    sub{ty} %f5, %f5, %f2;").map_err(PtxGenError::FormatError)?;
-        writeln!(ptx, "    fma{ty} %f4, %f5, %f5, %f4;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    fma.rn{ty} %f4, %f5, %f5, %f4;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    add.u32 %r5, %r5, {block_size};").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    bra $VAR_SPATIAL_LOOP;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "$VAR_SPATIAL_DONE:").map_err(PtxGenError::FormatError)?;
@@ -492,7 +492,7 @@ impl BatchNormTemplate {
         writeln!(ptx, "    sub{ty} %f10, %f10, %f2;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    mul{ty} %f10, %f10, %f7;").map_err(PtxGenError::FormatError)?;
         // Apply gamma and beta: y = gamma * normalized + beta
-        writeln!(ptx, "    fma{ty} %f10, %f8, %f10, %f9;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    fma.rn{ty} %f10, %f8, %f10, %f9;").map_err(PtxGenError::FormatError)?;
         // Store output
         writeln!(ptx, "    add.u64 %rd18, %rd17, %rd11;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    st.global{ty} [%rd18], %f10;").map_err(PtxGenError::FormatError)?;
@@ -652,7 +652,7 @@ impl BatchNormTemplate {
         writeln!(ptx, "    sub{ty} %f5, %f5, %f0;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    mul{ty} %f5, %f5, %f4;").map_err(PtxGenError::FormatError)?;
         // Scale and shift: gamma * norm + beta
-        writeln!(ptx, "    fma{ty} %f5, %f2, %f5, %f3;").map_err(PtxGenError::FormatError)?;
+        writeln!(ptx, "    fma.rn{ty} %f5, %f2, %f5, %f3;").map_err(PtxGenError::FormatError)?;
         // Store output
         writeln!(ptx, "    add.u64 %rd19, %rd16, %rd17;").map_err(PtxGenError::FormatError)?;
         writeln!(ptx, "    st.global{ty} [%rd19], %f5;").map_err(PtxGenError::FormatError)?;
@@ -789,7 +789,11 @@ mod tests {
         assert!(ptx.contains("bar.sync 0"));
         assert!(ptx.contains("sqrt.rn.f32"));
         assert!(ptx.contains("rcp.approx.f32"));
-        assert!(ptx.contains("fma.f32"));
+        // `fma` requires an explicit PTX rounding modifier -- ptxas rejects a
+        // bare `fma.f32` with "Rounding modifier required for instruction
+        // 'fma'" (confirmed on real hardware: this is exactly the bug this
+        // test now pins against regressing).
+        assert!(ptx.contains("fma.rn.f32"));
         assert!(ptx.contains("%param_gamma"));
         assert!(ptx.contains("%param_beta"));
     }
@@ -805,7 +809,7 @@ mod tests {
         assert!(ptx.contains("%param_running_var"));
         assert!(ptx.contains("sqrt.rn.f32"));
         assert!(ptx.contains("rcp.approx.f32"));
-        assert!(ptx.contains("fma.f32"));
+        assert!(ptx.contains("fma.rn.f32"));
     }
 
     #[test]
@@ -815,7 +819,41 @@ mod tests {
             .generate(SmVersion::Sm80)
             .expect("should generate f64 training BN");
         assert!(ptx.contains("batch_norm_train_f64"));
-        assert!(ptx.contains("fma.f64"));
+        assert!(ptx.contains("fma.rn.f64"));
+    }
+
+    /// Direct regression pin for the ptxas "Rounding modifier required for
+    /// instruction 'fma'" bug: every `fma` PTX instruction this template
+    /// emits, in either mode, must carry an explicit rounding modifier.
+    /// `.contains("fma{ty}")` (no modifier) is what ptxas rejected; asserting
+    /// the *absence* of that exact bare form is what a mere
+    /// `contains("fma.rn")` check would not catch if a future edit
+    /// re-introduced one unmodified `fma` alongside others that do have the
+    /// modifier.
+    #[test]
+    fn every_fma_instruction_carries_an_explicit_rounding_modifier() {
+        for (mode, ty) in [
+            (BnMode::Training, PtxType::F32),
+            (BnMode::Inference, PtxType::F32),
+            (BnMode::Training, PtxType::F64),
+            (BnMode::Inference, PtxType::F64),
+        ] {
+            let t = BatchNormTemplate::new(ty, mode, 4, 8, 1e-5, 32);
+            let ptx = t.generate(SmVersion::Sm86).expect("generate");
+            for line in ptx.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("fma") {
+                    assert!(
+                        trimmed.starts_with("fma.rn")
+                            || trimmed.starts_with("fma.rz")
+                            || trimmed.starts_with("fma.rm")
+                            || trimmed.starts_with("fma.rp"),
+                        "{mode:?}/{ty:?}: found an `fma` PTX instruction with no rounding \
+                         modifier, which ptxas rejects: {trimmed:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

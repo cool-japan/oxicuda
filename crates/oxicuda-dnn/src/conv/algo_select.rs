@@ -10,9 +10,13 @@
 //! 1. **1x1 kernels** with unit stride/dilation -> [`Direct`](ConvAlgorithm::Direct)
 //!    (reduces to plain GEMM)
 //! 2. **Depthwise convolutions** -> [`Direct`](ConvAlgorithm::Direct) (specialised kernel)
-//! 3. **3x3 NCHW FP32 kernels** with unit stride/dilation, `groups == 1` and
-//!    padding <= 1, above [`WINOGRAD_FLOP_THRESHOLD`]
-//!    -> [`Winograd`](ConvAlgorithm::Winograd). Eligibility is
+//! 3. **Anything the CTA-tiled implicit-GEMM kernel claims**
+//!    ([`TiledConvPlan::for_problem`]) -> [`ImplicitGemm`](ConvAlgorithm::ImplicitGemm).
+//!    Measured 5.7-8.0 TFLOPS against Winograd's 1.7-3.5 on the same shapes,
+//!    which is why this rule precedes the Winograd one.
+//! 4. **3x3 NCHW FP32 kernels** with unit stride/dilation, `groups == 1` and
+//!    padding <= 1, above [`WINOGRAD_FLOP_THRESHOLD`], *that the tiling
+//!    declined* -> [`Winograd`](ConvAlgorithm::Winograd). Eligibility is
 //!    [`WinogradConv::supports`] verbatim (via [`is_winograd_eligible`]), so
 //!    this rule can never select an engine that would then refuse the
 //!    problem; profitability is the separate FLOP test, calibrated from the
@@ -26,6 +30,7 @@ use oxicuda_ptx::arch::SmVersion;
 use crate::types::ConvAlgorithm;
 
 use super::descriptor::ConvProblem;
+use super::fprop::tiled_implicit_gemm::TiledConvPlan;
 
 /// Minimum [`estimate_gemm_flops`] count for Winograd to be profitable.
 ///
@@ -139,7 +144,32 @@ pub fn select_algorithm(problem: &ConvProblem, sm: SmVersion) -> ConvAlgorithm {
     let r = problem.filter_dims.first().copied().unwrap_or(1);
     let s = problem.filter_dims.get(1).copied().unwrap_or(1);
 
-    // Rule 3: 3x3 Winograd when the engine supports the shape and the problem
+    // Rule 3: the CTA-tiled implicit-GEMM kernel, wherever it claims the
+    // shape. This rule sits *above* Winograd because that is what the
+    // measurement says: on this workspace's RTX A4000, over the five real
+    // face-pipeline 3x3 shapes, the tiled kernel runs at 5.7-8.0 TFLOPS while
+    // Winograd -- whose transform-domain GEMM is itself an untiled 16x16
+    // kernel -- runs at 1.7-3.5 TFLOPS on the same shapes:
+    //
+    // ```text
+    //   shape                                  scalar    tiled  winograd
+    //   SCRFD    28->56  3x3 pad1 @320x320       905     6317      1720
+    //   ArcFace  64->64  3x3 pad1 @112x112       938     5702      2503
+    //   InSwap 1024->1024 3x3 pad0 @34x34        941     6124      3530
+    //   InSwap 1024->512  3x3 pad1 @64x64        931     7976      3498
+    //   InSwap  512->256  3x3 pad1 @128x128      886     7856      3468
+    //                                        (GFLOPS, benches/conv_engine_gflops_regression)
+    // ```
+    //
+    // Winograd's 2.25x multiply reduction cannot make up a 2x deficit in the
+    // GEMM it reduces *to*, so it stays a fallback for the shapes the tiling
+    // declines (`groups > 1`, f64, NHWC, or too small) -- where it is still
+    // 1.5-3.9x ahead of the scalar kernel and therefore still worth selecting.
+    if TiledConvPlan::for_problem(problem).is_some() {
+        return ConvAlgorithm::ImplicitGemm;
+    }
+
+    // Rule 4: 3x3 Winograd when the engine supports the shape and the problem
     // is large enough for the transform overhead to pay for itself. Both
     // conditions are load-bearing: `is_winograd_eligible` mirrors the engine's
     // own `supports`, and the FLOP threshold is calibrated from measurements
@@ -152,17 +182,17 @@ pub fn select_algorithm(problem: &ConvProblem, sm: SmVersion) -> ConvAlgorithm {
         }
     }
 
-    // Rule 4: Large kernels benefit from FFT.
+    // Rule 5: Large kernels benefit from FFT.
     if r >= FFT_FILTER_MIN && s >= FFT_FILTER_MIN {
         return ConvAlgorithm::FftConv;
     }
 
-    // Rule 5: Ampere+ with NHWC layout -> implicit GEMM is best.
+    // Rule 6: Ampere+ with NHWC layout -> implicit GEMM is best.
     if sm >= SmVersion::Sm80 && problem.layout.is_channels_last() {
         return ConvAlgorithm::ImplicitGemm;
     }
 
-    // Rule 6: Default fallback — im2col + GEMM.
+    // Rule 7: Default fallback — im2col + GEMM.
     ConvAlgorithm::Im2colGemm
 }
 
@@ -358,13 +388,42 @@ mod tests {
         }
     }
 
+    /// A large 3x3 NCHW f32 convolution satisfies *both* the Winograd rule and
+    /// the tiled-implicit-GEMM rule; the tiled kernel must win, because it is
+    /// 1.7-2.3x faster than Winograd on every measured shape (see the table on
+    /// Rule 3).
     #[test]
-    fn select_3x3_large_nchw_is_winograd() {
-        // `problem_3x3_nchw()` satisfies `is_winograd_eligible` and clears
-        // `WINOGRAD_FLOP_THRESHOLD` by a wide margin (batch 32, 256 channels,
-        // 56x56), so Rule 3 must fire. NCHW does not qualify for Rule 5, so
-        // before the engine existed this landed on Im2colGemm.
+    fn select_3x3_large_nchw_prefers_the_tiled_kernel_over_winograd() {
         let p = problem_3x3_nchw();
+        assert!(
+            is_winograd_eligible(&p, 3, 3)
+                && estimate_gemm_flops(&p, 3, 3) > WINOGRAD_FLOP_THRESHOLD,
+            "this shape must be Winograd-eligible, so the tiled rule is what decides it"
+        );
+        assert!(
+            TiledConvPlan::for_problem(&p).is_some(),
+            "...and claimed by the tiling"
+        );
+        assert_eq!(
+            select_algorithm(&p, SmVersion::Sm80),
+            ConvAlgorithm::ImplicitGemm
+        );
+    }
+
+    /// ...and Winograd is still selected for a Winograd-eligible shape the
+    /// tiling declines, which is the only reason Rule 4 still exists. A
+    /// grouped convolution is the cleanest such shape: `WinogradConv::supports`
+    /// requires `groups == 1`, so the decline has to come from somewhere the
+    /// two rules disagree -- here, an f32 NCHW 3x3 whose GEMM depth is below
+    /// the tiling's floor but whose FLOP count clears Winograd's.
+    #[test]
+    fn select_3x3_falls_back_to_winograd_where_the_tiling_declines() {
+        let mut p = problem_3x3_nchw();
+        p.in_channels = 4; // C*R*S = 36, under the tiling's MIN_GEMM_K of 64.
+        assert!(
+            TiledConvPlan::for_problem(&p).is_none(),
+            "the tiling must decline this shape"
+        );
         assert!(is_winograd_eligible(&p, 3, 3));
         assert!(estimate_gemm_flops(&p, 3, 3) > WINOGRAD_FLOP_THRESHOLD);
         assert_eq!(
@@ -433,12 +492,37 @@ mod tests {
         assert_ne!(algo, ConvAlgorithm::Winograd);
     }
 
+    /// The FFT rule now sits below the tiled rule, and that ordering is a
+    /// deliberate improvement rather than an accident of rule numbering: the
+    /// `FftConv` arm of `conv::api::conv_forward` does not actually run an
+    /// FFT convolution -- it validates an `FftConv2dPlan`, then executes
+    /// `Im2colGemmConv` -- *and* demands a workspace, returning
+    /// `WorkspaceRequired` without one. Routing a 7x7 the tiling can claim to
+    /// the tiled kernel replaces an im2col materialisation plus a BLAS GEMM
+    /// with a single zero-workspace kernel.
     #[test]
-    fn select_7x7_fft() {
+    fn select_7x7_prefers_the_tiled_kernel_over_the_fft_placeholder() {
         let mut p = problem_3x3_nchw();
         p.filter_dims = vec![7, 7];
-        let algo = select_algorithm(&p, SmVersion::Sm80);
-        assert_eq!(algo, ConvAlgorithm::FftConv);
+        p.padding = vec![3, 3];
+        assert!(TiledConvPlan::for_problem(&p).is_some());
+        assert_eq!(
+            select_algorithm(&p, SmVersion::Sm80),
+            ConvAlgorithm::ImplicitGemm
+        );
+    }
+
+    /// ...and a 7x7 the tiling declines still reaches the FFT rule.
+    #[test]
+    fn select_7x7_fft_when_the_tiling_declines() {
+        let mut p = problem_3x3_nchw();
+        p.filter_dims = vec![7, 7];
+        p.in_channels = 1; // C*R*S = 49, under the tiling's floor.
+        assert!(TiledConvPlan::for_problem(&p).is_none());
+        assert_eq!(
+            select_algorithm(&p, SmVersion::Sm80),
+            ConvAlgorithm::FftConv
+        );
     }
 
     #[test]

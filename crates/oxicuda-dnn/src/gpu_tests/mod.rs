@@ -37,6 +37,7 @@ mod attn;
 mod conv_fprop;
 mod conv_fused;
 mod conv_other;
+mod conv_tiled;
 mod conv_winograd;
 mod handle_sync;
 mod moe_linear;

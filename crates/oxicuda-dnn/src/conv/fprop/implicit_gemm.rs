@@ -37,6 +37,7 @@ use crate::types::{TensorDesc, TensorDescMut, TensorLayout, TileConfig};
 
 use super::super::descriptor::ConvProblem;
 use super::standard_conv::{emit_standard_conv_body, with_standard_conv_params};
+use super::tiled_implicit_gemm::TiledImplicitGemmConv;
 
 // ---------------------------------------------------------------------------
 // ImplicitGemmConv
@@ -46,10 +47,27 @@ use super::standard_conv::{emit_standard_conv_body, with_standard_conv_params};
 ///
 /// Generates and launches a PTX kernel that computes convolution as a GEMM
 /// with implicit im2col address mapping inside the inner loop.
+///
+/// # Two kernels, one engine
+///
+/// [`execute`](Self::execute) dispatches between two code generators that
+/// compute the identical mapping:
+///
+/// * [`TiledImplicitGemmConv`] — a CTA-tiled, shared-memory-staged mainloop,
+///   used whenever the problem's shape lets it be set up cleanly and is big
+///   enough to be worth it;
+/// * the scalar, one-thread-per-output-element kernel emitted by this type,
+///   which handles everything else (f64, NHWC, grouped, small) and remains the
+///   numeric oracle the tiled path is tested against.
+///
+/// The choice is made once, at construction, and callers do not participate:
+/// `oxionnx-cuda`'s `pick_engine` still names this one engine.
 pub struct ImplicitGemmConv {
     problem: ConvProblem,
     tile_config: TileConfig,
     sm_version: SmVersion,
+    /// The tiled engine, when this problem's shape admits one.
+    tiled: Option<TiledImplicitGemmConv>,
 }
 
 impl ImplicitGemmConv {
@@ -57,25 +75,68 @@ impl ImplicitGemmConv {
     #[must_use]
     pub fn new(problem: ConvProblem, sm_version: SmVersion) -> Self {
         let tile_config = TileConfig::default_conv(sm_version);
-        Self {
-            problem,
-            tile_config,
-            sm_version,
-        }
+        Self::build(problem, tile_config, sm_version)
     }
 
     /// Creates with a custom tile configuration.
+    ///
+    /// The tile configuration applies to the scalar kernel's cache key only;
+    /// the tiled kernel derives its own geometry from the problem (see
+    /// [`TiledConvPlan`](super::tiled_implicit_gemm::TiledConvPlan)).
     #[must_use]
     pub fn with_tile_config(
         problem: ConvProblem,
         tile_config: TileConfig,
         sm_version: SmVersion,
     ) -> Self {
+        Self::build(problem, tile_config, sm_version)
+    }
+
+    fn build(problem: ConvProblem, tile_config: TileConfig, sm_version: SmVersion) -> Self {
+        // `TiledImplicitGemmConv::new` is also where the
+        // `OXICUDA_DISABLE_TILED_CONV` kill switch is honoured, so every
+        // consumer of the tiling -- this engine, `algo_select`, and
+        // `oxionnx-cuda`'s `pick_engine` -- agrees about whether it is on.
+        let tiled = TiledImplicitGemmConv::new(problem.clone(), sm_version);
         Self {
             problem,
             tile_config,
             sm_version,
+            tiled,
         }
+    }
+
+    /// Builds an engine pinned to the scalar kernel, whatever the shape.
+    ///
+    /// The scalar kernel is this crate's numeric oracle for the tiled one --
+    /// same mapping, same accumulation order, no staging -- so the on-device
+    /// parity tests and the GFLOPS regression harness both need a way to reach
+    /// it by construction rather than by setting a process-global environment
+    /// variable. Production never calls this.
+    #[must_use]
+    pub fn scalar_only(problem: ConvProblem, sm_version: SmVersion) -> Self {
+        Self {
+            problem,
+            tile_config: TileConfig::default_conv(sm_version),
+            sm_version,
+            tiled: None,
+        }
+    }
+
+    /// Whether this problem will run on the tiled kernel.
+    ///
+    /// Public so benchmarks and the on-device tests can assert which code
+    /// generator a shape actually lands on, rather than inferring it from a
+    /// timing.
+    #[must_use]
+    pub const fn uses_tiled_kernel(&self) -> bool {
+        self.tiled.is_some()
+    }
+
+    /// The tiled engine backing this one, when there is one.
+    #[must_use]
+    pub const fn tiled(&self) -> Option<&TiledImplicitGemmConv> {
+        self.tiled.as_ref()
     }
 
     /// Returns a unique kernel name encoding every code-generation constant.
@@ -192,6 +253,9 @@ impl ImplicitGemmConv {
         bias: Option<&TensorDesc<T>>,
         output: &mut TensorDescMut<T>,
     ) -> DnnResult<()> {
+        if let Some(tiled) = &self.tiled {
+            return tiled.execute(handle, input, filter, bias, output);
+        }
         let entry = self.kernel_name();
         let kernel =
             handle.get_or_compile_kernel(&cache_key(&entry, self.sm_version), &entry, || {

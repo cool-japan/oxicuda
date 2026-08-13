@@ -45,6 +45,7 @@ use crate::conv::descriptor::ConvProblem;
 use crate::conv::fprop::direct::{Conv1x1, DepthwiseConv};
 use crate::conv::fprop::im2col_gemm::Im2colGemmConv;
 use crate::conv::fprop::implicit_gemm::ImplicitGemmConv;
+use crate::conv::fprop::tiled_implicit_gemm::TiledConvPlan;
 use crate::error::{DnnError, DnnResult};
 use crate::handle::DnnHandle;
 use crate::types::{ConvAlgorithm, ConvolutionDescriptor, TensorDesc, TensorDescMut, TensorLayout};
@@ -1114,10 +1115,27 @@ fn conv_forward_winograd_eligible_shape_matches_cpu_oracle() {
         "regression shape must clear the Winograd FLOP threshold"
     );
     // Pin down which branch this test is actually exercising, so the numeric
-    // check below is known to cover the engine the gate currently selects
-    // rather than silently testing the fallback forever.
+    // check below is known to cover the engine the dispatcher currently
+    // selects rather than silently testing the fallback forever.
+    //
+    // Since the CTA-tiled implicit-GEMM kernel landed, a *large* Winograd-
+    // eligible shape like this one is claimed by the tiling as well, and
+    // `select_algorithm`'s Rule 3 puts the tiling first because it measures
+    // 5.7-8.0 TFLOPS against Winograd's 1.7-3.5 on the same shapes (see
+    // `algo_select`'s Rule 3 table). So the expected route is `ImplicitGemm`
+    // here, and the Winograd gate is exercised on the shapes the tiling
+    // declines -- which `algo_select`'s own
+    // `select_3x3_falls_back_to_winograd_where_the_tiling_declines` pins, and
+    // which `gpu_tests::conv_winograd` validates numerically.
     let selected = problem.select_algorithm(fx.sm);
-    if winograd_forward_implemented() {
+    let tiled_claims = TiledConvPlan::for_problem(&problem).is_some();
+    if tiled_claims {
+        assert_eq!(
+            selected,
+            ConvAlgorithm::ImplicitGemm,
+            "a tiling-claimed shape must route to the tiled implicit-GEMM kernel"
+        );
+    } else if winograd_forward_implemented() {
         assert_eq!(
             selected,
             ConvAlgorithm::Winograd,
@@ -1156,28 +1174,35 @@ fn conv_forward_winograd_eligible_shape_matches_cpu_oracle() {
     )
     .expect("conv desc");
 
-    // Drive the *public* dispatcher exactly as a real caller would: call
-    // with no workspace first so the algorithm `select_algorithm` actually
-    // picked reports how much it needs. This also confirms the shape
-    // selected an algorithm that requires workspace at all (Winograd and
-    // Im2colGemm both do; Direct/ImplicitGemm don't), so a pass here is
-    // real evidence the Winograd path specifically was avoided rather than
-    // some unrelated no-workspace engine being selected by coincidence.
-    let err = conv_forward(
-        &fx.handle,
-        &in_desc,
-        &fil_desc,
-        &mut out_desc,
-        &conv_desc,
-        None,
-    )
-    .expect_err("algorithm selected for this shape must require a workspace");
-    let ws_bytes = match err {
-        DnnError::WorkspaceRequired(n) => n,
-        other => panic!("expected WorkspaceRequired, got {other:?}"),
+    // Drive the *public* dispatcher exactly as a real caller would. How the
+    // workspace has to be supplied depends on which engine was selected, and
+    // that dependency is itself corroborating evidence of the route:
+    //
+    //  * the tiled implicit-GEMM kernel stages through *static* shared memory
+    //    and needs no workspace at all, so the `None` call must succeed;
+    //  * Winograd and Im2colGemm both report their requirement through
+    //    `WorkspaceRequired`, so the `None` call must fail with the size --
+    //    which also rules out some unrelated no-workspace engine having been
+    //    selected by coincidence.
+    let mut ws_storage: Option<DeviceBuffer<u8>> = if tiled_claims {
+        None
+    } else {
+        let err = conv_forward(
+            &fx.handle,
+            &in_desc,
+            &fil_desc,
+            &mut out_desc,
+            &conv_desc,
+            None,
+        )
+        .expect_err("algorithm selected for this shape must require a workspace");
+        let ws_bytes = match err {
+            DnnError::WorkspaceRequired(n) => n,
+            other => panic!("expected WorkspaceRequired, got {other:?}"),
+        };
+        assert!(ws_bytes > 0, "reported workspace size must be positive");
+        Some(DeviceBuffer::from_host(&vec![0u8; ws_bytes]).expect("alloc workspace"))
     };
-    assert!(ws_bytes > 0, "reported workspace size must be positive");
-    let mut ws = DeviceBuffer::from_host(&vec![0u8; ws_bytes]).expect("alloc workspace");
 
     conv_forward(
         &fx.handle,
@@ -1185,9 +1210,9 @@ fn conv_forward_winograd_eligible_shape_matches_cpu_oracle() {
         &fil_desc,
         &mut out_desc,
         &conv_desc,
-        Some(&mut ws),
+        ws_storage.as_mut(),
     )
-    .expect("conv_forward with workspace");
+    .expect("conv_forward");
     fx.stream().synchronize().expect("synchronize");
 
     let mut gpu = vec![0.0f32; out_n];
@@ -1207,10 +1232,12 @@ fn conv_forward_winograd_eligible_shape_matches_cpu_oracle() {
     let fil_o: Vec<f64> = fil32.iter().map(|&x| f64::from(x)).collect();
     let exp64 = conv2d_ref(case, &in_o, &fil_o, None);
 
-    if winograd_forward_implemented() {
+    if !tiled_claims && winograd_forward_implemented() {
         // Winograd reassociates the sum, so it is held to the whole-tensor
         // relative-L2 budget documented on the engine, not to an element-wise
-        // bound the direct engines meet by construction.
+        // bound the direct engines (and the tiled kernel, which keeps the
+        // direct engines' `(c, r, s)` accumulation order) meet by
+        // construction.
         let err = rel_l2_error(&gpu, &exp64);
         assert!(
             err < 1e-4,

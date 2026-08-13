@@ -643,6 +643,27 @@ mod tests {
             "the selected backend must come back initialised"
         );
 
+        // `CudaBackend` is special-cased in `select_backend`'s own doc table:
+        // it is constructed whenever `libcuda` loads and reports >= 1 device
+        // (driver/memory/launch are default features), but its compute ops
+        // are individually gated on the `ptx` feature and return
+        // `Unsupported` per-call without it -- exactly the same "ops it does
+        // not implement return Unsupported rather than falling back
+        // silently" contract this module's doc comment spells out for
+        // Metal. On a real NVIDIA box built without `ptx`, Cuda is the
+        // legitimately-selected default backend yet genuinely cannot run
+        // this op; that is documented behaviour, not a regression this
+        // test should fail on. A build with `ptx` enabled (or one that
+        // selects a different backend entirely) still runs the real
+        // round-trip below.
+        if backend.kind() == BackendKind::Cuda && !cfg!(feature = "ptx") {
+            eprintln!(
+                "default_backend_runs_a_real_compute_round_trip: skipping -- Cuda selected \
+                 without the `ptx` feature, which cannot run compute ops by design"
+            );
+            return;
+        }
+
         // Negative inputs matter: a backend that silently dispatched an
         // identity kernel would still pass an all-positive ReLU check.
         let input_values = [-2.5f32, -0.5, 0.0, 1.5, 3.25, -7.0, 0.125, 42.0];
