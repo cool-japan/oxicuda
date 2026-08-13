@@ -94,6 +94,9 @@ The PTX crate is the largest in Vol.1+2 and the core differentiator of OxiCUDA. 
 - [x] Scan/prefix-sum template -- inclusive/exclusive scan with Blelloch work-efficient algorithm, sum/product/min/max ops (templates/scan.rs)
 - [x] Transpose template (templates/transpose.rs) -- coalesced shared-memory transpose with bank-conflict-free padding
 - [x] Batch normalization template (templates/batch_norm.rs) -- training + inference BN kernels
+- [x] CTA-tiled f32 GEMM mainloop emitter (templates/tiled_mainloop.rs) -- reusable, operand-agnostic (via a `GlobalTap` callback) register-blocked mainloop: 256-thread CTA, 128x128x8 tile, 8x8 register tile/thread; backs `oxicuda-dnn`'s CTA-tiled implicit-GEMM convolution engine. `oxicuda-blas`'s `GemmDispatcher` does not call it yet, despite the module doc naming both as intended consumers.
+- [x] Vectorized shared-memory / TF32-rounding builder primitives (builder/body_builder/vector_mem_ops.rs) -- `load_shared_f32x4`/`store_shared_f32x4`/`store_global_f32x4` (`ld`/`st.v4.f32`) and `cvt_f32_to_tf32` (`cvt.rna.tf32.f32`, `.rna` required pre-sm_90), plus `KernelBuilder::shared_mem_aligned` for the 16-byte-aligned shared arrays `.v4` needs. Only `shared_mem_aligned` has a caller outside this file's own tests so far (the tiled mainloop above).
+- [x] Channel-broadcast / PRelu templates (templates/channel_broadcast.rs) -- `ChannelBroadcastTemplate`/`PReluTemplate` for ONNX-style `[1,C,1,1]`-vs-`[1,C,H,W]` broadcast ops and per-channel-slope LeakyReLU; no caller elsewhere in the workspace yet
 - [x] Visual PTX explorer (explorer/) -- interactive TUI-based PTX code explorer with syntax highlighting, register liveness visualization, instruction dependency graph, and per-block register pressure heatmap (P2)
 
 ## Dependencies

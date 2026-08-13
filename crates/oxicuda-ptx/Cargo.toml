@@ -25,8 +25,15 @@ thiserror.workspace = true
 # crate's own test binary), which Cargo permits without forming a build
 # cycle -- `oxicuda-launch`'s and `oxicuda-memory`'s *library* targets build
 # from oxicuda-ptx's library alone, before this crate's tests are compiled.
-oxicuda-launch.workspace = true
-oxicuda-memory.workspace = true
+# Path-only (no `version`/`workspace = true`) deliberately: a versioned
+# intra-workspace dev-dep back-edge is stripped from the *published*
+# manifest only when it carries no version, so publishing `oxicuda-ptx`
+# never needs `oxicuda-launch`/`oxicuda-memory` 0.5.5 to already be on
+# crates.io. `{ workspace = true }` here would expand to path+version and
+# block `cargo publish` until those two publish first (release-check
+# skill, "Pre-Publish Safety Lints", check 1).
+oxicuda-launch = { path = "../oxicuda-launch" }
+oxicuda-memory = { path = "../oxicuda-memory" }
 
 [features]
 default = []

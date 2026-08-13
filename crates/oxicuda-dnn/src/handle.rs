@@ -130,8 +130,8 @@ impl DnnHandle {
     /// BLAS/DNN overlap and is prepared to pay for the ordering: every handoff
     /// between the two families then needs an event join (which is what
     /// [`Self::upload_staged_with`] and friends perform internally) rather than
-    /// stream order. See [`Self::build`] for why the shared-stream form is the
-    /// default.
+    /// stream order. See `Self::build`'s doc comment for why the shared-stream
+    /// form is the default.
     ///
     /// # Errors
     ///
@@ -288,30 +288,37 @@ impl DnnHandle {
     /// Blocks until every operation queued on *either* of this handle's two
     /// streams has completed: [`Self::stream`] (used by DNN kernels launched
     /// directly against this handle) **and** [`BlasHandle::stream`] on
-    /// [`Self::blas`] (a separate stream — see `Self::build` — used by GEMM
-    /// launches routed through [`Self::blas`]).
+    /// [`Self::blas`] (see `Self::build` — the *same* underlying queue by
+    /// default, a genuinely separate one only when this handle was built via
+    /// [`Self::with_split_blas_stream`]; [`Self::streams_unified`] reports
+    /// which case a given handle is in).
     ///
     /// # Why this exists
     ///
-    /// `DnnHandle` deliberately gives its BLAS sub-handle its own stream so
-    /// BLAS and DNN launches can be overlapped (see `Self::build`'s doc
-    /// comment). That is exactly what makes synchronizing only
-    /// [`Self::stream`] *look* correct while actually racing: a caller that
-    /// dispatches work through [`Self::blas`] and then calls
-    /// `dnn_handle.stream().synchronize()` has synchronized a stream nothing
-    /// was queued on. CUDA streams created `CU_STREAM_NON_BLOCKING` (as every
-    /// stream here is) do not implicitly order against each other, so the
-    /// host can read back a result buffer *before* the kernel that was
-    /// supposed to fill it has actually run — observing whatever was in that
-    /// device memory previously (for a freshly zeroed buffer, silently
+    /// Under the default (unified) construction this simply synchronizes one
+    /// queue twice — harmless, and it saves callers from branching on which
+    /// construction path built their handle. It earns its keep for a handle
+    /// built via [`Self::with_split_blas_stream`], which deliberately keeps
+    /// BLAS and DNN launches on independent streams so they can overlap (see
+    /// `Self::build`'s doc comment) — and that is exactly what makes
+    /// synchronizing only [`Self::stream`] *look* correct while actually
+    /// racing: a caller that dispatches work through [`Self::blas`] and then
+    /// calls `dnn_handle.stream().synchronize()` has synchronized a stream
+    /// nothing was queued on. CUDA streams created `CU_STREAM_NON_BLOCKING`
+    /// (as every stream here is) do not implicitly order against each other,
+    /// so the host can read back a result buffer *before* the kernel that
+    /// was supposed to fill it has actually run — observing whatever was in
+    /// that device memory previously (for a freshly zeroed buffer, silently
     /// plausible-looking zeros, not a crash). This happened for real: see
     /// `oxionnx-cuda::matmul::cuda_matmul`'s pre-fix history.
     ///
     /// A caller that only ever dispatches through *one* of the two streams
     /// may synchronize that one directly (cheaper: one blocking driver call
-    /// instead of two); this method is for callers that dispatch through
-    /// [`Self::blas`] — or aren't sure which stream a helper used internally
-    /// — and want a synchronization call that is correct regardless.
+    /// instead of two, and the only construction where that's meaningfully
+    /// cheaper is the split one); this method is for callers that dispatch
+    /// through [`Self::blas`] — or aren't sure which stream a helper used
+    /// internally, or which construction path built this handle — and want
+    /// a synchronization call that is correct regardless.
     ///
     /// # Errors
     ///

@@ -15,15 +15,16 @@
 //!    Measured 5.7-8.0 TFLOPS against Winograd's 1.7-3.5 on the same shapes,
 //!    which is why this rule precedes the Winograd one.
 //! 4. **3x3 NCHW FP32 kernels** with unit stride/dilation, `groups == 1` and
-//!    padding <= 1, above [`WINOGRAD_FLOP_THRESHOLD`], *that the tiling
+//!    padding <= 1, above `WINOGRAD_FLOP_THRESHOLD`, *that the tiling
 //!    declined* -> [`Winograd`](ConvAlgorithm::Winograd). Eligibility is
-//!    [`WinogradConv::supports`] verbatim (via [`is_winograd_eligible`]), so
-//!    this rule can never select an engine that would then refuse the
-//!    problem; profitability is the separate FLOP test, calibrated from the
-//!    measurements quoted on [`WINOGRAD_FLOP_THRESHOLD`].
-//! 4. **Large kernels** (7x7+) -> [`FftConv`](ConvAlgorithm::FftConv)
-//! 5. **Ampere+ with NHWC** -> [`ImplicitGemm`](ConvAlgorithm::ImplicitGemm)
-//! 6. **Default** -> [`Im2colGemm`](ConvAlgorithm::Im2colGemm)
+//!    [`WinogradConv::supports`](super::fprop::winograd::WinogradConv::supports)
+//!    verbatim (via `is_winograd_eligible`), so this rule can never select an
+//!    engine that would then refuse the problem; profitability is the
+//!    separate FLOP test, calibrated from the measurements quoted on
+//!    `WINOGRAD_FLOP_THRESHOLD`.
+//! 5. **Large kernels** (7x7+) -> [`FftConv`](ConvAlgorithm::FftConv)
+//! 6. **Ampere+ with NHWC** -> [`ImplicitGemm`](ConvAlgorithm::ImplicitGemm)
+//! 7. **Default** -> [`Im2colGemm`](ConvAlgorithm::Im2colGemm)
 
 use oxicuda_ptx::arch::SmVersion;
 
@@ -106,7 +107,7 @@ const FFT_FILTER_MIN: u32 = 7;
 ///
 /// Both are three to four orders of magnitude inside the documented `1e-4`
 /// budget. Performance is measured, not assumed: see
-/// [`WINOGRAD_FLOP_THRESHOLD`] for the full table, which is also what defines
+/// `WINOGRAD_FLOP_THRESHOLD` for the full table, which is also what defines
 /// the problem-size region this rule applies to (Winograd is 1.5x to 3.8x
 /// faster above the threshold and *slower* below it, so the flag alone is not
 /// the whole decision).
@@ -208,7 +209,7 @@ pub fn select_algorithm(problem: &ConvProblem, sm: SmVersion) -> ConvAlgorithm {
 /// problem so a stale pair cannot widen the test.
 ///
 /// This is the *shape* eligibility test only — profitability is
-/// [`WINOGRAD_FLOP_THRESHOLD`], and whether the rule is consulted at all is
+/// `WINOGRAD_FLOP_THRESHOLD`, and whether the rule is consulted at all is
 /// [`winograd_forward_implemented`]. `pub(crate)` so `gpu_tests` can assert a
 /// regression shape is genuinely eligible (not merely below the FLOP
 /// threshold).

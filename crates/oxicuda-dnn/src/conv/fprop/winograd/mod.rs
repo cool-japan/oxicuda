@@ -12,10 +12,10 @@
 //!
 //! | Stage | Kernel | Work |
 //! |---|---|---|
-//! | 1 | [`kernels::input_transform_ptx`] | `V[e][c][p] = (B^T d B)[e]` |
-//! | 2 | [`kernels::filter_transform_ptx`] | `U[e][k][c] = (G g G^T)[e]` |
-//! | 3 | [`kernels::batched_gemm_ptx`] | `M[e] = U[e] (KxC) * V[e] (CxP)` |
-//! | 4 | [`kernels::output_transform_ptx`] | `Y = A^T m A`, `+ bias`, store |
+//! | 1 | `kernels::input_transform_ptx` | `V[e][c][p] = (B^T d B)[e]` |
+//! | 2 | `kernels::filter_transform_ptx` | `U[e][k][c] = (G g G^T)[e]` |
+//! | 3 | `kernels::batched_gemm_ptx` | `M[e] = U[e] (KxC) * V[e] (CxP)` |
+//! | 4 | `kernels::output_transform_ptx` | `Y = A^T m A`, `+ bias`, store |
 //!
 //! All four run on [`DnnHandle::stream`] — stage 3 is this crate's own tiled
 //! kernel rather than a BLAS dispatch, so there is no second stream and no
@@ -25,8 +25,7 @@
 //! # Supported region
 //!
 //! [`WinogradConv::supports`] is the single authority, and
-//! [`is_winograd_eligible`](super::super::algo_select::is_winograd_eligible)
-//! defers to it:
+//! `is_winograd_eligible` (in `super::super::algo_select`) defers to it:
 //!
 //! * 2-D NCHW, FP32 in and out
 //! * 3x3 filter, stride 1, dilation 1, `groups == 1`
@@ -122,7 +121,7 @@ impl WinogradTileSize {
     /// Whether this crate has real *forward* kernels for this tile size.
     ///
     /// Only F(2,3) does. This is a capability fact about the emitters in
-    /// [`kernels`], not a heuristic — [`WinogradConv::with_tile_size`] refuses
+    /// `kernels`, not a heuristic — [`WinogradConv::with_tile_size`] refuses
     /// anything that returns `false` rather than launching kernels that do not
     /// exist.
     #[must_use]

@@ -304,11 +304,11 @@ impl GemmDispatcher {
     /// Creates a new dispatcher targeting the given SM architecture.
     ///
     /// The streaming-multiprocessor *count* defaults to a representative
-    /// value for `sm`'s architecture generation (see [`Self::sm_count`] on
-    /// the field doc for why compute capability alone cannot give an exact
-    /// count, and [`Self::new_with_sm_count`] to supply the real, live
-    /// count from a `Device` instead -- [`crate::handle::BlasHandle`] does
-    /// this automatically).
+    /// value for `sm`'s architecture generation (see the `sm_count` field
+    /// doc for why compute capability alone cannot give an exact count, and
+    /// [`Self::new_with_sm_count`] to supply the real, live count from a
+    /// `Device` instead -- [`crate::handle::BlasHandle`] does this
+    /// automatically).
     #[must_use]
     pub fn new(sm: SmVersion) -> Self {
         Self::new_with_sm_count(sm, Self::typical_sm_count(sm))
@@ -320,7 +320,7 @@ impl GemmDispatcher {
     /// Prefer this over [`Self::new`] whenever a live device is available:
     /// pass `device.multiprocessor_count()`. `sm_count` is clamped to at
     /// least 1 so a caller-supplied `0` (or a failed query defaulted to `0`)
-    /// cannot make [`Self::compute_grid`] compute a zero-size launch.
+    /// cannot make `compute_grid` compute a zero-size launch.
     #[must_use]
     pub fn new_with_sm_count(sm: SmVersion, sm_count: u32) -> Self {
         Self {
@@ -1174,7 +1174,7 @@ impl GemmDispatcher {
     /// cache.
     ///
     /// Zero until the first split-K GEMM; monotonically non-decreasing after
-    /// that, by design — see [`Self::split_k_workspace`].
+    /// that, by design — see the `split_k_workspace` field doc.
     ///
     /// # Errors
     ///

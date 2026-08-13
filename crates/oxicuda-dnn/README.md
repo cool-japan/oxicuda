@@ -17,12 +17,17 @@ convolution, MoE grouped GEMM) and on `oxicuda-ptx` for runtime PTX kernel
 generation. `DnnHandle` manages a CUDA stream, a BLAS sub-handle, and a PTX
 cache so that compiled kernels are reused across calls.
 
-Algorithm selection is automatic: the convolution dispatcher benchmarks
-implicit-GEMM, im2col+GEMM, direct, and FFT-based strategies and picks the
-fastest for each problem shape. Winograd is implemented as a strategy too,
-but is currently gated off pending real forward/backward kernels -- see
-`conv::algo_select::winograd_forward_implemented` -- so it is never
-selected. Fused epilogues (conv+BN+ReLU, LayerNorm+activation,
+Algorithm selection is automatic: the convolution dispatcher tries a
+CTA-tiled implicit-GEMM fast path first (`conv::fprop::tiled_implicit_gemm`,
+wired transparently inside the implicit-GEMM engine -- 5.7-8.0 TFLOPS on
+real face-pipeline 3x3 shapes vs. a ~900 GFLOPS scalar baseline when the
+shape qualifies), then Winograd F(2,3) once the shape clears a measured
+profitability threshold (`conv::algo_select::winograd_forward_implemented`
+is `true` -- forward is a real, hardware-validated implementation, not a
+skeleton), then falls back through im2col+GEMM, direct, and FFT-based
+strategies. Winograd F(4,3) forward and the Winograd *backward* passes
+(dgrad/wgrad) remain unimplemented skeletons -- see "Supported Operations"
+below. Fused epilogues (conv+BN+ReLU, LayerNorm+activation,
 fused_add_rms_norm) are provided to minimize global memory traffic;
 conv+BN+ReLU in particular is a decomposed real convolution plus a combined
 BN-affine + activation kernel pass, not a single monolithic kernel (see
@@ -76,23 +81,44 @@ fn main() -> DnnResult<()> {
 
 | Algorithm | Forward | dgrad | wgrad |
 |-----------|---------|-------|-------|
-| Implicit GEMM | yes | yes | yes |
+| Implicit GEMM¹ | yes | yes | yes |
 | im2col + GEMM | yes | -- | -- |
-| Winograd F(2,3) / F(4,3) | skeleton¹ | skeleton¹ | skeleton¹ |
+| Winograd F(2,3) | yes² | skeleton³ | skeleton³ |
+| Winograd F(4,3) | not implemented⁴ | -- | -- |
 | Direct (1x1, depthwise) | yes | -- | -- |
 | FFT-based | yes | -- | -- |
 
-¹ Tile selection, workspace sizing, and transform-matrix constants exist
-for all three (`conv/fprop/winograd.rs`, `conv/dgrad/winograd.rs`,
-`conv/wgrad/winograd.rs`), but the kernel bodies are load/launch-only
-skeletons that perform no numeric work (they leave the output buffer
-untouched rather than computing a wrong answer). The forward dispatcher
-(`conv::algo_select`) is gated to never route convolutions to it, falling
-back to im2col+GEMM / implicit-GEMM instead; the dgrad/wgrad variants are
-not wired into `conv_backward_data`/`conv_backward_filter` at all (those
-use separate implicit-GEMM engines) and are only reachable by constructing
-`WinogradDgrad`/`WinogradWgrad` directly. See each file's "Implementation
-status" module docs.
+¹ Forward transparently dispatches through a CTA-tiled, register-blocked
+GEMM mainloop (`conv/fprop/tiled_implicit_gemm.rs`) when the shape
+qualifies (F32/NCHW/`groups==1`/2-D, above minimum K/output-channel/CTA-count
+thresholds) -- 5.7-8.0 TFLOPS vs. a ~900 GFLOPS scalar baseline on real
+face-pipeline 3x3 shapes; declined shapes fall back to the scalar,
+one-thread-per-output-element kernel. `ImplicitGemmConv::scalar_only` pins
+the scalar path directly, and the `OXICUDA_DISABLE_TILED_CONV` environment
+variable disables tiling process-wide (A/B measurement, bisecting a
+suspected miscompare).
+
+² A genuine F(2x2,3x3) implementation (`conv/fprop/winograd/`): input
+transform, filter transform, a shared-memory-tiled batched GEMM over the 16
+transform-domain positions, output transform + bias. Hardware-validated on
+an RTX A4000 against an `f64` CPU oracle (relative L2 `1.0e-7`..`1.7e-7`)
+and `ImplicitGemmConv` (`7.9e-8`..`1.4e-6`); `conv::algo_select` routes
+eligible shapes to it only above a measured profitability threshold --
+below it, Winograd's four kernel launches lose to implicit-GEMM's one.
+
+³ Tile selection, workspace sizing, and transform-matrix constants exist
+for both (`conv/dgrad/winograd.rs`, `conv/wgrad/winograd.rs`), but the
+kernel bodies are load/launch-only skeletons that perform no numeric work
+(they leave the output buffer untouched rather than computing a wrong
+answer). Not wired into `conv_backward_data`/`conv_backward_filter` at all
+(those use separate implicit-GEMM dgrad/wgrad engines) and only reachable
+by constructing `WinogradDgrad`/`WinogradWgrad` directly. See each file's
+"Implementation status" module docs.
+
+⁴ Explicitly rejected by `WinogradTileSize::forward_supported` -- the
+larger transform's coefficients (`1/24`, `1/12`, ...) amplify FP32
+round-off enough to need its own error budget, so it was deliberately not
+enabled by inheritance from F(2,3).
 
 Fused: conv + BatchNorm + ReLU via `conv_bn_relu` -- decomposed into a real
 convolution dispatch plus one combined BN-affine + activation kernel pass,

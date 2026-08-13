@@ -102,18 +102,40 @@ buffer) built in the course of the same investigation.
   element past `n`. Each element now carries its own independent bound.
 - `oxicuda-dnn`: `conv::algo_select::select_algorithm` routed any 3x3, unit-stride/dilation, F32,
   non-grouped convolution over the ~1 GFLOP profitability threshold — an ordinary mid-size CNN
-  layer, not an edge case — into `WinogradConv`, whose forward kernels are comment-only PTX
-  skeletons (`generate_input_transform_ptx`/`generate_output_transform_ptx` emit only step-marker
-  `comment()` calls before `ret`, and `launch_winograd_gemm` launches no kernel at all), so
+  layer, not an edge case — into `WinogradConv`, whose forward kernels were comment-only PTX
+  skeletons (`generate_input_transform_ptx`/`generate_output_transform_ptx` emitted only step-marker
+  `comment()` calls before `ret`, and `launch_winograd_gemm` launched no kernel at all), so
   `conv_forward` returned `Ok(())` while leaving the output buffer completely untouched instead of
-  computing anything. The pre-existing test `select_3x3_large_winograd` asserted this routing as the
-  correct outcome. Fixed with a new capability gate, `winograd_forward_implemented()` (a `const fn`
-  currently returning `false`), that keeps `select_algorithm`/`candidate_algorithms` from ever
-  returning `ConvAlgorithm::Winograd` until the engine has a real kernel body; both now fall through
-  to the numerically-verified `Im2colGemm`/`ImplicitGemm` engines instead. A new regression test,
-  `conv_forward_winograd_eligible_shape_matches_cpu_oracle`, drives the public `conv_forward` entry
-  point (not the engine directly) with a genuinely Winograd-eligible, over-threshold shape and
-  checks the result against the `conv2d_ref` CPU oracle.
+  computing anything. The pre-existing test `select_3x3_large_winograd` had asserted this routing as
+  the correct outcome. First fixed defensively with a capability gate, `winograd_forward_implemented()`
+  (landed as a `const fn` returning `false`), that kept `select_algorithm`/`candidate_algorithms` from
+  ever returning `ConvAlgorithm::Winograd` until the engine had a real kernel body — both fell through
+  to `Im2colGemm`/`ImplicitGemm` instead, and a new regression test,
+  `conv_forward_winograd_eligible_shape_matches_cpu_oracle`, drove the public `conv_forward` entry
+  point with a genuinely Winograd-eligible, over-threshold shape to pin the honest fallback against
+  the `conv2d_ref` CPU oracle. Later in this same release, `WinogradConv` was implemented for real —
+  input transform, filter transform, a shared-memory-tiled batched GEMM over the 16 transform-domain
+  positions, and an output transform with bias — and `winograd_forward_implemented()` now returns
+  `true`. Two independent on-device validations (RTX A4000, sm_86) back the flip: relative-L2 error
+  `1.0e-7`-`1.7e-7` against the `f64` CPU oracle across 15 shapes (partial tiles, odd extents, `C==1`,
+  `K==1`, multi-batch, both supported paddings), and `7.9e-8`-`1.4e-6` against `ImplicitGemmConv` on
+  device including all four InSwapper-128-scale layers — three to four orders of magnitude inside the
+  documented `1e-4` budget. `conv_forward_winograd_eligible_shape_matches_cpu_oracle` survives from
+  the interim fix and now exercises real Winograd computation rather than the honest-fallback path it
+  originally pinned; the old routing-canary tests in `gpu_tests::conv_fprop` (an "honesty contract"
+  asserting an *untouched* output buffer as the passing outcome) are gone, superseded by a new
+  `gpu_tests::conv_winograd` module of real numeric-oracle assertions. `WINOGRAD_FLOP_THRESHOLD` —
+  the separate profitability gate that `winograd_forward_implemented()` doesn't replace — is
+  recalibrated from `1_000_000_000` to `10_000_000` based on the new `winograd_vs_implicit_gemm`
+  bench (see Added): below ~5e6 FLOPs every measured shape is launch-bound (Winograd issues four
+  kernels where implicit GEMM issues one), above ~1.9e7 Winograd wins by 1.5x+, growing with size.
+  `is_winograd_eligible` now delegates to `WinogradConv::supports` verbatim instead of restating its
+  own copy of the conditions (which had drifted: the restated version had no padding constraint; the
+  engine's real one caps padding at `<=1`), closing a selector/engine-disagreement class of bug by
+  construction. Selection priority changed again in the same release with the arrival of the tiled
+  implicit-GEMM engine (see Added, below), which now claims most 3x3 shapes ahead of Winograd —
+  Winograd remains the fallback for the shapes tiling declines (`groups > 1`, F64, NHWC, or too
+  small), where it is still 1.5-3.9x ahead of the scalar kernel.
 - `oxicuda-dnn`: `conv::api::conv_bn_relu` dispatched into `FusedConvBnAct::execute`, whose PTX body
   (`emit_fused_body`) is a comment-only skeleton that narrates the convolution/BN/activation steps
   but never loads, computes, or stores anything — so the public fused conv+BN+activation entry point
@@ -214,6 +236,69 @@ buffer) built in the course of the same investigation.
   without the `metal` crate, which is itself declared `[target.'cfg(target_os = "macos")'.dependencies]`
   in this crate's `Cargo.toml`; it gained the explicit `#[cfg(target_os = "macos")]` it had been
   missing, so it no longer breaks the build this same commit made possible elsewhere in the file.
+- `oxicuda-blas`: `GemmDispatcher::compute_grid` massively under-provisioned the naive/grid-stride
+  GEMM kernel's launch, and `template_shared_mem_bytes` requested shared memory that kernel never
+  uses — two symptoms of one root cause. `compute_grid` sized the launch as if
+  `GemmTemplate::generate()`'s output were CTA-tiled (`ceil(n/tile_n) * ceil(m/tile_m)` CTAs), but
+  that kernel is actually one thread per output element with an internal grid-stride loop; for a
+  1024^3 F32 GEMM at the `Standard` 128x128 tile config that was only 64 CTAs (8,192 threads) each
+  grid-striding ~128 elements serially, on hardware that can run tens of thousands of threads
+  concurrently. Fixed by sizing the grid from device occupancy instead: `GRID_STRIDE_WAVES` (3)
+  full-device thread-occupancies (`sm_count * max_threads_per_sm`), clamped to total output elements
+  — measured 191 -> 747 GFLOPS at 1024^3 F32 from this fix alone (RTX A4000, per the shipped doc
+  comment). Separately, the same launch kind unconditionally computed
+  `(tile_m*tile_k + tile_k*tile_n) * elem_bytes * stages` dynamic shared-memory bytes for a kernel
+  with no `.shared` declaration at all, silently taxing CTA occupancy for zero benefit; a new
+  `GemmTemplate::uses_shared_memory_tiles()` capability flag (see Changed) now gates that computation
+  to `0` for every config `generate()` produces today.
+- `oxicuda-blas`: split-K GEMM's reduction workspace is now a bounded, reusable cache instead of an
+  alloc-per-call. This is further work on top of — not a repeat of — the split-K dispatcher-wiring
+  fix above: that fix made split-K *reachable*; this fix addresses two problems with it once reached.
+  First, `DeviceBuffer`'s classic `cuMemFree` (used on every prior per-call workspace) is a
+  device-wide barrier — it blocks until every operation on every stream completes — so every split-K
+  GEMM ended with an unwanted full-device sync, once per skinny GEMM per inference frame. Second,
+  `cuMemAlloc` is forbidden during CUDA stream capture (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`),
+  making every split-K GEMM — exactly the shape class (`m*n < 65536`, `k >= 512`) repeated
+  small-batch inference falls into — impossible to record into a CUDA graph at all;
+  `oxionnx-cuda`'s `graph_cache` depends on this fix. Fixed with a new
+  `Mutex<HashMap<SplitKWorkspaceKey, SplitKWorkspace>>` cache keyed on `(stream, output_type, element
+  count)`, entries kept for the dispatcher's lifetime (never resized/evicted) so a captured graph's
+  baked-in device pointer stays valid on replay, bounded by `SPLIT_K_WORKSPACE_MAX_ENTRIES=64` /
+  `SPLIT_K_WORKSPACE_MAX_BYTES=256 MiB` with a fallback to the historical (correct, merely slower and
+  non-capturable) per-call path beyond that. The lock is deliberately held across *both* kernel
+  launches of one split-K pair — without that, two concurrent same-shape split-K calls on one stream
+  could interleave as `partial(A), partial(B), reduce(A), reduce(B)`, making `reduce(A)` sum B's
+  partial results. New coverage: `oxicuda-blas/tests/splitk_workspace_gpu.rs`.
+- `oxicuda` (facade): the cached PTX-ops launch stream (backing `unary`/`binary`/`reduce`) was
+  created in the wrong CUDA context, and the wiring tests that should have caught it tolerated the
+  resulting error as an "environment" outcome. `oxicuda-driver`'s `create_stream_in_ctx` explicitly
+  force-binds its passed context via `cu_ctx_set_current` for the duration of `cuStreamCreate` and
+  restores the prior current context afterward — so which context is current *before* the call is
+  irrelevant. The pre-fix code called `Context::new(&device)` (a fresh throwaway context, itself left
+  current), then `backend.activate_gpu()` to re-bind the primary context, then `Stream::new(&token)`
+  — but since `token` was still the throwaway context, `Stream::new`'s own context-binding
+  unconditionally overrode `activate_gpu()`'s effect, permanently creating the stream in the
+  throwaway context rather than the primary context that actually owns the device memory and
+  JIT-loaded modules. Any kernel launch on that stream mismatching the primary context is rejected
+  by the driver with `CUDA_ERROR_INVALID_HANDLE`. This went undetected because the existing GPU
+  wiring tests treated `Err(BackendError::DeviceError(_))` as an acceptable "no GPU present" outcome
+  even after confirming a live context existed — swallowing the exact error the bug produced; only
+  one unrelated, unwrapping test (`compute::tests::default_backend_runs_a_real_compute_round_trip`)
+  caught it. Fixed by unifying BLAS, DNN, and now PTX-ops stream creation around one shared
+  `primary_context_token()` helper (renamed from `handle_context_token`), and by tightening every
+  `unary`/`binary`/`reduce`/`gemm`/`conv2d`/`attention` wiring test to stop accepting `DeviceError`
+  once a live context is confirmed present.
+- `oxicuda-ptx`: `BatchNormTemplate::generate` emitted `fma` PTX instructions with no rounding
+  modifier, which `ptxas` rejects outright ("Rounding modifier required for instruction 'fma'",
+  confirmed on real hardware) — affecting all three emission sites (variance accumulation,
+  training-mode and inference-mode scale/shift), both F32 and F64, both BN modes. Fixed with
+  `fma.rn` at all three sites, plus a new regression test
+  (`every_fma_instruction_carries_an_explicit_rounding_modifier`) that scans every emitted PTX line
+  for a bare unmodified `fma`. Caveat on blast radius:
+  `oxicuda-ptx::templates::batch_norm::BatchNormTemplate` has no caller anywhere in this workspace
+  outside its own tests — `oxicuda-dnn`'s actual, kernel-cache-wired `norm::batch_norm` generates its
+  PTX independently via `BodyBuilder` directly. So this was a real compile-time defect in a template
+  that, as far as this repo shows, nothing has ever actually invoked.
 
 ### Changed
 
@@ -278,6 +363,42 @@ buffer) built in the course of the same investigation.
   kernel-generating module wired to the cache (see Added) keeps its own pre-existing launch geometry
   and gains only the module/kernel cache itself — including kernels like `layer_norm`/`rms_norm`
   that size shared memory from a fixed `blockDim.x` and cannot safely vary it this way.
+- `oxicuda-blas`/`oxicuda-dnn`: `DnnHandle` now shares one CUDA stream with its internal
+  `BlasHandle` by default, instead of two independently-created streams. Rationale stated directly
+  in `DnnHandle::build`'s doc: no in-repo caller ever exploited the old design's BLAS/DNN overlap,
+  while making the two-stream design *correct* required either an event join or — as the ONNX
+  execution provider did — a blocking `stream.synchronize()` per node, measured at 237 per frame
+  across the three face-pipeline models. With one shared queue, a `Conv -> Gemm` handoff is ordered
+  by stream semantics alone (no event, no host rendezvous), and a captured CUDA graph spanning the
+  pair is a linear chain rather than a fork/join. The old two-stream construction remains available
+  via a new `DnnHandle::with_split_blas_stream()` for a caller that genuinely wants overlap; a new
+  `DnnHandle::streams_unified()` lets a caller check which mode it has, and `join_blas_stream()`
+  becomes a no-op automatically when the streams are unified (skips the now-pointless
+  `cuEventRecord`/`cuStreamWaitEvent` pair). `oxicuda-driver`'s `Stream` gains reference-counted
+  clone semantics (`Arc<StreamInner>`, `Clone`, new `is_same_queue()`) so the two subsystems can
+  share one queue without either one owning it exclusively — previously `Stream` directly owned its
+  `CUstream` and was not `Clone` at all; cloning now yields a second handle to the *same* driver
+  queue, destroyed only when the last handle drops.
+- `oxicuda-blas`: `GemmDispatcher`/`BlasHandle` now use the real, live per-device SM count instead
+  of an architecture-typical guess. New `GemmDispatcher::new_with_sm_count(sm, sm_count)`;
+  `BlasHandle::new` queries `device.multiprocessor_count()` and uses it, falling back to the old
+  per-architecture table (`typical_sm_count`) only on query failure — because compute capability
+  alone doesn't determine SM count (sm_86 alone spans 46-SM to 84+-SM parts). This feeds directly
+  into the `compute_grid` fix above (see Fixed).
+- `oxicuda-ptx`: `GemmTemplate::generate_pipelined` renamed to `generate_pipelined_skeleton` with
+  substantially expanded documentation stating plainly that it is **not numerically functional** —
+  its `mma.sync`/FMA compute section reads fixed placeholder registers never loaded from the staged
+  tiles it also emits — and is dispatched by nothing in production; `oxicuda-blas`'s dispatcher only
+  ever calls `GemmTemplate::generate` (SIMT path) or the separate `SimtGemmBuilder`
+  (transposed/triangle-masked path). Unchanged in behavior: it was test-only before this rename and
+  remains test-only after (`oxicuda-blas/src/gpu_tests.rs`'s only caller). Pure clarity/naming
+  change.
+- `oxicuda-webgpu`: `WebGpuDevice::new`'s `request_device` error message now includes the adapter
+  name, backend, and device type. Root cause documented: on Linux, wgpu reaches an
+  NVIDIA/AMD/Intel GPU through the Vulkan *loader* (`libvulkan.so.1`), not the vendor driver
+  directly; without it installed, wgpu silently falls back to its OpenGL adapter, whose
+  `request_device` fails with the unhelpful "Parent device is lost" — indistinguishable from "no
+  GPU" without the backend name attached. No behavior change, diagnostics only.
 
 ### Performance
 
@@ -303,6 +424,15 @@ buffer) built in the course of the same investigation.
   `zeroed_no_longer_waits_for_unrelated_streams` fails against the old `cuCtxSynchronize`
   implementation and passes now — the live demonstration that an independent non-blocking stream is
   no longer needlessly awaited.
+- `oxicuda-ptx`: the naive GEMM kernel's row/col recovery is now strength-reduced. Previously
+  recomputed `row = idx/N, col = idx%N` via 64-bit `div.u64`/`rem.u64` — no native 64-bit divide on
+  this hardware, so `ptxas` lowers each to a software long-division subroutine call — once per
+  output element per grid-stride iteration. Now computed once (32-bit, since a single thread's
+  `global_id`/`total_threads` both fit `u32`) and advanced per-iteration via cheap
+  add/compare/select carry logic. A new `GemmTemplate::uses_shared_memory_tiles()` capability flag
+  (currently `false` for every config `generate()` can produce; a structural test pins that it's
+  never accidentally true) lets a caller detect that this kernel never stages through shared memory
+  at all.
 
 ### Added
 
@@ -339,14 +469,19 @@ buffer) built in the course of the same investigation.
   types with no invalid bit patterns. Usage is observable via a new `StagingStats` counter
   (allocations/staged transfers/direct transfers/bytes moved).
 - `oxicuda-dnn`: `DnnHandle` gains `synchronize_all()`, which blocks on both of the handle's streams
-  — its own launch stream and the separate stream `BlasHandle` uses internally (deliberately
-  separate so BLAS and DNN launches can overlap). The two are both `CU_STREAM_NON_BLOCKING` and
-  therefore never implicitly ordered against each other, so a caller that dispatches through
-  `DnnHandle::blas()` and then synchronizes only `DnnHandle::stream()` can read back a result buffer
-  before the kernel that fills it has actually run — this is not hypothetical: two `oxionnx-cuda`
-  call sites hit exactly this, reading back 439/512 wrong elements at `M=1,K=25088,N=512`, 3220/4096
-  at `M=8`, and 3456/4096 at a 64x64x64 all-ones sanity check, because they synchronized the idle
-  stream instead of the one the GEMM actually ran on. `DnnHandle` also gains a matched set of
+  — its own launch stream and the stream `BlasHandle` uses internally (independent, non-blocking
+  streams at the time this method was added, so BLAS and DNN launches could overlap). The two were
+  both `CU_STREAM_NON_BLOCKING` and therefore never implicitly ordered against each other, so a
+  caller that dispatches through `DnnHandle::blas()` and then synchronizes only `DnnHandle::stream()`
+  could read back a result buffer before the kernel that fills it has actually run — this was not
+  hypothetical: two `oxionnx-cuda` call sites hit exactly this, reading back 439/512 wrong elements
+  at `M=1,K=25088,N=512`, 3220/4096 at `M=8`, and 3456/4096 at a 64x64x64 all-ones sanity check,
+  because they synchronized the idle stream instead of the one the GEMM actually ran on. (Later in
+  this same release the default construction path changed to share one queue instead — see Changed,
+  above — which closes this whole hazard class by construction for the common case;
+  `synchronize_all()` still blocks on both streams correctly either way, and stays necessary for a
+  handle built via the now-opt-in `DnnHandle::with_split_blas_stream()`.) `DnnHandle` also gains a
+  matched set of
   staged-transfer methods — `upload_staged`/`upload_staged_with` and
   `download_staged`/`download_staged_into`, plus `reserve_staging`/`staging_stats` — built on the
   new `StagingBuffer`, each internally ordered against *both* streams via a new private
@@ -379,6 +514,68 @@ buffer) built in the course of the same investigation.
   collide) in `gpu_tests/conv_fprop.rs`, plus unit tests pinning the naming contract
   (`kernel_name_discriminates_every_codegen_constant`,
   `int4_symmetric_and_asymmetric_never_share_an_entry_name`).
+- `oxicuda-dnn`: new CTA-tiled implicit-GEMM forward convolution engine
+  (`conv::fprop::tiled_implicit_gemm::{TiledConvPlan, TiledImplicitGemmConv}`). Computes the
+  identical conv-to-GEMM index mapping as the existing scalar `ImplicitGemmConv` (same
+  cross-correlation convention, same implicit zero-padding), but via a real register-blocked,
+  shared-memory-staged GEMM mainloop instead of one thread per output element. Orients the GEMM as
+  `M = C_out`, `N = flattened (batch, oh, ow)`, `K = (C_in, R, S)` — deliberately transposed from
+  the textbook `M = pixels` mapping so both the input staging and the output epilogue stay
+  coalesced (`st.global.v4.f32`). `TiledConvPlan::for_problem` is the sole, pure, unit-testable
+  selection decision: declines anything but F32/NCHW/`groups==1`/2-D, problems under
+  `MIN_GEMM_K=64`/`MIN_OUT_CHANNELS=24`, and non-profitable shapes unless the resulting grid is at
+  least `MIN_CTAS=32` CTAs even under `MIN_GEMM_N=4096`. Needs no workspace (static shared memory
+  only). Wired transparently inside `ImplicitGemmConv::execute` (constructed once at
+  `ImplicitGemmConv::new`/`build` time; production callers still see one engine) and as the new
+  highest-priority Rule 3 in `algo_select::select_algorithm`/`candidate_algorithms` — ahead of
+  Winograd (see Fixed), because the module's own measured comparison table
+  (`benches/conv_engine_gflops_regression.rs`) shows 5.7-8.0 TFLOPS for the tiled kernel against
+  1.7-3.5 TFLOPS for Winograd on the same five real face-pipeline 3x3 shapes (SCRFD/ArcFace/
+  InSwapper), both far above the ~900 GFLOPS scalar baseline. A new `ImplicitGemmConv::scalar_only`
+  constructor pins the old scalar path for oracle/benchmark use, and a process-wide kill switch
+  (`OXICUDA_DISABLE_TILED_CONV`) restores pre-tiling dispatch everywhere at once (this engine,
+  `algo_select`, and `oxionnx-cuda`'s `pick_engine`) for A/B measurement or bisecting a suspected
+  miscompare.
+- `oxicuda-ptx`: new reusable CTA-tiled f32 GEMM mainloop emitter (`templates::tiled_mainloop`) —
+  the template the engine above generates its body from. Deliberately operand-agnostic: callers
+  supply per-staging-slot global addresses and validity predicates via a `GlobalTap` callback,
+  which is what lets one emitter serve both a plain GEMM and a convolution's *implicit* im2col (a
+  padded/strided/dilated view that is never materialized). Fixed 256-thread CTA (16x16), canonical
+  128x128x8 tile with an 8x8 register tile/thread; the module doc documents three specific
+  bank-conflict-avoidance design decisions (row-fragment broadcast, split column-fragment groups,
+  padded A-staging pitch) as load-bearing, not stylistic. Its own module doc states it was written
+  to serve both `oxicuda-dnn`'s convolutions and `oxicuda-blas`'s `GemmDispatcher` — but as of this
+  release, only the conv engine above actually calls it; `oxicuda-blas` has no reference to it at
+  all.
+- `oxicuda-ptx`: new vectorized shared-memory and TF32-rounding builder primitives
+  (`builder::body_builder::vector_mem_ops`): `BodyBuilder::load_shared_f32x4`/`store_shared_f32x4`
+  (`ld`/`st.shared.v4.f32`, mirroring the pre-existing `load_global_f32x4`), `store_global_f32x4`
+  (the previously-missing store-side counterpart of `load_global_f32x4`), and `cvt_f32_to_tf32`
+  (`cvt.rna.tf32.f32` — specifically `.rna`, since `ptxas` rejects `.rn` for this conversion on
+  `sm_80`-`sm_89` and accepts it only from `sm_90`; a `mov.b32` truncation alternative is
+  documented as a real trap, ~1e-3 relative error, at the edge of `oxionnx-cuda`'s
+  shadow-verification tolerance). Backed by a new `RoundingMode::Rna` IR variant. `KernelBuilder`
+  gains a matching `shared_mem_aligned(name, ty, count, align)` for declaring the 16-byte-aligned
+  shared arrays `.v4` accesses require (plain `shared_mem` only guarantees `max(elem_size, 4)`). Of
+  these, `shared_mem_aligned` is genuinely wired into production (the tiled conv engine's
+  `conv_smem_a`/`conv_smem_b` declarations); `load_shared_f32x4`/`store_shared_f32x4`/
+  `store_global_f32x4`/`cvt_f32_to_tf32` currently have no caller anywhere in this workspace outside
+  their own unit/gpu-tests — legitimate, independently-tested library additions to a crate whose
+  product is its public API, just not yet consumed by any in-tree kernel generator.
+- `oxicuda-ptx`: new channel-broadcast and PRelu kernel templates
+  (`templates::channel_broadcast::{ChannelBroadcastTemplate, PReluTemplate}`) —
+  `out[i] = full[i] OP small[channel(i)]` for ONNX-style `[1,C,1,1]`-vs-`[1,C,H,W]` or
+  scalar-vs-tensor `Add`/`Sub`/`Mul`/`Div`, and the per-channel-slope generalization of `LeakyRelu`.
+  Wired into `templates::mod` (module + re-exports); like the vector-mem-ops above, no caller
+  elsewhere in this repo as of this release.
+- New benchmarks. `benches/winograd_vs_implicit_gemm.rs` is a genuine Criterion bench — same
+  buffers, warmed kernel cache, one `synchronize()` per sample — across a 16x spatial x 4x channel
+  sweep; it's the actual source of the recalibrated `WINOGRAD_FLOP_THRESHOLD` (see Fixed).
+  `benches/conv_engine_gflops_regression.rs` despite its name is not a Criterion bench and asserts
+  nothing — it's a hand-rolled `fn main()` (`harness = false`) that drives real ONNX-graph-derived
+  SCRFD/ArcFace/InSwapper shapes through every engine that claims them
+  (scalar/tiled/Conv1x1/Depthwise/Winograd) and prints a GFLOPS/%-of-peak/speedup table for manual
+  comparison; it guards nothing automatically in CI. Both skip cleanly with no GPU.
 
 ### Known issues
 
@@ -1050,3 +1247,5 @@ This release adds no new crates (still 73). It is a depth pass: implementing gen
 
 **Umbrella (1 crate)**
 - `oxicuda` (19,614 SLoC, 494 tests): Re-exports all sub-crates, ComputeBackend trait with CudaBackend, OxiONNX GPU inference backend, ToRSh tensor backend, TrustformeRS transformer backend, global init/device pool
+
+[0.5.5]: https://github.com/cool-japan/oxicuda/releases/tag/v0.5.5

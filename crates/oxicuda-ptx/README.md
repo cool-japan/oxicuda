@@ -82,6 +82,8 @@ architecture-specific optimizations automatically:
 - `ReductionTemplate` -- parallel block-level reductions (sum, max, min)
 - `GemmTemplate` -- tiled matrix multiplication with epilogue support
 - `SoftmaxTemplate` -- numerically stable row-wise softmax
+- `templates::tiled_mainloop` -- reusable CTA-tiled f32 GEMM mainloop emitter (256-thread CTA, 128x128x8 tile, 8x8 register tile/thread); operand-agnostic via a `GlobalTap` callback so one emitter serves both a plain GEMM and a convolution's implicit im2col. Backs `oxicuda-dnn`'s CTA-tiled implicit-GEMM convolution engine.
+- `ChannelBroadcastTemplate` / `PReluTemplate` (`templates::channel_broadcast`) -- ONNX-style `[1,C,1,1]`-vs-`[1,C,H,W]` channel-broadcast elementwise ops and the per-channel-slope generalization of `LeakyRelu`
 
 ## Features
 
@@ -95,6 +97,13 @@ A SIMD-flavored warp-vector expression layer (`WarpVec`/`WarpMask`, in
 comparisons, reductions, scans, and the full shuffle family, generated
 as PTX `shfl.sync`/`vote.sync`/`redux.sync` instructions. See the
 crate's rustdoc for `WarpVec` for a worked example.
+
+`BodyBuilder` also exposes vectorized shared-memory and TF32-rounding
+primitives (`builder::body_builder::vector_mem_ops`): `load_shared_f32x4`/
+`store_shared_f32x4`/`store_global_f32x4` (`ld`/`st.v4.f32`) and
+`cvt_f32_to_tf32` (`cvt.rna.tf32.f32`), plus a matching
+`KernelBuilder::shared_mem_aligned` for the 16-byte-aligned shared arrays
+`.v4` accesses require.
 
 ## Status
 

@@ -185,8 +185,7 @@ impl BlasHandle {
     ///
     /// # Errors
     ///
-    /// [`BlasError::LaunchFailed`](crate::error::BlasError::LaunchFailed) if
-    /// the workspace cache's lock is poisoned.
+    /// [`BlasError::LaunchFailed`] if the workspace cache's lock is poisoned.
     pub fn split_k_workspace_bytes(&self) -> BlasResult<usize> {
         self.gemm_dispatcher.split_k_workspace_bytes()
     }

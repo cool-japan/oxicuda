@@ -377,7 +377,8 @@ impl TiledAccumulators {
 /// full dot product for its output element; the caller emits the epilogue.
 ///
 /// `smem_a` / `smem_b` name shared arrays the caller must have declared with
-/// [`TiledMainloopConfig::smem_a_elems`] / [`smem_b_elems`] `f32` elements and
+/// [`TiledMainloopConfig::smem_a_elems`] /
+/// [`smem_b_elems`](TiledMainloopConfig::smem_b_elems) `f32` elements and
 /// 16-byte alignment. `n_ktiles` is a **CTA-uniform** `u32` register giving the
 /// number of k-steps: the loop contains `bar.sync`, so a per-thread trip count
 /// would deadlock.
