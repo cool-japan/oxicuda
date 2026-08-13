@@ -3,7 +3,7 @@
 Pure Rust CUDA replacement for the COOLJAPAN ecosystem.
 (C) 2026 COOLJAPAN OU (Team KitaSan)
 
-## Project Status (v0.5.5 — 2026-08-13)
+## Project Status (v0.5.6 — 2026-08-13)
 
 - **Crates**: 74 workspace members (73 library crates + 1 umbrella)
 - **Files**: 4,521 Rust source files
